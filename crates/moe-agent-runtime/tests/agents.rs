@@ -1564,6 +1564,62 @@ impl MemoryContextAccess for RecoveryRequiredAccess {
     }
 }
 
+struct FaultableMemory {
+    memory: MemoryService,
+    faulted: bool,
+}
+
+impl FaultableMemory {
+    fn ready(&self) -> Result<(), PersistenceError> {
+        if self.faulted {
+            Err(PersistenceError::RecoveryRequired)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl MemoryContextAccess for FaultableMemory {
+    type Error = PersistenceError;
+
+    fn begin_memory_task(
+        &mut self,
+        identity: &PetIdentity,
+        session: &moe_memory_core::SessionId,
+        purpose: ReadPurpose,
+        query: &RetrievalQuery,
+        now_ms: u64,
+    ) -> Result<MemoryTask, Self::Error> {
+        self.ready()?;
+        self.memory
+            .begin_memory_task(identity, session, purpose, query, now_ms)
+            .map_err(PersistenceError::from)
+    }
+
+    fn assemble_context(
+        &mut self,
+        task: &MemoryTask,
+        budget_chars: usize,
+        now_ms: u64,
+    ) -> Result<RequestContext, Self::Error> {
+        self.ready()?;
+        self.memory
+            .assemble_context(task, budget_chars, now_ms)
+            .map_err(PersistenceError::from)
+    }
+
+    fn context_view<'context>(
+        &mut self,
+        context: &'context RequestContext,
+        now_ms: u64,
+    ) -> Result<&'context ContextView, Self::Error> {
+        self.ready()?;
+        self.memory
+            .context_view(context, now_ms)
+            .map_err(PersistenceError::from)
+    }
+}
+
 struct HybridAccess {
     memory: MemoryService,
     query_source: SourceRef,
@@ -1754,6 +1810,106 @@ fn backend_health_failure_is_preserved_and_never_reaches_the_model() {
     );
     let model = Probe::default();
     assert_eq!(model.calls, 0);
+}
+
+#[test]
+fn backend_failure_after_prepare_is_preserved_and_the_model_is_never_called() {
+    let mut fixture = Fixture::new(limits());
+    let memory = std::mem::replace(&mut fixture.memory, MemoryService::new());
+    let mut backend = FaultableMemory {
+        memory,
+        faulted: false,
+    };
+    let mut task = fixture
+        .agent
+        .prepare(
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+            AgentServices::new(&mut fixture.sessions, &mut backend),
+            &fixture.binding,
+            &fixture.registration.interaction,
+            &RetrievalQuery::new(""),
+        )
+        .unwrap();
+    backend.faulted = true;
+    let mut model = Probe::default();
+    let error = fixture
+        .agent
+        .infer(
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 1),
+            AgentServices::new(&mut fixture.sessions, &mut backend),
+            &mut task,
+            &mut model,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AgentError::Memory(PersistenceError::RecoveryRequired)
+    ));
+    assert_eq!(
+        std::error::Error::source(&error).unwrap().to_string(),
+        "journal failed; close and reopen before any further access"
+    );
+    assert_eq!(model.calls, 0);
+}
+
+#[test]
+fn backend_failure_after_inference_is_preserved_and_registers_no_terminal_state() {
+    let mut fixture = Fixture::new(limits());
+    let memory = std::mem::replace(&mut fixture.memory, MemoryService::new());
+    let mut backend = FaultableMemory {
+        memory,
+        faulted: false,
+    };
+    let mut task = fixture
+        .agent
+        .prepare(
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+            AgentServices::new(&mut fixture.sessions, &mut backend),
+            &fixture.binding,
+            &fixture.registration.interaction,
+            &RetrievalQuery::new(""),
+        )
+        .unwrap();
+    let mut model = Probe::default();
+    let result = fixture
+        .agent
+        .infer(
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 1),
+            AgentServices::new(&mut fixture.sessions, &mut backend),
+            &mut task,
+            &mut model,
+        )
+        .unwrap();
+    assert_eq!(model.calls, 1);
+    assert!(model.memory.iter().any(|block| block.contains(FACT)));
+    let events_before = fixture.snapshot(2).events.len();
+    backend.faulted = true;
+    let error = fixture
+        .agent
+        .finish(
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 2),
+            AgentServices::new(&mut fixture.sessions, &mut backend),
+            &mut task,
+            &result,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AgentError::Memory(PersistenceError::RecoveryRequired)
+    ));
+    assert_eq!(
+        std::error::Error::source(&error).unwrap().to_string(),
+        "journal failed; close and reopen before any further access"
+    );
+    let snapshot = fixture.snapshot(3);
+    assert_eq!(snapshot.events.len(), events_before);
+    assert_eq!(snapshot.events[0].terminal(), None);
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .all(|event| event.terminal() != Some(TerminalState::Completed))
+    );
 }
 
 #[test]
