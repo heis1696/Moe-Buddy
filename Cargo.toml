@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/moe-memory-core", "crates/moe-memory-local"]
+members = ["crates/moe-memory-core", "crates/moe-memory-local", "crates/moe-agent-runtime", "crates/moe-raw-local", "crates/moe-cli-hooks", "crates/moe-memory-search"]
 resolver = "3"
 
 [workspace.package]

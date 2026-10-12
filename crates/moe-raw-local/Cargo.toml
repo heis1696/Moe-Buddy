@@ -1,0 +1,15 @@
+[package]
+name = "moe-raw-local"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+moe-agent-runtime = { path = "../moe-agent-runtime" }
+
+[dev-dependencies]
+moe-memory-core = { path = "../moe-memory-core" }
+
+[lints]
+workspace = true

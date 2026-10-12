@@ -2,10 +2,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use moe_memory_core::{
-    CommandResult, EntityRead, Epistemic, IdentityView, MemoryCommand, MemoryDraft, MemoryError,
-    MemoryId, MemoryRecord, MemoryScope, MemoryService, MemoryStatus, MemoryTask, Namespace,
-    PetIdentity, PublicationPolicy, ReadPolicy, ReadPurpose, ReplacementReceipt, RetrievalQuery,
-    RetrievalResult, SearchQuery, SessionId, SharedCandidate, SourceRef, WriteReceipt,
+    CandidateRef, CandidateTicket, CommandResult, EntityRead, Epistemic, IdentityView,
+    MemoryCommand, MemoryDraft, MemoryError, MemoryId, MemoryRecord, MemoryScope, MemoryService,
+    MemoryStatus, MemoryTask, Namespace, PetIdentity, PublicationPolicy, ReadPolicy, ReadPurpose,
+    ReplacementReceipt, RetrievalPlan, RetrievalQuery, RetrievalResult, SearchQuery, SessionId,
+    SharedCandidate, SourceRef, TransmissionPolicy, TransmissionTicket, TransmissionUsage,
+    WriteReceipt,
 };
 
 use crate::PersistenceError;
@@ -423,6 +425,80 @@ impl LocalMemory {
             .remove_identity_view(identity, expected_version)?)
     }
 
+    pub fn set_transmission_policy(
+        &mut self,
+        identity: &PetIdentity,
+        policy: TransmissionPolicy,
+    ) -> Result<(), PersistenceError> {
+        self.ready()?;
+        Ok(self.service.set_transmission_policy(identity, policy)?)
+    }
+
+    pub fn validate_candidate_ticket(
+        &mut self,
+        ticket: &CandidateTicket,
+        now_ms: u64,
+    ) -> Result<(), PersistenceError> {
+        self.ready()?;
+        Ok(self.service.validate_candidate_ticket(ticket, now_ms)?)
+    }
+
+    pub fn bind_query_provenance(
+        &mut self,
+        ticket: &mut CandidateTicket,
+        sources: Vec<SourceRef>,
+        entries: &[CandidateRef],
+        now_ms: u64,
+    ) -> Result<(), PersistenceError> {
+        self.ready()?;
+        Ok(self
+            .service
+            .bind_query_provenance(ticket, sources, entries, now_ms)?)
+    }
+
+    pub fn prepare_transmission(
+        &mut self,
+        ticket: &CandidateTicket,
+        usage: TransmissionUsage,
+        endpoint: &str,
+        entries: &[CandidateRef],
+        now_ms: u64,
+    ) -> Result<TransmissionTicket, PersistenceError> {
+        self.ready()?;
+        Ok(self
+            .service
+            .prepare_transmission(ticket, usage, endpoint, entries, now_ms)?)
+    }
+
+    pub fn record_transmission(
+        &mut self,
+        ticket: &mut CandidateTicket,
+        sent: &TransmissionTicket,
+        now_ms: u64,
+    ) -> Result<(), PersistenceError> {
+        self.ready()?;
+        Ok(self.service.record_transmission(ticket, sent, now_ms)?)
+    }
+
+    pub fn fail_transmission(
+        &mut self,
+        ticket: &mut CandidateTicket,
+        sent: &TransmissionTicket,
+        now_ms: u64,
+    ) -> Result<(), PersistenceError> {
+        self.ready()?;
+        Ok(self.service.fail_transmission(ticket, sent, now_ms)?)
+    }
+
+    pub fn recover_failed_rerank(
+        &mut self,
+        ticket: &mut CandidateTicket,
+        now_ms: u64,
+    ) -> Result<CandidateTicket, PersistenceError> {
+        self.ready()?;
+        Ok(self.service.recover_failed_rerank(ticket, now_ms)?)
+    }
+
     pub fn for_session(
         &mut self,
         identity: &PetIdentity,
@@ -597,6 +673,34 @@ pub struct LocalMemoryReader<'service> {
 }
 
 impl LocalMemoryReader<'_> {
+    pub fn begin_candidates(
+        &mut self,
+        query: &RetrievalQuery,
+        plan: RetrievalPlan,
+        now_ms: u64,
+    ) -> Result<CandidateTicket, PersistenceError> {
+        self.coordinator.ready()?;
+        Ok(self
+            .coordinator
+            .service
+            .for_session(&self.identity, &self.session, self.purpose)
+            .begin_candidates(query, plan, now_ms)?)
+    }
+
+    pub fn complete_retrieval(
+        &mut self,
+        ticket: &CandidateTicket,
+        ranking: &[(CandidateRef, f64)],
+        now_ms: u64,
+    ) -> Result<MemoryTask, PersistenceError> {
+        self.coordinator.ready()?;
+        Ok(self
+            .coordinator
+            .service
+            .for_session(&self.identity, &self.session, self.purpose)
+            .complete_retrieval(ticket, ranking, now_ms)?)
+    }
+
     pub fn begin_task(
         &mut self,
         query: &RetrievalQuery,
