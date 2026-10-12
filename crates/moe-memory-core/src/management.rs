@@ -109,6 +109,20 @@ impl fmt::Debug for TaskStamp {
 }
 
 #[derive(Clone)]
+pub(crate) enum Delivery {
+    Keyword,
+    Hybrid(HybridSeal),
+}
+
+#[derive(Clone)]
+pub(crate) struct HybridSeal {
+    pub(crate) plan: crate::read::RetrievalPlan,
+    pub(crate) entries: Vec<crate::read::CandidateRef>,
+    pub(crate) inputs: Vec<crate::RetrievalItem>,
+    pub(crate) transmissions: Vec<crate::read::TransmissionEvidence>,
+}
+
+#[derive(Clone)]
 pub struct MemoryTask {
     pub(crate) epoch: Arc<()>,
     pub(crate) identity: PetIdentity,
@@ -118,6 +132,7 @@ pub struct MemoryTask {
     pub(crate) result: RetrievalResult,
     pub(crate) identity_view: Option<IdentityView>,
     pub(crate) issued_at_ms: u64,
+    pub(crate) delivery: Delivery,
 }
 
 impl fmt::Debug for MemoryTask {
@@ -138,6 +153,24 @@ impl MemoryTask {
     }
     pub fn generation(&self) -> u64 {
         self.stamp.generation
+    }
+    pub fn retrieval_plan(&self) -> Option<&crate::read::RetrievalPlan> {
+        match &self.delivery {
+            Delivery::Keyword => None,
+            Delivery::Hybrid(seal) => Some(&seal.plan),
+        }
+    }
+    pub fn transmissions(&self) -> &[crate::read::TransmissionEvidence] {
+        match &self.delivery {
+            Delivery::Keyword => &[],
+            Delivery::Hybrid(seal) => &seal.transmissions,
+        }
+    }
+
+    /// 任务有界请求字节（混合任务以专用前缀区别于旧关键词布局）。
+    /// 混合任务包含规范化完整发送证据，实际发送集不同的请求字节不同。
+    pub fn request_bytes(&self) -> &[u8] {
+        &self.stamp.request
     }
 
     pub fn propose_create(
@@ -190,6 +223,28 @@ impl MemoryTask {
             if !draft.dependencies.contains(&record.version_ref()) {
                 draft.dependencies.push(record.version_ref());
             }
+        }
+        for evidence in self.transmissions() {
+            if !evidence
+                .sent_sources()
+                .iter()
+                .all(|source| draft.sources.contains(source))
+            {
+                return Err(MemoryError::InvalidEvidence);
+            }
+            for entry in evidence.sent_entries() {
+                let Some(version) = entry.record() else {
+                    return Err(MemoryError::InvalidInput(
+                        "session-derived output cannot be persisted",
+                    ));
+                };
+                if !draft.dependencies.contains(&version) {
+                    draft.dependencies.push(version);
+                }
+            }
+        }
+        if draft.dependencies.len() > crate::validation::MAX_SOURCES {
+            return Err(MemoryError::InvalidEvidence);
         }
         if self.identity_view.as_ref().is_some_and(|view| {
             !view
@@ -274,16 +329,21 @@ impl MemoryService {
         {
             return Err(MemoryError::TaskCancelled);
         }
-        let reader = self.for_session(&task.identity, &task.stamp.session, task.purpose);
-        if reader
-            .retrieve(&task.query, now_ms)
-            .map_err(|_| MemoryError::TaskCancelled)?
-            != task.result
-            || reader.identity().ok() != task.identity_view
-        {
-            return Err(MemoryError::TaskCancelled);
+        match &task.delivery {
+            Delivery::Keyword => {
+                let reader = self.for_session(&task.identity, &task.stamp.session, task.purpose);
+                if reader
+                    .retrieve(&task.query, now_ms)
+                    .map_err(|_| MemoryError::TaskCancelled)?
+                    != task.result
+                    || reader.identity().ok() != task.identity_view
+                {
+                    return Err(MemoryError::TaskCancelled);
+                }
+                Ok(())
+            }
+            Delivery::Hybrid(seal) => crate::read::validate_hybrid_task(self, task, seal, now_ms),
         }
-        Ok(())
     }
 
     pub fn create_from_task(

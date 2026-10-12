@@ -7,6 +7,7 @@ pub enum MemoryError {
     NotFound,
     ProtectedContent,
     AccessDenied,
+    TransmissionDenied,
     PublicationDenied,
     AutomaticPublicationDisabled,
     PublicationVersionConflict,
@@ -32,6 +33,9 @@ impl fmt::Display for MemoryError {
                 formatter.write_str("protected content requires an authority")
             }
             Self::AccessDenied => formatter.write_str("read purpose is not authorized"),
+            Self::TransmissionDenied => {
+                formatter.write_str("online transmission is not authorized")
+            }
             Self::PublicationDenied => formatter.write_str("shared publication is not authorized"),
             Self::AutomaticPublicationDisabled => {
                 formatter.write_str("automatic publication rules are undetermined")

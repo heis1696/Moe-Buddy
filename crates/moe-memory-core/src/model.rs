@@ -135,6 +135,13 @@ impl SourceRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MemoryId(pub(crate) u64);
 
+impl MemoryId {
+    /// Stable numeric representation for derived cache keys, not authority.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct MemoryDraft {
     pub(crate) text: String,
