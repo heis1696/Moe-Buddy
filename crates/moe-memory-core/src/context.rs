@@ -7,6 +7,8 @@ use crate::{
     RecordVersion, RetrievalItem, Sensitivity, SessionId, SourceRef, validation,
 };
 
+pub mod access;
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum ContextOrigin {
     LongTerm(RecordVersion),

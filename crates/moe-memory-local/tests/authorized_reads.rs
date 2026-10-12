@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use moe_memory_core::{
-    CacheStatus, Category, Epistemic, Lifecycle, MemoryDraft, MemoryError, MemoryScope, Namespace,
-    PetIdentity, ReadPolicy, ReadPurpose, RetrievalItem, RetrievalLayer, RetrievalQuery,
-    Sensitivity, SessionId, SourceRef,
+    CacheStatus, Category, EmbeddingProfile, Epistemic, Lifecycle, MemoryContextAccess,
+    MemoryDraft, MemoryError, MemoryScope, Namespace, PetIdentity, ReadPolicy, ReadPurpose,
+    RerankProfile, RetrievalItem, RetrievalLayer, RetrievalPlan, RetrievalQuery, Sensitivity,
+    SessionId, SourceRef, TransmissionPolicy, TransmissionUsage,
 };
 use moe_memory_local::{LocalMemory, OperationId, PersistenceError};
 
@@ -91,6 +92,121 @@ fn fixture(scratch: &Scratch) -> (LocalMemory, SourceRef) {
         .clone();
     configure(&mut memory, &source);
     (memory, source)
+}
+
+#[test]
+fn local_reader_keeps_keyword_behavior_and_delivers_hybrid_evidence() {
+    let scratch = Scratch::new();
+    let (mut memory, source) = fixture(&scratch);
+    let pet = owner();
+    let session = session();
+    memory
+        .for_pet(&pet)
+        .create(
+            operation("hybrid-record"),
+            draft("主人喜欢喝茉莉花茶", &source),
+            100,
+        )
+        .unwrap();
+
+    let keyword_task = MemoryContextAccess::begin_memory_task(
+        &mut memory,
+        &pet,
+        &session,
+        ReadPurpose::OfflineReasoning,
+        &RetrievalQuery::new("茉莉花茶"),
+        100,
+    )
+    .unwrap();
+    assert_eq!(keyword_task.result().items().len(), 1);
+    assert_eq!(
+        keyword_task.result().items()[0].text(),
+        "主人喜欢喝茉莉花茶"
+    );
+
+    let endpoint = "https://rerank.example.test/v1";
+    let plan = RetrievalPlan::new(EmbeddingProfile::new("fixture", "embedding", 8).unwrap())
+        .with_rerank(RerankProfile::new("fixture", "reranker").unwrap());
+    memory
+        .set_transmission_policy(
+            &pet,
+            TransmissionPolicy::new(1, TransmissionUsage::Rerank, endpoint, vec![source.clone()])
+                .unwrap()
+                .transmit_query()
+                .with_scope(MemoryScope::Private(pet.clone())),
+        )
+        .unwrap();
+    let query = RetrievalQuery::new("茶饮偏好");
+    let mut ticket = memory
+        .for_session(&pet, &session, ReadPurpose::OfflineReasoning)
+        .begin_candidates(&query, plan, 100)
+        .unwrap();
+    assert_eq!(ticket.candidates().len(), 1);
+    let reference = ticket.candidates()[0].candidate_ref();
+    memory
+        .bind_query_provenance(&mut ticket, vec![source.clone()], &[], 100)
+        .unwrap();
+    let sent = memory
+        .prepare_transmission(
+            &ticket,
+            TransmissionUsage::Rerank,
+            endpoint,
+            std::slice::from_ref(&reference),
+            100,
+        )
+        .unwrap();
+    memory.record_transmission(&mut ticket, &sent, 110).unwrap();
+    let hybrid_task = memory
+        .for_session(&pet, &session, ReadPurpose::OfflineReasoning)
+        .complete_retrieval(&ticket, &[(reference.clone(), 0.9)], 110)
+        .unwrap();
+    assert_eq!(hybrid_task.result().items().len(), 1);
+    assert_eq!(hybrid_task.transmissions().len(), 1);
+    assert_eq!(hybrid_task.transmissions()[0].sent_sources(), &[source]);
+    assert_eq!(hybrid_task.transmissions()[0].sent_entries(), &[reference]);
+
+    let context =
+        MemoryContextAccess::assemble_context(&mut memory, &hybrid_task, 512, 110).unwrap();
+    let view = MemoryContextAccess::context_view(&mut memory, &context, 120).unwrap();
+    assert_eq!(view.blocks().len(), 1);
+    assert_eq!(view.blocks()[0].text(), "主人喜欢喝茉莉花茶");
+}
+
+#[test]
+fn local_candidate_ticket_is_rejected_after_cancellation() {
+    let scratch = Scratch::new();
+    let (mut memory, source) = fixture(&scratch);
+    let pet = owner();
+    let session = session();
+    memory
+        .for_pet(&pet)
+        .create(
+            operation("ticket-record"),
+            draft("tea preference", &source),
+            100,
+        )
+        .unwrap();
+    let plan = RetrievalPlan::new(EmbeddingProfile::new("fixture", "embedding", 8).unwrap());
+    let mut reader = memory.for_session(&pet, &session, ReadPurpose::OfflineReasoning);
+    let ticket = reader
+        .begin_candidates(&RetrievalQuery::new("preference"), plan, 100)
+        .unwrap();
+    drop(reader);
+    memory
+        .cancel_tasks(operation("cancel-ticket"), memory.generation().unwrap())
+        .unwrap();
+
+    assert!(matches!(
+        memory.validate_candidate_ticket(&ticket, 110),
+        Err(PersistenceError::Memory(MemoryError::TaskCancelled))
+    ));
+    let reference = ticket.candidates()[0].candidate_ref();
+    assert!(matches!(
+        memory
+            .for_session(&pet, &session, ReadPurpose::OfflineReasoning)
+            .complete_retrieval(&ticket, &[(reference, 0.9)], 110),
+        Err(PersistenceError::Memory(MemoryError::TaskCancelled))
+    ));
 }
 
 #[test]

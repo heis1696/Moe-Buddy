@@ -1,4 +1,5 @@
 /target/
+/scripts/__pycache__/
 *.log
 .env
 .env.*

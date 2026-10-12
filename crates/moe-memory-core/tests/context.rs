@@ -1,8 +1,8 @@
 use moe_memory_core::{
-    Category, CommandResult, ContextBlockKind, ContextOrigin, Epistemic, Lifecycle, MemoryDraft,
-    MemoryError, MemoryId, MemoryScope, MemoryService, MemoryTask, Namespace, PetIdentity,
-    PublicationPolicy, ReadPolicy, ReadPurpose, RequestContext, RetrievalLayer, RetrievalQuery,
-    Sensitivity, SessionId, SourceRef,
+    Category, CommandResult, ContextBlockKind, ContextOrigin, EmbeddingProfile, Epistemic,
+    Lifecycle, MemoryContextAccess, MemoryDraft, MemoryError, MemoryId, MemoryScope, MemoryService,
+    MemoryTask, Namespace, PetIdentity, PublicationPolicy, ReadPolicy, ReadPurpose, RequestContext,
+    RetrievalLayer, RetrievalPlan, RetrievalQuery, Sensitivity, SessionId, SourceRef,
 };
 
 fn owner(name: &str) -> PetIdentity {
@@ -107,6 +107,75 @@ fn assembly_is_read_only_and_reports_whole_item_omissions() {
         1
     );
     assert_eq!(task.result().items().len(), 2);
+}
+
+#[test]
+fn context_access_preserves_keyword_matching_and_protected_hybrid_context() {
+    let (mut service, source, _) = fixture();
+    identity(&mut service, &source);
+    let pet = owner("alice");
+    let session = session();
+    let keyword_task = MemoryContextAccess::begin_memory_task(
+        &mut service,
+        &pet,
+        &session,
+        ReadPurpose::OfflineReasoning,
+        &RetrievalQuery::new("TEA"),
+        100,
+    )
+    .unwrap();
+    assert_eq!(keyword_task.result().items().len(), 2);
+
+    let query = RetrievalQuery::new("morning beverage preference");
+    let plan = RetrievalPlan::new(EmbeddingProfile::new("fixture", "embedding", 8).unwrap());
+    let ticket = service
+        .for_session(&pet, &session, ReadPurpose::OfflineReasoning)
+        .begin_candidates(&query, plan, 100)
+        .unwrap();
+    let reference = ticket.candidates()[0].candidate_ref();
+    let hybrid_task = service
+        .for_session(&pet, &session, ReadPurpose::OfflineReasoning)
+        .complete_retrieval(&ticket, &[(reference, 0.9)], 100)
+        .unwrap();
+    assert_eq!(hybrid_task.result().items().len(), 1);
+    assert_eq!(
+        hybrid_task.retrieval_plan().unwrap().profile().model(),
+        "embedding"
+    );
+
+    let context =
+        MemoryContextAccess::assemble_context(&mut service, &hybrid_task, 512, 100).unwrap();
+    let view = MemoryContextAccess::context_view(&mut service, &context, 110).unwrap();
+    assert_eq!(view.identity().unwrap().text(), "我是小萌");
+    assert_eq!(view.blocks().len(), 1);
+    assert_eq!(view.blocks()[0].text(), "tea before breakfast");
+}
+
+#[test]
+fn context_access_rejects_invalidated_tasks_and_views() {
+    let (mut service, _source, _) = fixture();
+    let pet = owner("alice");
+    let session = session();
+    let task = MemoryContextAccess::begin_memory_task(
+        &mut service,
+        &pet,
+        &session,
+        ReadPurpose::OfflineReasoning,
+        &RetrievalQuery::new("tea"),
+        100,
+    )
+    .unwrap();
+    let context = MemoryContextAccess::assemble_context(&mut service, &task, 100, 100).unwrap();
+    service.cancel_tasks(service.generation()).unwrap();
+
+    assert!(matches!(
+        MemoryContextAccess::assemble_context(&mut service, &task, 100, 110),
+        Err(MemoryError::TaskCancelled)
+    ));
+    assert!(matches!(
+        MemoryContextAccess::context_view(&mut service, &context, 110),
+        Err(MemoryError::TaskCancelled)
+    ));
 }
 
 #[test]
