@@ -1797,3 +1797,217 @@ async fn protected_budget_shortfall_stays_a_facade_error() {
     let context = facade.assemble_context(task.task(), 4096, 100).unwrap();
     assert!(facade.context_view(&context, 100).is_ok());
 }
+
+#[test]
+fn batch_lease_is_deleted_by_completion_and_committed_work_leaves_the_queue() {
+    let mut fixture = Fixture::new(&["tea", "coffee"]);
+    let ticket = fixture.ticket(RetrievalQuery::new("tea"));
+    let mut index = fixture.index();
+    let batch = index
+        .take_batch(&mut fixture.host, &ticket)
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.len(), 2);
+    assert!(matches!(
+        index.take_batch(&mut fixture.host, &ticket),
+        Err(SearchError::InvalidInput("index batch already in flight"))
+    ));
+    let vectors = (0..batch.len())
+        .map(|_| UnitVector::new(vec![1.0, 0.0], 2).unwrap())
+        .collect();
+    index
+        .commit(
+            &mut fixture.host,
+            &ticket,
+            CompletedIndexBatch { batch, vectors },
+        )
+        .unwrap();
+    assert!(
+        index
+            .take_batch(&mut fixture.host, &ticket)
+            .unwrap()
+            .is_none()
+    );
+    let status = index.reconcile(&mut fixture.host, &ticket).unwrap();
+    assert_eq!(status.missing_chunks, 0);
+    assert_eq!(status.indexed_records, 2);
+    assert_eq!(status.queued_records, 0);
+    assert_eq!(index.entries.len(), 2);
+}
+
+#[test]
+fn cancelled_tasks_reject_the_leased_batch_and_never_activate_its_vectors() {
+    let mut fixture = Fixture::new(&["tea"]);
+    let ticket = fixture.ticket(RetrievalQuery::new("tea"));
+    let mut index = fixture.index();
+    let batch = index
+        .take_batch(&mut fixture.host, &ticket)
+        .unwrap()
+        .unwrap();
+    fixture
+        .host
+        .service
+        .cancel_tasks(fixture.host.service.generation())
+        .unwrap();
+    assert_eq!(
+        index.commit(
+            &mut fixture.host,
+            &ticket,
+            CompletedIndexBatch {
+                batch,
+                vectors: vec![UnitVector::new(vec![1.0, 0.0], 2).unwrap()],
+            },
+        ),
+        Err(SearchError::Core(MemoryError::TaskCancelled))
+    );
+    assert!(index.entries.is_empty());
+    assert!(matches!(
+        index.take_batch(&mut fixture.host, &ticket),
+        Err(SearchError::Core(MemoryError::TaskCancelled))
+    ));
+    let fresh = fixture.ticket(RetrievalQuery::new("tea"));
+    let batch = index
+        .take_batch(&mut fixture.host, &fresh)
+        .unwrap()
+        .unwrap();
+    index
+        .commit(
+            &mut fixture.host,
+            &fresh,
+            CompletedIndexBatch {
+                batch,
+                vectors: vec![UnitVector::new(vec![1.0, 0.0], 2).unwrap()],
+            },
+        )
+        .unwrap();
+    assert_eq!(index.entries.len(), 1);
+}
+
+#[test]
+fn foreign_identity_cannot_commit_or_activate_a_leased_batch() {
+    let mut fixture = Fixture::new(&["tea"]);
+    let bob = PetIdentity::new(fixture.owner.namespace().clone(), "bob").unwrap();
+    let bob_source = fixture
+        .host
+        .service
+        .register_source(
+            MemoryScope::Private(bob.clone()),
+            "bob",
+            1,
+            Epistemic::UserStatement,
+        )
+        .unwrap();
+    fixture
+        .host
+        .service
+        .for_pet(&bob)
+        .create(draft("tea", &bob_source), 100)
+        .unwrap();
+    fixture
+        .host
+        .service
+        .set_read_policy(&bob, ReadPolicy::offline(1, vec![bob_source.clone()]))
+        .unwrap();
+    let ticket = fixture.ticket(RetrievalQuery::new("tea"));
+    let mut index = fixture.index();
+    let batch = index
+        .take_batch(&mut fixture.host, &ticket)
+        .unwrap()
+        .unwrap();
+    let bob_ticket = fixture
+        .host
+        .service
+        .for_session(
+            &bob,
+            &SessionId::new("session").unwrap(),
+            ReadPurpose::OfflineReasoning,
+        )
+        .begin_candidates(
+            &RetrievalQuery::new("tea"),
+            RetrievalPlan::new(fixture.profile.clone()),
+            fixture.host.now,
+        )
+        .unwrap();
+    assert_eq!(
+        index.commit(
+            &mut fixture.host,
+            &bob_ticket,
+            CompletedIndexBatch {
+                batch,
+                vectors: vec![UnitVector::new(vec![1.0, 0.0], 2).unwrap()],
+            },
+        ),
+        Err(SearchError::StaleIndexWork)
+    );
+    assert!(index.entries.is_empty());
+    let bob_status = index.reconcile(&mut fixture.host, &bob_ticket).unwrap();
+    assert_eq!(bob_status.missing_chunks, 1);
+    assert_eq!(bob_status.indexed_records, 0);
+    let batch = index
+        .take_batch(&mut fixture.host, &ticket)
+        .unwrap()
+        .unwrap();
+    index
+        .commit(
+            &mut fixture.host,
+            &ticket,
+            CompletedIndexBatch {
+                batch,
+                vectors: vec![UnitVector::new(vec![1.0, 0.0], 2).unwrap()],
+            },
+        )
+        .unwrap();
+    assert_eq!(index.entries.len(), 1);
+    let alice_status = index.reconcile(&mut fixture.host, &ticket).unwrap();
+    assert_eq!(alice_status.indexed_records, 1);
+}
+
+#[test]
+fn reopened_index_rejects_old_completed_batches_and_keeps_new_vectors() {
+    let mut fixture = Fixture::new(&["tea"]);
+    let ticket = fixture.ticket(RetrievalQuery::new("drink"));
+    let mut index = fixture.index();
+    let batch = index
+        .take_batch(&mut fixture.host, &ticket)
+        .unwrap()
+        .unwrap();
+    let stale_vectors = (0..batch.len())
+        .map(|_| UnitVector::new(vec![1.0, 0.0], 2).unwrap())
+        .collect();
+    drop(index);
+    let mut reopened = fixture.index();
+    assert_eq!(
+        reopened.commit(
+            &mut fixture.host,
+            &ticket,
+            CompletedIndexBatch {
+                batch,
+                vectors: stale_vectors,
+            },
+        ),
+        Err(SearchError::StaleIndexWork)
+    );
+    assert!(reopened.entries.is_empty());
+    fill(&mut reopened, &mut fixture, &ticket, |_| vec![0.0, 1.0]);
+    assert_eq!(reopened.entries.len(), 1);
+    let config = fixture.config(0.8);
+    let hit = hybrid_rank(
+        &mut reopened,
+        &mut fixture.host,
+        &ticket,
+        Some(&encoded(&ticket, vec![0.0, 1.0])),
+        &config,
+    )
+    .unwrap();
+    assert_eq!(hit.vector_hits(), 1);
+    let stale = hybrid_rank(
+        &mut reopened,
+        &mut fixture.host,
+        &ticket,
+        Some(&encoded(&ticket, vec![1.0, 0.0])),
+        &config,
+    )
+    .unwrap();
+    assert!(stale.ranking().is_empty());
+    assert_eq!(stale.mode(), SearchMode::Hybrid);
+}

@@ -2715,3 +2715,384 @@ fn protected_identity_snapshots_cannot_be_substituted_at_candidate_completion_or
         .record_transmission(&mut ticket, &sent, 100)
         .unwrap();
 }
+
+struct RecoveryFixture {
+    service: MemoryService,
+    owner: PetIdentity,
+    source: SourceRef,
+    branch: moe_memory_core::WriteReceipt,
+    stable: moe_memory_core::WriteReceipt,
+    authority: SourceRef,
+}
+
+fn recovery_fixture() -> RecoveryFixture {
+    let mut service = MemoryService::new();
+    let owner = pet("alice");
+    let source = service
+        .register_source(
+            MemoryScope::Private(owner.clone()),
+            "message",
+            1,
+            Epistemic::UserStatement,
+        )
+        .unwrap();
+    let branch = service
+        .for_pet(&owner)
+        .create(draft("branch original", &source), 100)
+        .unwrap();
+    let stable = service
+        .for_pet(&owner)
+        .create(draft("stable note", &source), 100)
+        .unwrap();
+    let authority = service
+        .register_source(
+            MemoryScope::Private(owner.clone()),
+            "identity",
+            1,
+            Epistemic::AuthoritativeState,
+        )
+        .unwrap();
+    service
+        .set_read_policy(
+            &owner,
+            ReadPolicy::offline(2, vec![source.clone(), authority.clone()]),
+        )
+        .unwrap();
+    grant(
+        &mut service,
+        &owner,
+        TransmissionUsage::Rerank,
+        vec![source.clone()],
+    );
+    RecoveryFixture {
+        service,
+        owner,
+        source,
+        branch,
+        stable,
+        authority,
+    }
+}
+
+fn reference_by_id(
+    ticket: &moe_memory_core::CandidateTicket,
+    id: moe_memory_core::MemoryId,
+) -> moe_memory_core::CandidateRef {
+    ticket
+        .candidates()
+        .iter()
+        .find(|candidate| {
+            candidate
+                .item()
+                .candidate_ref()
+                .record()
+                .is_some_and(|version| version.id() == id)
+        })
+        .unwrap()
+        .candidate_ref()
+}
+
+fn failed_rerank_ticket_over(
+    service: &mut MemoryService,
+    owner: &PetIdentity,
+    source: &SourceRef,
+    query_dependency: Option<moe_memory_core::MemoryId>,
+    sends: &[moe_memory_core::MemoryId],
+) -> moe_memory_core::CandidateTicket {
+    let mut ticket = reader(service, owner)
+        .begin_candidates(&RetrievalQuery::new(""), plan(), 300)
+        .unwrap();
+    let entries = query_dependency
+        .map(|id| vec![reference_by_id(&ticket, id)])
+        .unwrap_or_default();
+    service
+        .bind_query_provenance(&mut ticket, vec![source.clone()], &entries, 300)
+        .unwrap();
+    let sent: Vec<_> = sends
+        .iter()
+        .map(|id| reference_by_id(&ticket, *id))
+        .collect();
+    let pending = service
+        .prepare_transmission(
+            &ticket,
+            TransmissionUsage::Rerank,
+            RERANK_ENDPOINT,
+            &sent,
+            300,
+        )
+        .unwrap();
+    service
+        .fail_transmission(&mut ticket, &pending, 310)
+        .unwrap();
+    ticket
+}
+
+#[test]
+fn failed_rerank_recovery_rejects_divergent_candidate_query_send_and_persona_snapshots() {
+    let RecoveryFixture {
+        mut service,
+        owner,
+        source,
+        branch,
+        stable,
+        ..
+    } = recovery_fixture();
+    let mut fork = service.clone();
+    service
+        .for_pet(&owner)
+        .update(
+            branch.id(),
+            branch.revision(),
+            draft("branch A", &source),
+            300,
+        )
+        .unwrap();
+    fork.for_pet(&owner)
+        .update(
+            branch.id(),
+            branch.revision(),
+            draft("branch B", &source),
+            300,
+        )
+        .unwrap();
+    assert_eq!(service.generation(), fork.generation());
+    let mut original_ticket = failed_rerank_ticket_over(
+        &mut service,
+        &owner,
+        &source,
+        None,
+        &[branch.id(), stable.id()],
+    );
+    let fork_ticket = failed_rerank_ticket_over(
+        &mut fork,
+        &owner,
+        &source,
+        None,
+        &[branch.id(), stable.id()],
+    );
+    assert_eq!(original_ticket.runtime(), fork_ticket.runtime());
+    assert_eq!(
+        original_ticket.candidates().len(),
+        fork_ticket.candidates().len()
+    );
+    assert_eq!(
+        reference_by_id(&original_ticket, branch.id()).record(),
+        reference_by_id(&fork_ticket, branch.id()).record()
+    );
+    assert_eq!(
+        fork.recover_failed_rerank(&mut original_ticket, 320)
+            .unwrap_err(),
+        MemoryError::TaskCancelled
+    );
+    service
+        .recover_failed_rerank(&mut original_ticket, 320)
+        .unwrap();
+
+    let RecoveryFixture {
+        mut service,
+        owner,
+        source,
+        branch: _,
+        stable,
+        ..
+    } = recovery_fixture();
+    let mut fork = service.clone();
+    service
+        .for_pet(&owner)
+        .update(
+            stable.id(),
+            stable.revision(),
+            draft("stable note A", &source),
+            300,
+        )
+        .unwrap();
+    fork.for_pet(&owner)
+        .update(
+            stable.id(),
+            stable.revision(),
+            draft("stable note B", &source),
+            300,
+        )
+        .unwrap();
+    assert_eq!(service.generation(), fork.generation());
+    let mut original_ticket = failed_rerank_ticket_over(
+        &mut service,
+        &owner,
+        &source,
+        Some(stable.id()),
+        &[stable.id()],
+    );
+    let fork_ticket = failed_rerank_ticket_over(
+        &mut fork,
+        &owner,
+        &source,
+        Some(stable.id()),
+        &[stable.id()],
+    );
+    assert_eq!(original_ticket.runtime(), fork_ticket.runtime());
+    assert_eq!(
+        fork.recover_failed_rerank(&mut original_ticket, 320)
+            .unwrap_err(),
+        MemoryError::TaskCancelled
+    );
+    service
+        .recover_failed_rerank(&mut original_ticket, 320)
+        .unwrap();
+
+    let RecoveryFixture {
+        mut service,
+        owner,
+        source,
+        branch,
+        stable,
+        ..
+    } = recovery_fixture();
+    let mut fork = service.clone();
+    service
+        .for_pet(&owner)
+        .update(
+            stable.id(),
+            stable.revision(),
+            draft("stable note A", &source),
+            300,
+        )
+        .unwrap();
+    fork.for_pet(&owner)
+        .update(
+            stable.id(),
+            stable.revision(),
+            draft("stable note B", &source),
+            300,
+        )
+        .unwrap();
+    assert_eq!(service.generation(), fork.generation());
+    let mut original_ticket = failed_rerank_ticket_over(
+        &mut service,
+        &owner,
+        &source,
+        Some(branch.id()),
+        &[branch.id(), stable.id()],
+    );
+    let fork_ticket = failed_rerank_ticket_over(
+        &mut fork,
+        &owner,
+        &source,
+        Some(branch.id()),
+        &[branch.id(), stable.id()],
+    );
+    assert_eq!(original_ticket.runtime(), fork_ticket.runtime());
+    assert_eq!(
+        fork.recover_failed_rerank(&mut original_ticket, 320)
+            .unwrap_err(),
+        MemoryError::TaskCancelled
+    );
+    let recovered = service
+        .recover_failed_rerank(&mut original_ticket, 320)
+        .unwrap();
+    assert_eq!(recovered.transmissions()[0].sent_entries().len(), 2);
+    let selected = reference_by_id(&recovered, branch.id());
+    let task = reader(&mut service, &owner)
+        .complete_retrieval(&recovered, &[(selected, 1.0)], 320)
+        .unwrap();
+    service.validate_task(&task, 320).unwrap();
+
+    let RecoveryFixture {
+        mut service,
+        owner,
+        source,
+        branch,
+        stable,
+        authority,
+    } = recovery_fixture();
+    let mut fork = service.clone();
+    service
+        .set_identity_view(&owner, 1, "persona anchor A", vec![authority.clone()])
+        .unwrap();
+    fork.set_identity_view(&owner, 1, "persona anchor B", vec![authority])
+        .unwrap();
+    assert_eq!(service.generation(), fork.generation());
+    let mut original_ticket = failed_rerank_ticket_over(
+        &mut service,
+        &owner,
+        &source,
+        None,
+        &[branch.id(), stable.id()],
+    );
+    let mut fork_ticket = failed_rerank_ticket_over(
+        &mut fork,
+        &owner,
+        &source,
+        None,
+        &[branch.id(), stable.id()],
+    );
+    assert_eq!(original_ticket.runtime(), fork_ticket.runtime());
+    fork.recover_failed_rerank(&mut fork_ticket, 320).unwrap();
+    assert_eq!(
+        fork.recover_failed_rerank(&mut original_ticket, 320)
+            .unwrap_err(),
+        MemoryError::TaskCancelled
+    );
+    service
+        .recover_failed_rerank(&mut original_ticket, 320)
+        .unwrap();
+}
+
+#[test]
+fn unforked_clone_recovers_failed_rerank_once_and_can_only_close_out() {
+    let RecoveryFixture {
+        mut service,
+        owner,
+        source,
+        branch,
+        stable,
+        ..
+    } = recovery_fixture();
+    let mut ticket = failed_rerank_ticket_over(
+        &mut service,
+        &owner,
+        &source,
+        Some(branch.id()),
+        &[branch.id(), stable.id()],
+    );
+    let mut identical = service.clone();
+    let recovered = identical.recover_failed_rerank(&mut ticket, 320).unwrap();
+    assert_ne!(recovered.runtime(), ticket.runtime());
+    assert_eq!(
+        recovered.query_proof().entries(),
+        std::slice::from_ref(&reference_by_id(&recovered, branch.id()))
+    );
+    assert_eq!(recovered.transmissions()[0].sent_entries().len(), 2);
+    assert_eq!(
+        service.recover_failed_rerank(&mut ticket, 320).unwrap_err(),
+        MemoryError::TaskCancelled
+    );
+    assert_eq!(
+        identical
+            .recover_failed_rerank(&mut ticket, 320)
+            .unwrap_err(),
+        MemoryError::TaskCancelled
+    );
+    for usage in [
+        TransmissionUsage::QueryEmbedding,
+        TransmissionUsage::EntryEmbedding,
+        TransmissionUsage::Rerank,
+    ] {
+        assert_eq!(
+            identical
+                .prepare_transmission(&recovered, usage, RERANK_ENDPOINT, &[], 320)
+                .unwrap_err(),
+            MemoryError::TransmissionDenied
+        );
+    }
+    let selected = reference_by_id(&recovered, branch.id());
+    let task = reader(&mut identical, &owner)
+        .complete_retrieval(&recovered, &[(selected, 1.0)], 320)
+        .unwrap();
+    identical.validate_task(&task, 320).unwrap();
+    assert_eq!(
+        reader(&mut identical, &owner)
+            .complete_retrieval(&recovered, &[], 320)
+            .unwrap_err(),
+        MemoryError::TaskCancelled
+    );
+}
