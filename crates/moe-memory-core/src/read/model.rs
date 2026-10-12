@@ -102,6 +102,26 @@ impl RetrievalQuery {
         self.char_budget = char_budget;
         self
     }
+
+    pub fn text(&self) -> &str {
+        &self.search.text
+    }
+
+    pub fn scope(&self) -> SearchScope {
+        self.search.scope
+    }
+
+    pub fn layer(&self) -> RetrievalLayer {
+        self.layer
+    }
+
+    pub fn limit(&self) -> usize {
+        self.search.limit
+    }
+
+    pub fn char_budget(&self) -> usize {
+        self.char_budget
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]

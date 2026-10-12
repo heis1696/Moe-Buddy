@@ -14,6 +14,7 @@ mod validation;
 
 pub use api::{MemoryClient, MemoryService};
 pub use command::{CommandResult, MemoryCommand};
+pub use context::access::MemoryContextAccess;
 pub use context::{
     CompactionTask, ContextBlock, ContextBlockKind, ContextEvidence, ContextOrigin, ContextUsage,
     ContextView, RequestContext,
@@ -26,6 +27,9 @@ pub use model::{
 };
 pub use publication::{PublicationPolicy, SharedCandidate};
 pub use read::{
-    CacheStatus, EntityRead, EntityView, IdentityView, MemoryReader, ReadPolicy, ReadPurpose,
-    RetrievalItem, RetrievalLayer, RetrievalQuery, RetrievalResult, SessionId, WorkingContext,
+    AuthorizedCandidate, CacheStatus, CandidateRef, CandidateTicket, EmbeddingProfile, EntityRead,
+    EntityView, IdentityView, MemoryReader, QueryProof, ReadPolicy, ReadPurpose, RerankProfile,
+    RetrievalItem, RetrievalLayer, RetrievalPlan, RetrievalQuery, RetrievalResult, SessionId,
+    TransmissionEvidence, TransmissionPolicy, TransmissionTicket, TransmissionUsage,
+    WorkingContext,
 };

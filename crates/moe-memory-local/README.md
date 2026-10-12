@@ -1,10 +1,10 @@
 # moe-memory-local
 
-M1 本地版本化持久化、M2 授权读取、M3 生命周期/撤权/取消、M4 受控共享发布及 M5 最小离线对话适配。仅依赖 workspace 内的 `moe-memory-core`，没有第三方依赖、网络、真实模型连接、GUI 或旧档迁移。
+M1 本地版本化持久化、M2 授权读取、M3 生命周期/撤权/取消、M4 受控共享发布、M5 最小离线对话适配及 R3 健康门覆盖的任务/上下文窄契约。仅依赖 workspace 内的 `moe-memory-core`，没有第三方依赖、网络、真实模型连接、GUI 或旧档迁移。
 
 ## M5 离线对话
 
-完整现行契约见 [M5 契约](../../docs/MEMORY-M5.md)。受信宿主以 `offline_dialogue` 绑定稳定身份/会话和 OfflineReasoning，依次 begin_turn → generate（仅 OfflineFixture 注入）→ review_and_commit。Unknown/UserInspection/ModelTransmission 仍拒绝；OfflineReasoning 不代表任何模型传输许可。模型 SDK、端点/网络回调、任意工具执行和隐式模型历史均不存在。
+完整现行契约见 [M5 契约](../../docs/MEMORY.md#离线对话)。受信宿主以 `offline_dialogue` 绑定稳定身份/会话和 OfflineReasoning，依次 begin_turn → generate（仅 OfflineFixture 注入）→ review_and_commit。Unknown/UserInspection/ModelTransmission 仍拒绝；OfflineReasoning 不代表任何模型传输许可。模型 SDK、端点/网络回调、任意工具执行和隐式模型历史均不存在。
 
 候选不会自行生效。宿主审查不可变候选全文/全部元数据、真实上下文和身份锚点后，返回 Reject 或附真实当前时间的 CreatePrivate/PublishShared；方法立即复验任务并同步提交，不交出可排队的批准。实际来源/版本和原始依赖分别复用 M3 tag 10、M4 tag 11，命令/日志格式不变。private（包括 Normal）、工作项、身份锚点和正式资料仍不能洗入普通共享，自动发布恒拒绝。生成夹具不能暗中添加库外输入或复用其他模型历史。
 
@@ -56,7 +56,7 @@ fn mutate(draft: &mut MemoryDraft) { draft.text().push_str("changed"); }
 
 ## M4 发布适配
 
-完整语义见 [M4 契约](../../docs/MEMORY-M4.md)。根提供 `set_publication_policy`、`set_formal_publication_policy`、`prepare_shared_publication(candidate, now_ms)`、`prepare_automatic_publication`、`prepare_formal_publication`、`prepare_formal_revision` 和 `commit_publication`。许可与批准均仅供受信宿主；来源白名单不是自动批准，低风险规则未定始终拒绝自动发布。
+完整语义见 [M4 契约](../../docs/MEMORY.md#共享发布)。根提供 `set_publication_policy`、`set_formal_publication_policy`、`prepare_shared_publication(candidate, now_ms)`、`prepare_automatic_publication`、`prepare_formal_publication`、`prepare_formal_revision` 和 `commit_publication`。许可与批准均仅供受信宿主；来源白名单不是自动批准，低风险规则未定始终拒绝自动发布。
 
 prepare 使用注入的真实提交时间，迟到候选重验到期/实际读取集；其结果是带实时证明的不可变命令，不是已经落盘的回执。宿主审查后应立即用相同实际提交时间提交；不能给排队命令谎报旧时间。`commit_publication` 只接受 M4 命令，并复用私有副本、追加日志、文件同步、再发布与 `Committed<WriteReceipt>`。原日志外层 v1 和命令 v1 字节不变，M4 新增命令 v2 tag 11–13。
 
@@ -95,7 +95,7 @@ fn forge(memory: &mut LocalMemory) { memory.service = moe_memory_core::MemorySer
 
 `set_read_policy`、`put_working_context`、`set_identity_view` 和 `set_entity_cache_capacity` 只配置本次进程的核心状态，返回 `Result<()>`，不追加日志、无 operationId、无持久化回执；重启全部清空，默认拒绝读取。来源元数据仍须经 `register_source` 同步提交。身份锚点由宿主可信配置重建，不从普通记忆自动升级。会话注入不分配持久化记录 ID，不改变日志重放或旧操作幂等结果。
 
-宿主显式提供精确来源白名单，再调用 `for_session(identity, session, purpose)` 得到 `LocalMemoryReader`。它只提供 `retrieve`、`entity`、`identity` 和 M3 的 `begin_task`，不能切换身份、用途或会话，也不能取根对象。核心的授权先过滤、预算、身份保护和版本化缓存规则完全复用，详见 [核心 M2 契约](../moe-memory-core/README.md#m2-授权读取)。`Unknown`、用户查看和模型传输用途仍拒绝，旧 `get` / `search` 仅限受信宿主存储检查，不得绕过 reader 充当上下文读取工具。
+宿主显式提供精确来源白名单，再调用 `for_session(identity, session, purpose)` 得到 `LocalMemoryReader`。它提供 `retrieve`、`entity`、`identity`、`begin_task`，以及配合检索适配的 `begin_candidates` / `complete_retrieval`；所有读取入口先检查本地健康状态，再由核心完整复验授权与票据。reader 不能切换身份、用途或会话，也不能取根对象。默认关键词路径和原 `RetrievalQuery` 语义保持不变，混合任务只通过密封候选票据收口为 `MemoryTask`。核心的授权先过滤、预算、身份保护和版本化缓存规则完全复用，详见 [核心 M2 契约](../moe-memory-core/README.md#m2-授权读取)。`Unknown`、用户查看和模型传输用途仍拒绝，旧 `get` / `search` 仅限受信宿主存储检查，不得绕过 reader 充当上下文读取工具。
 
 写盘候选携带配置和缓存的私有副本，仍须文件同步后才发布；失败对象连 M2 读取、缓存命中及运行时配置都返回 `RecoveryRequired`。重开验证并同步成功不等于恢复旧授权：即使完整不确定帧已恢复，也需宿主重新安装当前策略，才能读取其正文。半帧依旧明确拒绝，不自动修复。
 
@@ -217,11 +217,13 @@ operationId 在整个日志内唯一。相同 ID 与完全相同的请求返回�
 
 ## 请求上下文适配
 
-`LocalMemory` 公开 `assemble_context`、`context_view`、`begin_compaction`、`apply_compaction`，与核心同名接口一致，先检查本地健康状态，再复验真实任务和投影版本。四个接口均不追加日志、不分配 operationId、不产生耐久回执；压缩结果只是运行时未核验摘要，不能作为新事实或共享授权。重开后旧上下文及票据均失效，不确定写盘后四个入口全部拒绝。详情及核心调用示例见 [上下文契约](../../docs/MEMORY-CONTEXT.md) 和 [核心 API](../moe-memory-core/README.md)。
+`LocalMemory` 实现核心 `MemoryContextAccess` 窄 trait，关联错误为 `PersistenceError`；`begin_memory_task`、`assemble_context` 和 `context_view` 均经本地健康门后委托核心授权与失效校验。它也公开 `assemble_context`、`context_view`、`begin_compaction`、`apply_compaction`，先检查本地健康状态，再复验真实任务和投影版本。这些接口均不追加日志、不分配 operationId、不产生耐久回执；压缩结果只是运行时未核验摘要，不能作为新事实或共享授权。重开后旧上下文及票据均失效，不确定写盘后所有入口拒绝。
+
+`LocalMemory` 还以 `PersistenceError` 健康门转发核心 `set_transmission_policy`、`validate_candidate_ticket`、`bind_query_provenance`、`prepare_transmission`、`record_transmission`、`fail_transmission` 和 `recover_failed_rerank`；`LocalMemoryReader` 的 `begin_candidates` / `complete_retrieval` 同样先检查健康状态。票据、发送集合、查询来源证明和实际发送回执均原样交由核心完整复验，不开放可变 service/inner；`generation` 与 `cancel_tasks` 沿用既有入口。详情及核心调用示例见 [上下文契约](../../docs/MEMORY.md#上下文与压缩) 和 [核心 API](../moe-memory-core/README.md)。
 
 ## M3 管理与恢复
 
-完整核心语义见 [M3 契约](../../docs/MEMORY-M3.md)。`LocalMemoryClient` 提供 `archive`、`restore_archive`、`replace` 与仅元数据的 `status`；根提供 `revoke_source`、严格升版的 `restore_source`、`generation`、CAS `cancel_tasks`、`validate_task`、`create_from_task`。只有成功持久化操作返回 `Committed`，仍遵守排他锁、完整请求 operationId 幂等、私有副本、追加、文件同步、再发布的顺序。替代的旧状态与新条目写在同一帧，不会只发布一半。
+完整核心语义见 [M3 契约](../../docs/MEMORY.md#生命周期与取消)。`LocalMemoryClient` 提供 `archive`、`restore_archive`、`replace` 与仅元数据的 `status`；根提供 `revoke_source`、严格升版的 `restore_source`、`generation`、CAS `cancel_tasks`、`validate_task`、`create_from_task`。只有成功持久化操作返回 `Committed`，仍遵守排他锁、完整请求 operationId 幂等、私有副本、追加、文件同步、再发布的顺序。替代的旧状态与新条目写在同一帧，不会只发布一半。
 
 全库取消代际、来源撤权、归档/替代/删除墓碑及精确记录依赖经日志重放恢复；运行标记、读取策略、上下文、身份和缓存不恢复。`revoke_access`、`remove_working_context`、`remove_identity_view` 与配置同属运行时管理，无 operationId/耐久回执，重开后默认拒绝；恢复旧日志不能恢复宽权限。含工作条目的任务拒绝持久化派生，不能借此把会话临时输入自动升级为长期证据。
 

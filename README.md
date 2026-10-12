@@ -1,52 +1,35 @@
 # Moe Buddy
 
-以独立陪伴 Agent 为目标的新项目，记忆与 Agent 核心采用 Rust。先建立记忆、身份与权限底座，再接入对话、工具和桌宠表现，不从旧项目整体搬运固定反应逻辑。桌面壳与渲染技术另定，不因选择 Rust 自动选定某个 GUI 框架。
+以独立陪伴 Agent 为目标的 Rust 项目：先建立稳定身份、私密/共享记忆与可信交流入口，再接入真实模型、渠道和桌宠表现。
 
 ## 当前状态
 
-- 2026-10-10：M0–M5 已实现；纯核心、本地持久化、授权读取、逻辑管理、受控共享与最小离线对话保持分层。
-- 一级记忆归属仅为 private / shared，长短期属于生命周期。
-- `moe-memory-core` 对外提供 `create`、`get`、`search`、`update`、`delete`，不暴露存储集合或可变记录；修改和删除校验预期版本。
-- `moe-memory-local` 提供身份绑定的持久化 CRUD、来源版本、CAS、operationId 幂等与同步回执；排他文件锁保证单写入，写盘成功后才发布，坏档不回退空库，重启不复用已删除 ID。
-- M2 的会话 reader 先按用途、归属、精确来源白名单与有效性授权，再做相关性/预算；当前会话工作上下文与长期记录分离，身份锚点仅受信宿主配置，实体缓存按记录/来源/策略版本失效，关闭或满额退回条目检索。
-- 读取策略、会话、身份配置及缓存不写入日志；重启默认拒绝，需宿主重新安装当前授权。未知用途、用户查看及模型传输仍拒绝，旧 CRUD 读取仅供受信宿主，不是模型/传输绕过入口。
-- M3 区分纠正、替代、有效期/过期、归档/显式恢复和删除墓碑；精确记录依赖传播至会话与实体，身份仍由私密权威来源保护。来源撤权/升版恢复和全库取消代际进入日志，旧任务不能跨重启新提交。
-- M3 任务提议保留不透明实时证明，最终提交复验实际授权/读取集；完整请求幂等包含自动补边前的原始候选差异。含会话工作条目的任务不自动持久化提炼，不借管理扩权。
-- M4 普通共享候选按真实任务读取集和完整来源审查，逐候选宿主批准与正式能力/协议资料入口分离；自动规则未定始终拒绝。正式资料仅为受保护 Reference 文档，不授予工具、身份或运行协议权威。
-- M5 以 OfflineFixture 注入候选，连接受信身份、获准上下文、宿主审查、即时私密/共享提交、原始证据纠正与历史回执确认；模型失败明确拒绝，实体索引不可用退回获准条目，不伪造执行成功。
-- 记忆精进提供显式请求上下文与受控压缩：身份/正式资料原文预算、原来源及版本追溯、摘要未核验标记和投影 CAS；不覆盖事实、不自动调用模型或把临时会话升级为长期记忆。
-- 真实模型端点与传输政策、审批 GUI、持续行动、任意工具执行和真实存档迁移均未实现；OfflineReasoning 绝不替代 ModelTransmission，未知/查看/传输用途仍拒绝。删除仅是逻辑删除，不承诺清除日志历史正文。
-- Rust 工具链固定为 1.99.0，核心无第三方依赖；本机已安装 rustup、rustfmt 与 Clippy，未修改系统 PATH。
+- M0–M5、上下文精进与 G0–G5 的离线范围已交付；两项原文留存 P1 已修复，最近 workspace 独立清单为 848 项（含 doctest）；R1–R3 在线协议适配、混合检索/索引及持久化门面/离线 Agent 注入已交付离线范围，下一批 R4 质量与最终复核，真实模型门仍未验证，最新全链证据见 REVIEW。
+- 私密记忆按桌宠实例隔离，共享库可共阅不代表可共写；模型只提议，权限/来源/版本/取消及实际提交由可信服务裁决。
+- 已有预设、会话暂存、回收区、原文文件恢复和固定 CLI Hooks 适配。G6–G8 暂停，未完成真实模型/对外 HTTP 网关/微信/QQ/生产 Hooks 联调；记忆模型出站仅回环协议已验证。
+- 架构基本分层，但夹具公开、会话职责集中等整理项仍存在；Agent 现经核心窄契约注入记忆门面，不把离线全绿当作生产闭环。
+
+## 文档
+
+| 内容 | 入口 |
+| --- | --- |
+| 决策、架构、阶段和统一验证门 | [现行计划](docs/AGENT-MEMORY-PLAN.md) |
+| 记忆治理、上下文及 DSH 参考 | [记忆系统](docs/MEMORY.md) |
+| 预设、Agent、暂存/回收、文件格式和 Hooks | [网关契约](docs/GATEWAY.md) |
+| 修复、架构待整理项和验收证据 | [审核与验收](docs/REVIEW.md) |
+
+公开 API 与示例：[memory-search](crates/moe-memory-search/README.md)、[memory-core](crates/moe-memory-core/README.md)、[memory-local](crates/moe-memory-local/README.md)、[agent-runtime](crates/moe-agent-runtime/README.md)、[cli-hooks](crates/moe-cli-hooks/README.md)。raw-local 公开 API 见生成的 Rustdoc；旧项目原始材料见 [只读归档](docs/archive/pet-assistant/README.md)，不是现行实现说明。
 
 ## 验证
 
-在仓库根运行：
+工具链固定为 Rust 1.99.0。完整统一门见现行计划，最小本地检查：
 
 ```powershell
-$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo build --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build --workspace --locked
+powershell -NoProfile -File scripts/check-docs.ps1
 ```
 
-当前 314 项独立测试全部通过：保留前序实现及敏感度修复的 283 项，本批新增 22 项核心上下文测试、5 项本地适配测试、1 项不确定写盘故障测试和 3 项文档示例/封装测试；不重复计入跨进程测试的子进程输出。fmt、Clippy、workspace test/build、rustdoc（-D warnings）及活动文档检查均通过，具体结果见施工计划 §12；§6–§11 保留各阶段当时记录。
-
-文档编码、路径/锚点、围栏及空白验证可运行 `powershell -NoProfile -File scripts/check-docs.ps1`，不修改历史归档。离线合成演示及只创建新日志的运行方法见 M5 契约。
-
-## 文档入口
-
-- [新仓库施工计划](docs/AGENT-MEMORY-PLAN.md)：当前实施入口，已调整为从零建设。
-- [记忆核心外部 API](crates/moe-memory-core/README.md)：接口、使用示例、信任边界与当前限制。
-- [本地持久化 API](crates/moe-memory-local/README.md)：运行适配、版本化格式、幂等与失败恢复语义、耐久限制。
-- [M3 管理契约](docs/MEMORY-M3.md)：逻辑状态、派生闭包、取消/撤权、恢复及保留/外部副本边界。
-- [M4 发布契约](docs/MEMORY-M4.md)：实际读取集防洗白、逐候选批准、独立正式资料入口、命令及恢复边界。
-- [M5 离线对话契约](docs/MEMORY-M5.md)：上下文报告、离线候选、宿主审查/即时提交、原始证据纠正与只确认不执行的历史回执。
-- [DSH 本地源码研究](docs/DSH-MEMORY-EVOLUTION.md)：会话投影、上下文压缩、技能加载及可演化能力的借鉴与限制；不是新阶段施工授权。
-- [上下文装配与受控压缩](docs/MEMORY-CONTEXT.md)：外部接口、正文字符预算、原始证据、压缩票据及失败/重启边界。
-- [API 预设与桌宠交流入口整合](docs/API-PRESETS-AGENT-GATEWAY.md)：预设、统一 Agent、协议适配、结果/表现、短期暂存与闲时整理的综合设计；尚未实现。
-- [对外交流与会话时效设计](docs/GATEWAY-SESSION-DESIGN.md)：原文暂存、即时会话状态、30 分钟滑动窗口与闲时整理；当前为设计，尚未实现。
-- [开发约束](AGENTS.md)：分层、受控写入、验证与范围要求。
-- [历史资料索引](docs/archive/pet-assistant/README.md)：原讨论、候选规格、文章复核与旧项目施工草案。
-
-历史资料原样归档，用于保留讨论依据；其中旧项目的源码路径和已实现能力不代表 Moe Buddy 已有这些模块。
+不自行提交或推送，不默认放行云传输、全量用户查看或工具执行。

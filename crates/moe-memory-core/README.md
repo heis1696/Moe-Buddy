@@ -1,12 +1,12 @@
 # moe-memory-core
 
-M5 的 MemoryDraft 只读审查访问器完整提供正文、分类、性质、来源、生命周期、敏感度、期限和原始依赖；不授予审批、身份或可变状态。最小离线对话编排位于上层本地适配，不反向进入纯核心，见 [M5 契约](../../docs/MEMORY-M5.md)。
+M5 的 MemoryDraft 只读审查访问器完整提供正文、分类、性质、来源、生命周期、敏感度、期限和原始依赖；不授予审批、身份或可变状态。最小离线对话编排位于上层本地适配，不反向进入纯核心，见 [M5 契约](../../docs/MEMORY.md#离线对话)。
 
-Rust 标准库实现的封装记忆核心。M0 提供纯内存 CRUD，M1 增加纯命令编解码，M2 增加授权会话读取与可降级实体视图，M3 增加生命周期管理、派生依赖和取消栅栏，M4 增加受控共享发布和独立正式资料。内部模块、存储集合、记录字段和策略实现均不导出；外部只能通过 crate 根公开的服务、绑定客户端与输入/快照类型交互。
+Rust 标准库实现的封装记忆核心。M0 提供纯内存 CRUD，M1 增加纯命令编解码，M2 增加授权会话读取与可降级实体视图，M3 增加生命周期管理、派生依赖和取消栅栏，M4 增加受控共享发布和独立正式资料，R0 增加密封候选票据、混合任务复验与在线传输许可契约。内部模块、存储集合、记录字段和策略实现均不导出；外部只能通过 crate 根公开的服务、绑定客户端与输入/快照类型交互。
 
 ## M4 受控发布
 
-完整契约见 [M4 发布边界](../../docs/MEMORY-M4.md)。`set_publication_policy` 与 `set_formal_publication_policy` 分别安装逐宠普通共享和逐分区正式资料许可，均仅在运行时保存且严格升版。读许可不包含写许可；自动发布规则未定，`prepare_automatic_publication` 始终拒绝。
+完整契约见 [M4 发布边界](../../docs/MEMORY.md#共享发布)。`set_publication_policy` 与 `set_formal_publication_policy` 分别安装逐宠普通共享和逐分区正式资料许可，均仅在运行时保存且严格升版。读许可不包含写许可；自动发布规则未定，`prepare_automatic_publication` 始终拒绝。
 
 模型只能提普通候选；宿主用 `MemoryTask::propose_shared` 绑定真实读取集，审查只读候选后显式 `prepare_shared_publication(candidate, now_ms)`。漏实际来源、私密记录（包括 Normal）、会话工作项或私密身份锚点一律拒绝，不能借共享提升生命周期或敏感度。宿主必须如实绑定全部实际输入，并在真实提交时间批准/立即执行，不能将库外私密输入藏在另一个空任务后；核心不做语义脱敏或系统时钟检查。
 
@@ -69,6 +69,65 @@ use moe_memory_core::MemoryCommand;
 fn forge(mut command: MemoryCommand) { command.2 = None; }
 ```
 
+## R0 检索票据与在线传输许可
+
+完整契约见 [RAG 方案](../../docs/MEMORY.md#rag-检索扩展分批施工)。宿主用 `MemoryReader::begin_candidates` 取得密封候选票据：候选来自本次授权下的全量扫描，不受 100 条检索上限约束；票据绑定运行证明、稳定身份、会话、用途、原查询、`RetrievalPlan`（Embedding 档案与可选 rerank 档案）、策略/配置版本与代际，外部不能构造或改写。`AuthorizedCandidate` 提供只读条目和绑定本票 nonce 的引用，普通 `RetrievalItem` 快照的未绑定引用不能提交；相同 ID/版本的跨根、跨票据引用也被拒绝。`RetrievalQuery` 的只读访问器使后续适配可以直接使用票据原查询，不必另传可能不一致的正文。适配层只提交票据内候选引用与有限分数；`MemoryReader::complete_retrieval` 拒绝外来/重复引用、非有限分数，按当前授权、完整候选快照（不只 ID/版本）、有效期和预算重新逐引用取正文，生成密封交付的混合 `MemoryTask`。混合任务的 `validate_task` 逐条复验实际交付条目、身份、运行证明、权限、代际和有效期，不重跑关键词选择——合法语义命中不会被旧重查误取消。
+
+在线外传需要独立的 `TransmissionPolicy`：按 `TransmissionUsage`（QueryEmbedding / EntryEmbedding / Rerank）分别安装并严格升版，绑定目的端点、显式 `with_scope` 数据范围与精确来源版本；默认无外传范围，不从来源标签推断范围。读许可不授予传输，三种用途互不替代。QueryEmbedding/Rerank 会发送查询本身，必须由受信宿主先用 `bind_query_provenance` 声明完整查询来源及派生记录/工作上下文引用，再在策略上显式 `transmit_query()`；查询保持本宠私密归属，不从搜索范围推断归属，并且策略须允许该私密范围——空条目的查询编码和 Shared 搜索都不会替私密归属的查询取得外传权，缺查询证明即拒绝。`prepare_transmission`/`record_transmission`/`fail_transmission` 由宿主注入当前时间：发出前与返回后都按全部发送候选（不只最终入选者）复验当前读许可、来源与到期等号边界，失败保留发送审计并禁止交付。每次 `CandidateTicket` 由服务分配独立运行期身份，回执绑定签发票据及其会话/查询/范围/模型配置，另一会话、另一查询或空候选票据不能代收；候选票据和发送票据均不可克隆，单票独立 nonce 防止快照孪生的序号碰撞；发送预留有界名额，未回执的发送阻止交付，交付后不能追加发送，失败回执永久封闭该票据。发送资格按实际候选 `MemoryScope` 与查询归属核验：私密记录（即使引用共享来源）不得借 Shared-only 许可外传，必须显式允许实际私密范围，来源白名单是另一项独立检查。实际查询/发送输入的完整快照在发送票据和混合任务密封中保留（只含实际输入、有界且不序列化），贯穿准备、回执、交付与写回比较；同 epoch/代际/版本但正文不同的克隆分叉也被拒绝，未分叉克隆仍可用。实际发送但未入选的引用、来源与查询证据全部进入派生校验——`create_from_task` 必须声明全部发送来源并继承其依赖（删除任一发送记录使派生失效），发送过工作上下文仍禁止持久化；`propose_shared` 拒绝含非共享发送集的任务。单票至多预留/记录 8 次发送，每次至多 32 个引用及 32 个来源；混合 request 上限 64 KiB，并以不兼容旧查询长度字段的专用标记区分。混合任务的有界 request 字节包含规范化完整发送证据（`MemoryTask::request_bytes`），最终结果相同而实际发送集不同即为不同请求；关键词任务字节、journal/TaskStamp 布局与解码不序列化 LiveProof 的既有语义不变。本核心仍无模型、网络、文件或时钟访问；R1 已在独立 [memory-search](../moe-memory-search/README.md) 实现在线编码/HTTP 协议及精确扫描（真实模型门未验证），R2 已交付索引与混合排序，R3 已交付健康门覆盖的门面与离线 Agent 窄契约注入；真实质量门仍待 R4。失败/取消/未知网络结果由受信适配调用 `fail_transmission`：先按原回执规则记录可能发送的完整输入、复验授权，再永久封闭本票；外来失败回执不能毒化另一张票。核心仍无 I/O 或第三方依赖。
+
+候选票据的受信宿主校验入口为 `MemoryService::validate_candidate_ticket(&mut self, ticket: &CandidateTicket, now_ms: u64) -> Result<(), MemoryError>`；它核对当前运行/配置/代际、读取授权、人设快照、完整候选条目、QueryProof 与全部发送证据，并拒绝失败或有待回执的票据。只有完整留证的 Rerank 故障明确获得恢复标记、没有其他失败/待回执且当前快照仍一致时，宿主才可调用 `MemoryService::recover_failed_rerank(&mut self, ticket: &mut CandidateTicket, now_ms: u64) -> Result<CandidateTicket, MemoryError>`。恢复不复活旧票：资格仅消费一次，新票使用新运行身份和 nonce、完整重映射所有候选/QueryProof/发送引用、保留原传输证据与时间，并永久禁止再次外传；随后仍须走 `complete_retrieval`、任务交付和写回复验。它是受信宿主 API，不是模型工具。外部 `CallControl` 取消、整体 deadline 与错误分类由 search 适配层检查；核心只接收注入时间并裁决票据/授权。
+
+```rust
+use moe_memory_core::{
+    Category, EmbeddingProfile, Epistemic, MemoryDraft, MemoryError, MemoryScope, MemoryService,
+    Namespace, PetIdentity, ReadPolicy, ReadPurpose, RetrievalPlan, RetrievalQuery, SessionId,
+    TransmissionPolicy, TransmissionUsage,
+};
+fn main() -> Result<(), MemoryError> {
+    let pet = PetIdentity::new(Namespace::new("home", "user")?, "pet")?;
+    let session = SessionId::new("session")?;
+    let mut host = MemoryService::new();
+    let source = host.register_source(
+        MemoryScope::Private(pet.clone()), "message", 1, Epistemic::UserStatement,
+    )?;
+    host.for_pet(&pet).create(MemoryDraft::new(
+        "主人偏爱茉莉花茶", Category::Episode, Epistemic::UserStatement, vec![source.clone()],
+    ), 100)?;
+    host.set_read_policy(&pet, ReadPolicy::offline(1, vec![source.clone()]))?;
+    host.set_transmission_policy(&pet, TransmissionPolicy::deny_all(1, TransmissionUsage::Rerank))?;
+    let plan = RetrievalPlan::new(EmbeddingProfile::new("fixture-backend", "fixture-model", 8)?);
+    let mut reader = host.for_session(&pet, &session, ReadPurpose::OfflineReasoning);
+    let ticket = reader.begin_candidates(&RetrievalQuery::new("茶饮偏好"), plan.clone(), 100)?;
+    let ranking: Vec<_> = ticket
+        .candidates()
+        .iter()
+        .map(|item| (item.candidate_ref(), 0.9))
+        .collect();
+    let task = reader.complete_retrieval(&ticket, &ranking, 100)?;
+    assert_eq!(task.result().items().len(), 1);
+    assert_eq!(task.retrieval_plan(), Some(&plan));
+    host.validate_task(&task, 200)?;
+    Ok(())
+}
+```
+
+密封票据、发送集证据与许可来源集合同样不可从外部改写：
+
+```compile_fail
+use moe_memory_core::CandidateTicket;
+fn forge(mut ticket: CandidateTicket) { ticket.generation = 0; }
+```
+
+```compile_fail
+use moe_memory_core::TransmissionPolicy;
+fn widen(mut policy: TransmissionPolicy) { policy.sources.clear(); }
+```
+
+```compile_fail
+use moe_memory_core::TransmissionTicket;
+fn forge(mut ticket: TransmissionTicket) { ticket.sent_sources.clear(); }
+```
+
 ## 外部接口
 
 | 入口 | 用途 |
@@ -85,6 +144,9 @@ fn forge(mut command: MemoryCommand) { command.2 = None; }
 | `archive` / `restore_archive` / `replace` / `status` | 绑定客户端上的显式管理；状态仅含本宠元数据，不是用户查看入口 |
 | `revoke_source` / `restore_source` / `cancel_tasks` | 宿主根上的精确来源撤权/升版恢复、全库代际取消 |
 | `MemoryReader::begin_task` / `validate_task` / `create_from_task` | 获准实际读取集、交付前复验、受取消栅栏保护的派生新建 |
+| `MemoryReader::begin_candidates` / `complete_retrieval` | 密封全量获准候选票据、按适配排序收口为混合任务并逐引用复验 |
+| `set_transmission_policy` / `bind_query_provenance` / `prepare_transmission` / `record_transmission` / `fail_transmission` | 按用途/端点/实际数据范围/来源（及显式查询证明与许可）授予在线外传许可，发送集留证并在发出前后按当前时间复验 |
+| `MemoryContextAccess` | 绑定身份、会话、用途与原查询以开始任务，并复用核心上下文装配和复验；由 `MemoryService` 与持久化门面实现，不暴露存储内部 |
 
 每次操作都由宿主提供毫秒时间，不读取系统时钟。写回执仅证明当前内存操作成功，不表示已落盘或持久化。返回的快照不会随服务更新；调用方保留的旧副本不能由服务远程追回。
 
@@ -161,7 +223,7 @@ draft.owner_pet_id = "another-pet".to_owned();
 - `Restricted` 不在通用读取/修改/删除或 M3 记录管理接口中放行，普通更新和替代也不能把 Private 敏感度降为 Normal；M3 不扩展细粒度同意、用户查看或物理擦除权限。
 - 当前内存最多 10,000 条保留记录，另最多 100,000 个无正文删除墓碑（覆盖旧日志的 100,000 次成功操作容量）；达到上限拒绝，不驱逐历史。文本最多 4096 个 Unicode 字符，证据及直接记录依赖各最多 32 个且不能重复；检索最多 100 条。
 - ID 在同一个核心服务对象的生命周期内不复用；跨重启稳定性和回执恢复由 M1 的 `moe-memory-local` 保证，直接使用 `MemoryService::new()` 不获得持久化保证。
-- 空查询表示列举获准记录；检索目前为大小写归一的子串匹配，没有向量、图谱或自动实体消歧。
+- 空查询表示列举获准记录；默认检索仍为大小写归一的子串匹配，没有向量、图谱或自动实体消歧。语义选择只能通过 R0 密封候选票据进入核心，核心本身不计算向量，也不因票据存在而放宽用途授权。
 - 此核心无文件、网络、后台任务或系统时钟访问；持久化、跨进程写入锁和操作幂等位于独立 `moe-memory-local` 适配。M3 只交付逻辑管理闭环，不交付备份恢复、压缩或物理擦除。
 
 ## M1 适配边界
@@ -236,7 +298,9 @@ fn change(mut view: IdentityView) { view.text = "override".into(); }
 
 ## 获准上下文与压缩
 
-`assemble_context`、`context_view`、`begin_compaction`、`apply_compaction` 只管理请求投影，复用实际任务的读取/取消栅栏；不覆盖长期记忆，不调用模型。可用身份与正式资料保留原文预算；摘要标记为 `UnverifiedSummary`，来源和性质沿用原输入，不构造新证据。完整预算、失效与不落盘契约见 [上下文契约](../../docs/MEMORY-CONTEXT.md)。
+`assemble_context`、`context_view`、`begin_compaction`、`apply_compaction` 只管理请求投影，复用实际任务的读取/取消栅栏；不覆盖长期记忆，不调用模型。可用身份与正式资料保留原文预算；摘要标记为 `UnverifiedSummary`，来源和性质沿用原输入，不构造新证据。完整预算、失效与不落盘契约见 [上下文契约](../../docs/MEMORY.md#上下文与压缩)。
+
+`MemoryContextAccess` 是供 Agent 注入的窄 trait：`begin_memory_task` 绑定受信身份、会话、读取用途和 `RetrievalQuery`，`assemble_context` 与 `context_view` 继续使用本 crate 的完整授权、失效及受保护内容校验。`MemoryService` 的关联错误为 `MemoryError`；持久化实现可保留适配层自己的错误类型。
 
 ```rust
 use moe_memory_core::{
@@ -279,7 +343,7 @@ fn approve(mut ticket: CompactionTask) { ticket.revision = 999; }
 
 ## M3 管理入口
 
-完整语义、取消/恢复边界与命令 v2 见 [M3 契约](../../docs/MEMORY-M3.md)。管理接口仍仅交给受信宿主，Unknown、UserInspection、ModelTransmission 始终拒绝。
+完整语义、取消/恢复边界与命令 v2 见 [M3 契约](../../docs/MEMORY.md#生命周期与取消)。管理接口仍仅交给受信宿主，Unknown、UserInspection、ModelTransmission 始终拒绝。
 
 - `update` 是同 ID 纠正；`replace` 原子创建新 ID 并将旧条目标记为 Superseded。过期记录不能普通更新续命，需显式替代。归档保留正文，仅通过升版解归档恢复；解归档也要求有效证据、依赖和期限。
 - `MemoryDraft::with_dependencies` 声明精确 `RecordVersion`，要求完整来源及不降低敏感度。迭代检查传递闭包，覆盖派生记录、会话上下文和实体；身份视图只依赖私密权威来源。祖先失效只造成后代不可见，不自动扩大删除。
@@ -321,4 +385,19 @@ fn bypass(mut task: MemoryTask) { task.stamp.generation = 0; }
 ```compile_fail
 use moe_memory_core::MemoryStatus;
 fn forge(mut status: MemoryStatus) { status.available = true; }
+```
+
+```compile_fail
+use moe_memory_core::CandidateTicket;
+fn fork(ticket: CandidateTicket) { let _copy = ticket.clone(); }
+```
+
+```compile_fail
+use moe_memory_core::TransmissionTicket;
+fn fork(ticket: TransmissionTicket) { let _copy = ticket.clone(); }
+```
+
+```compile_fail
+use moe_memory_core::QueryProof;
+fn forge(mut proof: QueryProof) { proof.bound = true; }
 ```

@@ -1,0 +1,17 @@
+[package]
+name = "moe-cli-hooks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+moe-agent-runtime = { path = "../moe-agent-runtime" }
+serde = "1.0"
+serde_json = "1.0"
+
+[dev-dependencies]
+moe-memory-core = { path = "../moe-memory-core" }
+
+[lints]
+workspace = true

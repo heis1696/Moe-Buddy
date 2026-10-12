@@ -1,3 +1,4 @@
+mod hybrid;
 mod model;
 
 #[cfg(test)]
@@ -6,6 +7,12 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+pub use hybrid::{
+    AuthorizedCandidate, CandidateRef, CandidateTicket, EmbeddingProfile, QueryProof,
+    RerankProfile, RetrievalPlan, TransmissionEvidence, TransmissionPolicy, TransmissionTicket,
+    TransmissionUsage,
+};
+pub(crate) use hybrid::{TransmissionState, validate_hybrid_task};
 pub use model::*;
 
 use crate::validation::{MAX_RECORDS, MAX_RESULTS, MAX_SOURCES, MAX_TEXT_CHARS};
@@ -18,6 +25,7 @@ use crate::{
 pub(crate) struct ReadState {
     pub(crate) epoch: Arc<()>,
     pub(crate) configuration: u64,
+    pub(crate) ticket_sequence: u64,
     policies: BTreeMap<PetIdentity, ReadPolicy>,
     contexts: BTreeMap<(PetIdentity, SessionId), BTreeMap<String, WorkingContext>>,
     identities: BTreeMap<PetIdentity, IdentityView>,
@@ -32,6 +40,7 @@ impl Default for ReadState {
         Self {
             epoch: Arc::new(()),
             configuration: 0,
+            ticket_sequence: 0,
             policies: BTreeMap::new(),
             contexts: BTreeMap::new(),
             identities: BTreeMap::new(),
@@ -239,6 +248,16 @@ impl MemoryService {
             .ok_or(MemoryError::CapacityExceeded)
     }
 
+    pub(crate) fn next_ticket_runtime(&mut self) -> Result<u64, MemoryError> {
+        let next = self
+            .reads
+            .ticket_sequence
+            .checked_add(1)
+            .ok_or(MemoryError::CapacityExceeded)?;
+        self.reads.ticket_sequence = next;
+        Ok(next)
+    }
+
     pub(crate) fn task_configuration_current(
         &self,
         identity: &PetIdentity,
@@ -427,6 +446,7 @@ impl MemoryReader<'_> {
             result,
             identity_view,
             issued_at_ms: now_ms,
+            delivery: crate::management::Delivery::Keyword,
         })
     }
 

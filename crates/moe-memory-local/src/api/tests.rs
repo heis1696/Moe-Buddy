@@ -753,6 +753,137 @@ fn uncertain_write_blocks_every_context_entry_point() {
 }
 
 #[test]
+fn uncertain_write_blocks_every_hybrid_access_entry_point() {
+    use moe_memory_core::{
+        EmbeddingProfile, MemoryContextAccess, ReadPolicy, ReadPurpose, RerankProfile,
+        RetrievalPlan, RetrievalQuery, SessionId, TransmissionPolicy, TransmissionUsage,
+    };
+    let (mut memory, state, pet, source) = fixture();
+    let session = SessionId::new("current").unwrap();
+    let id = memory
+        .for_pet(&pet)
+        .create(
+            OperationId::new("hybrid-create").unwrap(),
+            draft(&source),
+            100,
+        )
+        .unwrap()
+        .value()
+        .id();
+    memory
+        .set_read_policy(&pet, ReadPolicy::offline(1, vec![source.clone()]))
+        .unwrap();
+    let endpoint = "https://rerank.example.test/v1";
+    memory
+        .set_transmission_policy(
+            &pet,
+            TransmissionPolicy::new(1, TransmissionUsage::Rerank, endpoint, vec![source.clone()])
+                .unwrap()
+                .transmit_query()
+                .with_scope(MemoryScope::Private(pet.clone())),
+        )
+        .unwrap();
+    let query = RetrievalQuery::new("candidate");
+    let task = MemoryContextAccess::begin_memory_task(
+        &mut memory,
+        &pet,
+        &session,
+        ReadPurpose::OfflineReasoning,
+        &query,
+        100,
+    )
+    .unwrap();
+    let context = MemoryContextAccess::assemble_context(&mut memory, &task, 100, 100).unwrap();
+    let plan = RetrievalPlan::new(EmbeddingProfile::new("fixture", "embedding", 8).unwrap())
+        .with_rerank(RerankProfile::new("fixture", "reranker").unwrap());
+    let mut ticket = memory
+        .for_session(&pet, &session, ReadPurpose::OfflineReasoning)
+        .begin_candidates(&query, plan.clone(), 100)
+        .unwrap();
+    let reference = ticket.candidates()[0].candidate_ref();
+    memory
+        .bind_query_provenance(&mut ticket, vec![source.clone()], &[], 100)
+        .unwrap();
+    let sent = memory
+        .prepare_transmission(
+            &ticket,
+            TransmissionUsage::Rerank,
+            endpoint,
+            std::slice::from_ref(&reference),
+            100,
+        )
+        .unwrap();
+    memory.fail_transmission(&mut ticket, &sent, 105).unwrap();
+
+    state.lock().unwrap().fault = Fault::Sync;
+    assert!(matches!(
+        memory.for_pet(&pet).update(
+            OperationId::new("hybrid-uncertain").unwrap(),
+            id,
+            1,
+            draft(&source),
+            110
+        ),
+        Err(PersistenceError::Io(_))
+    ));
+    let appends = state.lock().unwrap().appends;
+    macro_rules! blocked {
+        ($expression:expr) => {
+            assert!(matches!(
+                $expression,
+                Err(PersistenceError::RecoveryRequired)
+            ));
+        };
+    }
+    blocked!(memory.set_transmission_policy(
+        &pet,
+        TransmissionPolicy::deny_all(2, TransmissionUsage::Rerank)
+    ));
+    blocked!(memory.validate_candidate_ticket(&ticket, 110));
+    blocked!(memory.bind_query_provenance(&mut ticket, vec![source.clone()], &[], 110));
+    blocked!(memory.prepare_transmission(
+        &ticket,
+        TransmissionUsage::Rerank,
+        endpoint,
+        std::slice::from_ref(&reference),
+        110
+    ));
+    blocked!(memory.record_transmission(&mut ticket, &sent, 110));
+    blocked!(memory.fail_transmission(&mut ticket, &sent, 110));
+    blocked!(memory.recover_failed_rerank(&mut ticket, 110));
+    blocked!(
+        memory
+            .for_session(&pet, &session, ReadPurpose::OfflineReasoning)
+            .begin_candidates(&query, plan, 110)
+    );
+    blocked!(
+        memory
+            .for_session(&pet, &session, ReadPurpose::OfflineReasoning)
+            .complete_retrieval(&ticket, &[(reference, 0.9)], 110)
+    );
+    blocked!(MemoryContextAccess::begin_memory_task(
+        &mut memory,
+        &pet,
+        &session,
+        ReadPurpose::OfflineReasoning,
+        &query,
+        110
+    ));
+    blocked!(MemoryContextAccess::assemble_context(
+        &mut memory,
+        &task,
+        100,
+        110
+    ));
+    blocked!(MemoryContextAccess::context_view(
+        &mut memory,
+        &context,
+        110
+    ));
+    assert_eq!(state.lock().unwrap().appends, appends);
+}
+
+#[test]
 fn uncertain_archive_blocks_all_m3_entry_points_and_recovers_without_grants() {
     use moe_memory_core::{ReadPolicy, ReadPurpose, RecordState, RetrievalQuery, SessionId};
     let (mut memory, state, pet, source) = fixture();

@@ -109,6 +109,19 @@ impl MemoryTask {
         {
             return Err(MemoryError::PublicationDenied);
         }
+        if let crate::management::Delivery::Hybrid(seal) = &self.delivery
+            && seal.transmissions.iter().any(|evidence| {
+                evidence
+                    .sent_scopes()
+                    .iter()
+                    .any(|scope| scope != &MemoryScope::Shared(self.identity.namespace().clone()))
+                    || evidence.sent_sources().iter().any(|source| {
+                        source.key.scope != MemoryScope::Shared(self.identity.namespace().clone())
+                    })
+            })
+        {
+            return Err(MemoryError::PublicationDenied);
+        }
         let (draft, mut stamp) = self.derived_draft(draft)?;
         stamp.request.extend_from_slice(&now_ms.to_le_bytes());
         validate_shared_shape(&draft, self.identity.namespace(), now_ms, false)?;

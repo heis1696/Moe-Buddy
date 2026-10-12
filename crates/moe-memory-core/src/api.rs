@@ -11,6 +11,7 @@ pub struct MemoryService {
     pub(crate) store: Store,
     pub(crate) reads: crate::read::ReadState,
     pub(crate) publications: crate::publication::PublicationState,
+    pub(crate) transmissions: crate::read::TransmissionState,
 }
 
 impl MemoryService {
