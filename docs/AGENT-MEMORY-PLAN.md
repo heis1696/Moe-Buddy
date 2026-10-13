@@ -8,7 +8,7 @@
 | --- | --- |
 | 产品决策、架构、阶段范围与开发门 | 本文 |
 | 私密/共享记忆、生命周期、发布、上下文、RAG 施工方案及 DSH 研究 | [记忆系统](MEMORY.md) |
-| API 预设、可信入口、会话暂存、回收区、快照/文件格式与 Hooks | [Agent 与网关](GATEWAY.md) |
+| API 预设、可信入口、会话暂存、回收区、快照/文件格式、Hooks 与可见运行日志设计 | [Agent 与网关](GATEWAY.md) |
 | 缺陷修复、架构待整理项、验收证据与未验证范围 | [审核与验收](REVIEW.md) |
 
 各 crate README 与 Rustdoc 维护公开 API 和可运行示例；上述文档维护跨接口契约，不再复制整套说明。旧项目材料见 [只读归档](archive/pet-assistant/README.md)，不代表本仓库实现。
@@ -45,6 +45,7 @@ moe-memory-local     moe-agent-runtime
 - `AgentServices` 经核心 `MemoryContextAccess` 窄契约支持内存、LocalMemory 与显式注入的 SearchMemory；默认关键词不变，后端健康错误原样保留，完整读取/查询/实际发送来源均受会话许可约束。此为离线最小接线，不是生产闭环；夹具公开、职责集中和全局失效等整理项见 [审核意见](REVIEW.md#3-分级整理意见)。
 - RAG 属于记忆系统内部扩展，不另建业务系统或记忆大类。已新增唯一 `moe-memory-search` 适配 crate，实现 OpenAI-compatible 在线 Embedding、Cohere v2 可选 rerank 和纯精确扫描；R2 已实现索引生命周期与混合召回，R3 已完成持久化健康门和离线 Agent 注入；R4 离线质量工程/基准已实施，本地模型与真实完整质量评估仍未验证。核心继续负责授权、版本与上下文；适配层依赖评审和精确版本见其 README，不让 Agent 反向依赖它。在线计算不要求云端存储记忆，不因配置 API Key 自动获得外传权。实施边界、依赖评审、窄接口与验收见 [RAG 方案](MEMORY.md#rag-检索扩展分批施工)。
 - 不迁入旧项目 UI、动画、依赖或存档；桌面壳与渲染方案另定，不因采用 Rust 自动选定 GUI 框架。
+- [可见运行日志](GATEWAY.md#可见运行日志) 当前仅完成后台消息、错误与运行记录的设计；不同于记忆持久化日志，不授予额外查看/落盘/导出权，不改变 R4 当前批次或 G6–G8 暂停状态，未自动启动实现。
 
 ## 阶段与暂停范围
 
