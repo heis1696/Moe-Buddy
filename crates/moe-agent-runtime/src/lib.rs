@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod agent;
+mod diagnostics;
 mod error;
 mod hooks;
 mod ingress;
@@ -12,6 +13,15 @@ pub use agent::{
     AgentAccess, AgentBinding, AgentDelivery, AgentError, AgentLimits, AgentResult, AgentRuntime,
     AgentServices, AgentTask, ModelFailure, ModelOutcome, OfflineInput, OfflineModel,
     PresentationEvent,
+};
+pub use diagnostics::{
+    BackgroundCode, CaptureSetting, CaptureStrategy, Category, CategorySet, ClockReading,
+    DetailLevel, DiagnosticKind, DiagnosticsConfig, DiagnosticsError, DiagnosticsService,
+    EmitOutcome, ErrorCode, EventCode, EventInput, Gap, HardBudgets, HealthSnapshot, KnownFailure,
+    LOG_SCHEMA_VERSION, LogAccess, LogCursor, LogEmitter, LogEntry, LogFilter, MessageKey,
+    OpaqueAlias, OperationState, PageDirection, QueryPage, Redaction, RetryHint, RunHandle,
+    RunList, RunObservation, RunSummary, Severity, Source, StableDomain, Step, TransportState,
+    ViewerGrant, ViewerSubject,
 };
 pub use error::GatewayError;
 pub use hooks::{

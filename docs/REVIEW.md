@@ -243,6 +243,17 @@ P2 是正式宿主接线前应收口的维护/架构项，不等同于已发生�
 - 在主目录重新实际通过 core hybrid 49 项、search 全目标、fmt、全目标 Clippy `-D warnings`、workspace test/build、严格 Rustdoc、11 份活动 Markdown、暂存及工作区 diff 检查；test/doc 均设 `RUSTDOCFLAGS=-D warnings`，Cargo 构建/测试使用 `--locked --offline`。独立 `-- --list` 清单仍为 879 项，没有沿用集成工作树的编译通过结论。
 - 合并备份、补丁及本轮主目录验证日志在本机忽略目录 `target/main-integration-20261013`；构建产物、工作树、环境/密钥文件和向量缓存均未纳入版本控制。完整 R4 真实模型质量门仍未完成，提交推送不等于产品或真实模型验收。
 
+## 可见运行日志首批内存交付（2026-10-13）
+
+- 范围：按用户明确启动，在 `moe-agent-runtime` 新增 `diagnostics.rs`、受控导出及合成 `tests/diagnostics.rs`。标准库纯内存实现，默认关闭，采集和查看分别配置；没有新增 crate、依赖、I/O、真实业务接线、GUI、文件或导出，不改记忆日志、业务账本、R4 及 G6–G8 的既有边界。
+- 交付：宿主注入进程代际/稳定域/主体/许可/单调时间，服务签发不可外部构造的 emitter/access/run/cursor；每次读取复验。分区硬预算包含实际容器容量、健康、索引、别名及 cursor。白名单事件、安全错误码、正反向快照分页、安全搜索、健康查询、运行别名查询与业务/传输双状态投影已有针对性回归。
+- 复核闭环：修复跨分区双状态证据被共享水位吞掉、崩溃严重度错误、错误输出残留与查询缺项。独立审查另发现 1 项 P1（自定义 Hasher 可抽取 opaque 别名私有域/主体偏移）及 3 项 P2（服务地址复用导致别名碰撞、同毫秒跨分区倒序、已知拒收仍宣称证据完整）；领队移除公开别名 Hash、引入 checked 实例标识与宿主跨重启代际、按受理顺序投影并隔离私有序号的等值比较、将可见拒收/省略纳入完整性判断，补入正式回归及 compile-fail 契约。
+- 容量语义：事件是可淘汰保留窗口；运行登记与别名是代际累计额度，到限明确拒绝，不承诺无限尾随。可见分区损失会保守影响同域其他可见运行，不是逐运行精确丢失追踪；隐藏分区不影响可见结果。字节计费使用实际 Vec 容量与保守固定开销，不声称测量分配器元数据或系统峰值。
+- 最终实际验证：日志集成回归 24 项、模块内单元回归 4 项通过，另有 README 合成示例及 opaque 别名禁用 Hash 的 compile-fail 契约。领队已在主工作区通过 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked --offline -- -D warnings`、`cargo test --workspace --locked --offline`、`cargo build --workspace --locked --offline`、`cargo doc --workspace --no-deps --locked --offline`；test/doc 设置 `RUSTDOCFLAGS=-D warnings`。独立 `cargo test --workspace --locked --offline -- --list` 清单为 932 项（含 doctest，不累加子进程输出），11 份活动 Markdown 的 UTF-8/路径/锚点/格式门及 `git diff --check` 通过。原始最终门日志在本机忽略目录 `target/diagnostics-validation-20261013`。补充回归修复了反向查询整页容纳保留窗口时漏报已淘汰前缀的 Gap，崩溃码固定为 `process.crashed`。
+- 最终独立复核通过：原 1 项 P1、3 项 P2 均确认闭环，限定日志范围内未发现新的可复现 P0/P1/P2。复核队员从当前源码重新编译并实际通过集成 24 项、单元 4 项及 Hash compile-fail 1 项；隔离工作副本的忽略区另有 5 项探针通过，覆盖隐藏分区损失/其他主体查询非干扰、跨主体/域/服务/代际别名解析拒绝、运行 cursor 隔离、六个可见分区正反分页及淘汰缺口。探针不进入正式测试、不计入 932 项清单；队员未复跑 workspace 全链门，其结论不替代领队的最终门记录。本轮仅补文档，重新通过活动 Markdown 与 diff 检查。
+- 提交前隔离验证（用户明确授权精简指南并 commit/push）：本次仅提交日志模块、相关契约/验收与精简后的 AGENTS 接入索引，不包含并行流程层或动画计划的未提交改动。上述主工作区 932 项包含并行流程层变更；从暂存区导出的独立提交快照实际通过 fmt、workspace clippy/test/build/doc（locked/offline，test/doc 设置 `RUSTDOCFLAGS=-D warnings`），独立测试清单为 909 项，活动 Markdown 与 diff 检查亦通过。原始日志位于本机忽略目录 `target/diagnostics-commit-validation-20261013`，不把并行任务的结果冒充本提交独立验收。
+- 本批没有授权自动施工的后续日志阶段。业务采集、查看器缓存租约/缓存管理、重复告警合并、优先级预留、文件与导出均未实现；桌面和真实模型/渠道仍未验收，既有其他任务的未提交改动保持不动。提交推送已获用户明确授权，不创建新分支。
+
 ## 历史验收
 
 下表压缩原施工记录，只记录各快照当时的独立测试清单，不把前后快照相加、不重复计算子进程输出，也不代表今天重跑了历史版本。当前范围仍见现行计划。

@@ -450,6 +450,58 @@ use moe_agent_runtime::RawHistoryGrant;
 let forged = RawHistoryGrant {};
 ```
 
+## 可见运行日志：首批纯内存服务
+
+`DiagnosticsService::default()` 关闭采集。受信宿主先用 `DiagnosticsConfig::new(process_generation, budgets)` 显式配置进程代际，再通过 `add_domain` 声明精确稳定域、采集策略及查看许可，最后 `enable`。代际必须非零且跨重启不复用；域必须映射完整稳定实例身份或独立授权的宿主诊断域，不能用昵称、当前角色或“所有桌宠”替代。下例仅为合成离线配置，不批准生产采集级别、预算或保留策略。
+
+- `create_run/create_emitter` 只供受信宿主调用；模型、Hook 输入与查询参数不能签发它们。采集与查看许可独立，公开封闭枚举只是诊断数据，不证明实际业务已经执行；宿主必须映射真实返回值/精确回执，无证据时用 Unknown。
+- `authorize` 签发绑定服务、域、主体、版本与期限的 `LogAccess`；所有读取再次复验。`disable/enable` 是当前重配置/撤权入口，丢弃旧诊断并使全部旧 emitter/access/run/cursor 失效；授权改回原版本也不复活。到期或已观察到单调时钟回拨的许可不再使用。
+- `query_into`、`health_into`、`list_runs_into` 与 `inspect_run_alias_into` 写入调用方有界切片；服务不无限分配输出或缓存。查询支持固定枚举过滤、单调时间半开区间、最多 96 UTF-8 字节安全模板搜索及 `PageDirection` 正反分页。后续页必须传原过滤和 cursor；cursor 消费后旧票据失效，提前结束用 `close_cursor` 释放服务槽位。
+- 事件数、实际容器容量/字节、域、运行登记、别名、健康槽、cursor、页大小与查询工作量均受硬预算约束。事件槽按域×类别×详细度分区循环复用；运行登记和每查看授权的别名映射是重配置前累计上限，不回收或复用标识，到限明确拒绝。别名不提供 `Hash` 或序列化，去重使用有界等值索引；不承诺持续无限尾随。同步服务仅接受并发查询预算 1。
+- `Gap::Possible` 表示可见历史存在缺口，数量未知；运行摘要不是业务账本。业务与传输状态独立，Completed 不等于 Written，更不等于 CLI 消费。可见采集损失保守标记证据不完整，隐藏分区不影响可见分页、健康及摘要；读取失败清空输出，不回退打印原始错误。
+
+```rust
+use moe_agent_runtime::{
+    BackgroundCode, CaptureStrategy, Category, CategorySet, ClockReading, DetailLevel,
+    DiagnosticKind, DiagnosticsConfig, DiagnosticsService, EventInput, HardBudgets,
+    LogFilter, Source, StableDomain, ViewerGrant, ViewerSubject,
+};
+
+let domain = StableDomain::new("synthetic-private-pet")?;
+let viewer = ViewerSubject::new("synthetic-viewer")?;
+let budgets = HardBudgets {
+    max_domains: 1, max_grants_per_domain: 1,
+    events_per_partition: 8, runs_per_partition: 4, aliases_per_partition: 16,
+    cursors_per_grant: 2, max_page_size: 2, max_query_work: 1024,
+    max_summaries_per_query: 4, max_health_slots: 9, max_concurrent_queries: 1,
+    max_event_bytes: 2048, max_allocated_bytes: 1_048_576,
+};
+let categories = CategorySet::only(Category::Background);
+let grant = ViewerGrant::new(viewer, 1, 1000, categories, DetailLevel::Essential);
+let mut config = DiagnosticsConfig::new(1, budgets)?;
+config.add_domain(domain, CaptureStrategy::all_through(DetailLevel::Essential), &[grant])?;
+let mut diagnostics = DiagnosticsService::default();
+diagnostics.enable(config)?;
+let access = diagnostics.authorize(domain, viewer, 1, ClockReading {
+    monotonic_ms: 0, wall_clock_ms: None,
+})?;
+let emitter = diagnostics.create_emitter(domain, None)?;
+diagnostics.emit(&emitter, EventInput {
+    source: Source::Host, detail: DetailLevel::Essential, elapsed_ms: None,
+    kind: DiagnosticKind::Background(BackgroundCode::ServiceStarted),
+}, ClockReading { monotonic_ms: 1, wall_clock_ms: None })?;
+let mut entries = [None; 2];
+let page = diagnostics.query_into(
+    &access, LogFilter::all().categories(categories), None,
+    ClockReading { monotonic_ms: 2, wall_clock_ms: None }, &mut entries,
+)?;
+assert_eq!(page.returned, 1);
+assert_eq!(entries[0].unwrap().occurred_at_ms(), None);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+没有 Agent/记忆/Hooks 的自动采集接线、文件、终端输出、导出、桌面查看器或查看端缓存租约；没有重复告警合并和终态优先级预留。交付 DTO 不是长期展示许可，后续查看器仍须实现独立预算、租约、断连/撤权清缓存；现阶段不挂载此类查看器。完整目标与首批限制见 [网关契约](../../docs/GATEWAY.md#可见运行日志)，实际验证见 [审核记录](../../docs/REVIEW.md#可见运行日志首批内存交付2026-10-13)。
+
 ## 当前限制
 
 G0–G3 没有监听服务、兼容 HTTP 解析、流式协议、QQ/微信/Hooks、真实模型调用、长期整理提交或工具执行。G4 步骤 2 只交付运行层内的无 I/O 快照导出/导入契约：没有文件存储、锁、崩溃原子性或断电耐久（`moe-raw-local` 另批交付），快照可被整份伪造，内容真实性仅由非密码学校验和覆盖，防重放栅栏不含运行局部请求序号。从未被当前权威栅栏记录过的旧正文快照无法被运行层单独识别为过期——适配必须持久化并呈现最新快照与栅栏。稳定凭据归属及其授权修订由受信宿主声明，运行层只保证"未声明即拒绝、声明即精确比对、在册凭据归属不可中途改写、一条归属同时只属一张在册凭据、修订只前进且已退役修订不可重绑"，无法验证宿主所报归属是否真是跨重启同一逻辑凭据或其修订语义是否属实。G3 回收区与恢复在当前运行实例的有界内存内成立；持久化导出/导入要求宿主在单一受信 Unix epoch 毫秒时间轴上注入时间，运行层无法自行验证时间轴，谎报时间不可检测。本机管理能力与历史许可是离线宿主能力契约，不是 OS 登录认证、密码学 capability 或本机 GUI，宿主根接口不得作为模型工具、Hook 或远程 API 开放。安装、会话、Agent、管理、导出与导入 API 是受信宿主边界，不是模型可调用工具；不收集鉴权头、供应商密钥、隐藏推理或真实用户记录作为默认事件。含会话工作项的记忆任务仍禁止持久化派生，运行层不提供任何长期写入或自动共享路径。
