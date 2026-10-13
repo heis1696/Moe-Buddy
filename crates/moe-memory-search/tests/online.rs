@@ -457,6 +457,97 @@ async fn key_and_read_permission_do_not_authorize_transmission() {
     assert_eq!(server.count(), 0);
 }
 
+#[test]
+fn transport_tuning_preserves_embedding_and_rerank_space_identity() {
+    let embedding_endpoint = "https://example.test/v1/embeddings";
+    let rerank_endpoint = "https://example.test/v2/rerank";
+    let embedding = OnlineEmbedding::new(
+        embedding_endpoint,
+        "fixture-key",
+        "model-r1",
+        2,
+        OnlineOptions::default(),
+    )
+    .unwrap();
+    let rerank = CohereReranker::new(
+        rerank_endpoint,
+        "fixture-key",
+        "model-r1",
+        OnlineOptions::default(),
+    )
+    .unwrap();
+    for options in [
+        OnlineOptions {
+            request_timeout: Duration::from_secs(16),
+            ..OnlineOptions::default()
+        },
+        OnlineOptions {
+            max_attempts: 3,
+            ..OnlineOptions::default()
+        },
+        OnlineOptions {
+            retry_delay: Duration::from_millis(500),
+            ..OnlineOptions::default()
+        },
+        OnlineOptions {
+            request_timeout: Duration::from_secs(60),
+            max_attempts: 2,
+            retry_delay: Duration::from_secs(30),
+            ..OnlineOptions::default()
+        },
+    ] {
+        let tuned_embedding = OnlineEmbedding::new(
+            embedding_endpoint,
+            "rotated-fixture-key",
+            "model-r1",
+            2,
+            options.clone(),
+        )
+        .unwrap();
+        let tuned_rerank =
+            CohereReranker::new(rerank_endpoint, "rotated-fixture-key", "model-r1", options)
+                .unwrap();
+        assert_eq!(embedding.profile(), tuned_embedding.profile());
+        assert_eq!(rerank.profile(), tuned_rerank.profile());
+    }
+}
+
+#[test]
+fn encoding_configuration_changes_still_partition_model_profiles() {
+    let endpoint = "https://example.test/v1/embeddings";
+    let baseline = OnlineEmbedding::new(
+        endpoint,
+        "fixture-key",
+        "model-r1",
+        2,
+        OnlineOptions::default(),
+    )
+    .unwrap();
+    for (endpoint, model, dimension, options) in [
+        (
+            "https://other.test/v1/embeddings",
+            "model-r1",
+            2,
+            OnlineOptions::default(),
+        ),
+        (endpoint, "model-r2", 2, OnlineOptions::default()),
+        (endpoint, "model-r1", 3, OnlineOptions::default()),
+        (
+            endpoint,
+            "model-r1",
+            2,
+            OnlineOptions {
+                max_input_bytes: 512,
+                ..OnlineOptions::default()
+            },
+        ),
+    ] {
+        let changed =
+            OnlineEmbedding::new(endpoint, "fixture-key", model, dimension, options).unwrap();
+        assert_ne!(baseline.profile(), changed.profile());
+    }
+}
+
 #[tokio::test]
 async fn cohere_v2_maps_all_scores_to_original_references() {
     let server = Server::new(vec![Reply::json(

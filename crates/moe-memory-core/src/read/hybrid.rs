@@ -964,13 +964,18 @@ impl MemoryReader<'_> {
         ranking: &[(CandidateRef, f64)],
         now_ms: u64,
     ) -> Result<MemoryTask, MemoryError> {
-        let current = validate_candidate_ticket_state(self, ticket, now_ms, false, false)?;
+        validate_candidate_ticket_state(self, ticket, now_ms, false, false)?;
+        let candidates: BTreeMap<_, _> = ticket
+            .candidates
+            .iter()
+            .map(|candidate| (&candidate.reference, &candidate.item))
+            .collect();
         let mut seen = BTreeSet::new();
         for (reference, score) in ranking {
             if !score.is_finite() {
                 return Err(MemoryError::InvalidInput("relevance score must be finite"));
             }
-            if ticket.candidate(reference).is_none() || !seen.insert(reference) {
+            if !candidates.contains_key(reference) || !seen.insert(reference) {
                 return Err(MemoryError::InvalidEvidence);
             }
         }
@@ -981,17 +986,6 @@ impl MemoryReader<'_> {
             .flat_map(|item| item.sent_entries.iter().cloned())
             .collect();
         let inputs = ticket_inputs(ticket, &input_refs.into_iter().collect::<Vec<_>>())?;
-        let mut delivered = Vec::with_capacity(ranking.len());
-        for (reference, _) in ranking {
-            let item = current
-                .iter()
-                .find(|candidate| candidate.candidate_ref().kind == reference.kind)
-                .ok_or(MemoryError::TaskCancelled)?;
-            if ticket.candidate(reference) != Some(item) {
-                return Err(MemoryError::TaskCancelled);
-            }
-            delivered.push((reference.clone(), item.clone()));
-        }
         let identity_view = self.identity().ok();
         if identity_view != ticket.identity_view {
             return Err(MemoryError::TaskCancelled);
@@ -1000,15 +994,18 @@ impl MemoryReader<'_> {
             items: Vec::new(),
             used_chars: 0,
         };
-        let mut entries = Vec::with_capacity(delivered.len());
-        for (reference, item) in delivered {
+        let mut entries = Vec::with_capacity(ranking.len().min(ticket.query.search.limit));
+        for (reference, _) in ranking {
+            let item = candidates
+                .get(reference)
+                .ok_or(MemoryError::InvalidEvidence)?;
             let cost = item.text().chars().count();
             if cost > ticket.query.char_budget - result.used_chars {
                 continue;
             }
             result.used_chars += cost;
-            entries.push(reference);
-            result.items.push(item);
+            entries.push(reference.clone());
+            result.items.push((*item).clone());
             if result.items.len() == ticket.query.search.limit {
                 break;
             }

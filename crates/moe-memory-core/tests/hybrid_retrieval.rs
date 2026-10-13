@@ -188,6 +188,120 @@ fn foreign_services_pets_and_duplicate_references_are_rejected() {
 }
 
 #[test]
+fn complete_retrieval_validates_the_entire_ranking_even_past_delivery_limits() {
+    let (mut service, owner, source) = private_fixture("alice", "seed");
+    for text in ["a", "b", "c", "d", "e"] {
+        service
+            .for_pet(&owner)
+            .create(draft(text, &source), 100)
+            .unwrap();
+    }
+    for query in [
+        RetrievalQuery::new("").with_limit(5),
+        RetrievalQuery::new("").with_limit(20).with_char_budget(4),
+    ] {
+        let ticket = reader(&mut service, &owner)
+            .begin_candidates(&query, plan(), 100)
+            .unwrap();
+        let other = reader(&mut service, &owner)
+            .begin_candidates(&query, plan(), 100)
+            .unwrap();
+        let ranking: Vec<_> = ticket
+            .candidates()
+            .iter()
+            .take(5)
+            .map(|candidate| (candidate.candidate_ref(), 1.0))
+            .collect();
+        let valid_tail = ticket.candidates()[5].candidate_ref();
+        for (tail, expected) in [
+            ((ranking[0].0.clone(), 1.0), MemoryError::InvalidEvidence),
+            (
+                (other.candidates()[5].candidate_ref(), 1.0),
+                MemoryError::InvalidEvidence,
+            ),
+            (
+                (ticket.candidates()[5].item().candidate_ref(), 1.0),
+                MemoryError::InvalidEvidence,
+            ),
+            (
+                (valid_tail.clone(), f64::NAN),
+                MemoryError::InvalidInput("relevance score must be finite"),
+            ),
+            (
+                (valid_tail.clone(), f64::INFINITY),
+                MemoryError::InvalidInput("relevance score must be finite"),
+            ),
+            (
+                (valid_tail.clone(), f64::NEG_INFINITY),
+                MemoryError::InvalidInput("relevance score must be finite"),
+            ),
+        ] {
+            let mut malformed = ranking.clone();
+            malformed.push(tail);
+            assert_eq!(
+                reader(&mut service, &owner)
+                    .complete_retrieval(&ticket, &malformed, 100)
+                    .unwrap_err(),
+                expected
+            );
+        }
+        let task = reader(&mut service, &owner)
+            .complete_retrieval(&ticket, &ranking, 100)
+            .unwrap();
+        assert_eq!(
+            task.result().items().len(),
+            if query.limit() == 5 { 5 } else { 1 }
+        );
+    }
+}
+
+#[test]
+fn large_complete_ranking_delivers_only_budgeted_top_five_in_rank_order() {
+    let (mut service, owner, source) = private_fixture("alice", "record-00000");
+    for position in 1..10_000 {
+        service
+            .for_pet(&owner)
+            .create(draft(&format!("record-{position:05}"), &source), 100)
+            .unwrap();
+    }
+    let query = RetrievalQuery::new("").with_limit(5).with_char_budget(60);
+    let ticket = reader(&mut service, &owner)
+        .begin_candidates(&query, plan(), 100)
+        .unwrap();
+    assert_eq!(ticket.candidates().len(), 10_000);
+    let ranking: Vec<_> = ticket
+        .candidates()
+        .iter()
+        .rev()
+        .map(|candidate| (candidate.candidate_ref(), 1.0))
+        .collect();
+    let task = reader(&mut service, &owner)
+        .complete_retrieval(&ticket, &ranking, 100)
+        .unwrap();
+    assert_eq!(
+        task.result()
+            .items()
+            .iter()
+            .map(|item| item.text())
+            .collect::<Vec<_>>(),
+        [
+            "record-09999",
+            "record-09998",
+            "record-09997",
+            "record-09996",
+            "record-09995"
+        ]
+    );
+    assert_eq!(task.result().used_chars(), 60);
+    assert_eq!(task.retrieval_plan(), Some(&plan()));
+    let context = service.assemble_context(&task, 60, 100).unwrap();
+    assert_eq!(
+        service.context_view(&context, 100).unwrap().blocks().len(),
+        5
+    );
+}
+
+#[test]
 fn non_finite_scores_are_rejected() {
     let (mut service, owner, _source) = private_fixture("alice", "tea note");
     let ticket = reader(&mut service, &owner)

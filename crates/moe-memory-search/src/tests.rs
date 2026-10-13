@@ -6,7 +6,7 @@ use std::time::Duration;
 use moe_memory_core::{
     CandidateTicket, Category, EmbeddingProfile, Epistemic, MemoryContextAccess, MemoryDraft,
     MemoryError, MemoryScope, MemoryService, Namespace, PetIdentity, ReadPolicy, ReadPurpose,
-    RetrievalPlan, RetrievalQuery, SearchScope, SessionId, SourceRef,
+    RetrievalLayer, RetrievalPlan, RetrievalQuery, SearchScope, SessionId, SourceRef,
 };
 use moe_memory_local::{LocalMemory, OperationId, PersistenceError};
 
@@ -2010,4 +2010,227 @@ fn reopened_index_rejects_old_completed_batches_and_keeps_new_vectors() {
     .unwrap();
     assert!(stale.ranking().is_empty());
     assert_eq!(stale.mode(), SearchMode::Hybrid);
+}
+
+#[test]
+fn working_context_queries_preserve_long_term_vectors_and_queued_records() {
+    let mut fixture = Fixture::new(&["tea", "coffee"]);
+    let mut index = SearchIndex::new(
+        StorageDomain::new("trusted-root-a").unwrap(),
+        fixture.profile.clone(),
+        chunks(),
+        256,
+        1,
+        4096,
+    )
+    .unwrap();
+    let long_term = fixture.ticket(RetrievalQuery::new("").with_layer(RetrievalLayer::LongTerm));
+    let batch = index
+        .take_batch(&mut fixture.host, &long_term)
+        .unwrap()
+        .unwrap();
+    index
+        .commit(
+            &mut fixture.host,
+            &long_term,
+            CompletedIndexBatch {
+                batch,
+                vectors: vec![UnitVector::new(vec![1.0, 0.0], 2).unwrap()],
+            },
+        )
+        .unwrap();
+    assert_eq!(index.entries.len(), 1);
+    let working =
+        fixture.ticket(RetrievalQuery::new("").with_layer(RetrievalLayer::WorkingContext));
+    let status = index.reconcile(&mut fixture.host, &working).unwrap();
+    assert_eq!(status.candidates, 0);
+    assert_eq!(status.indexed_records, 0);
+    assert_eq!(status.missing_chunks, 0);
+    assert!(
+        index
+            .take_batch(&mut fixture.host, &working)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(index.entries.len(), 1);
+    fill(&mut index, &mut fixture, &long_term, |_| vec![1.0, 0.0]);
+    let status = index.reconcile(&mut fixture.host, &long_term).unwrap();
+    assert_eq!(status.indexed_records, 2);
+    assert_eq!(status.missing_chunks, 0);
+}
+
+#[test]
+fn formal_and_ordinary_layers_preserve_each_others_vectors_and_pending_work() {
+    let mut fixture = Fixture::new(&["tea", "coffee"]);
+    let namespace = fixture.owner.namespace().clone();
+    let source = fixture
+        .host
+        .service
+        .register_source(
+            MemoryScope::Shared(namespace.clone()),
+            "formal",
+            1,
+            Epistemic::Reference,
+        )
+        .unwrap();
+    fixture
+        .host
+        .service
+        .set_formal_publication_policy(
+            &namespace,
+            moe_memory_core::PublicationPolicy::allow_sources(1, vec![source.clone()]),
+        )
+        .unwrap();
+    for text in ["formal protocol", "formal reference"] {
+        let command = fixture
+            .host
+            .service
+            .prepare_formal_publication(
+                &namespace,
+                MemoryDraft::new(
+                    text,
+                    Category::Protocol,
+                    Epistemic::Reference,
+                    vec![source.clone()],
+                ),
+                100,
+            )
+            .unwrap();
+        command.execute(&mut fixture.host.service).unwrap();
+    }
+    fixture
+        .host
+        .service
+        .set_read_policy(
+            &fixture.owner,
+            ReadPolicy::offline(2, vec![fixture.source.clone(), source]),
+        )
+        .unwrap();
+    let mut index = SearchIndex::new(
+        StorageDomain::new("trusted-root-a").unwrap(),
+        fixture.profile.clone(),
+        chunks(),
+        256,
+        1,
+        4096,
+    )
+    .unwrap();
+    let ordinary = fixture.ticket(RetrievalQuery::new("").with_layer(RetrievalLayer::LongTerm));
+    let formal = fixture.ticket(RetrievalQuery::new("").with_layer(RetrievalLayer::FormalMaterial));
+    for ticket in [&ordinary, &formal] {
+        let batch = index
+            .take_batch(&mut fixture.host, ticket)
+            .unwrap()
+            .unwrap();
+        index
+            .commit(
+                &mut fixture.host,
+                ticket,
+                CompletedIndexBatch {
+                    batch,
+                    vectors: vec![UnitVector::new(vec![1.0, 0.0], 2).unwrap()],
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(index.entries.len(), 2);
+    fill(&mut index, &mut fixture, &ordinary, |_| vec![1.0, 0.0]);
+    assert_eq!(index.entries.len(), 3);
+    fill(&mut index, &mut fixture, &formal, |_| vec![1.0, 0.0]);
+    assert_eq!(index.entries.len(), 4);
+    for layer in [
+        RetrievalLayer::All,
+        RetrievalLayer::FormalMaterial,
+        RetrievalLayer::LongTerm,
+    ] {
+        let ticket = fixture.ticket(RetrievalQuery::new("tea").with_layer(layer));
+        let config = fixture.config(0.8);
+        let ranked = hybrid_rank(
+            &mut index,
+            &mut fixture.host,
+            &ticket,
+            Some(&encoded(&ticket, vec![1.0, 0.0])),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(ranked.status().indexed_records, 2);
+        assert_eq!(ranked.status().missing_chunks, 0);
+        assert_eq!(ranked.ranking().len(), 2);
+        assert_eq!(index.entries.len(), 4);
+        assert!(ranked.ranking().iter().all(|(reference, _)| {
+            let moe_memory_core::RetrievalItem::LongTerm(record) =
+                ticket.candidate(reference).unwrap()
+            else {
+                return false;
+            };
+            record.is_protected() == (layer == RetrievalLayer::FormalMaterial)
+        }));
+    }
+}
+
+#[test]
+fn preserved_out_of_layer_vectors_are_still_removed_by_authoritative_reconciliation() {
+    for mutation in ["update", "delete", "revoke"] {
+        let mut fixture = Fixture::new(&["tea"]);
+        let mut index = fixture.index();
+        let ticket = fixture.ticket(RetrievalQuery::new("tea"));
+        let record = ticket.candidates()[0].candidate_ref().record().unwrap();
+        fill(&mut index, &mut fixture, &ticket, |_| vec![1.0, 0.0]);
+        match mutation {
+            "update" => {
+                fixture
+                    .host
+                    .service
+                    .for_pet(&fixture.owner)
+                    .update(
+                        record.id(),
+                        record.revision(),
+                        draft("coffee", &fixture.source),
+                        101,
+                    )
+                    .unwrap();
+            }
+            "delete" => {
+                fixture
+                    .host
+                    .service
+                    .for_pet(&fixture.owner)
+                    .delete(record.id(), record.revision(), 101)
+                    .unwrap();
+            }
+            "revoke" => {
+                fixture.host.service.revoke_source(&fixture.source).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        fixture.host.now = 101;
+        let working =
+            fixture.ticket(RetrievalQuery::new("").with_layer(RetrievalLayer::WorkingContext));
+        let config = fixture.config(0.8);
+        let ranked = hybrid_rank(
+            &mut index,
+            &mut fixture.host,
+            &working,
+            Some(&encoded(&working, vec![1.0, 0.0])),
+            &config,
+        )
+        .unwrap();
+        assert!(ranked.ranking().is_empty());
+        assert_eq!(index.entries.len(), 1);
+        let current =
+            fixture.ticket(RetrievalQuery::new("tea").with_layer(RetrievalLayer::LongTerm));
+        let status = index.reconcile(&mut fixture.host, &current).unwrap();
+        assert!(index.entries.is_empty());
+        assert_eq!(status.missing_chunks, usize::from(mutation == "update"));
+        if mutation == "update" {
+            fill(&mut index, &mut fixture, &current, |_| vec![0.0, 1.0]);
+            assert_eq!(index.entries.len(), 1);
+            assert!(
+                index
+                    .entries
+                    .values()
+                    .all(|stored| stored.input.text() == "coffee")
+            );
+        }
+    }
 }

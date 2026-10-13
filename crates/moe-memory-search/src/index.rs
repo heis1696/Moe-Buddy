@@ -296,8 +296,11 @@ impl SearchIndex {
         Ok(slices)
     }
 
-    fn in_scope(ticket: &CandidateTicket, scope: &MemoryScope) -> bool {
-        match scope {
+    fn covered_by_ticket(ticket: &CandidateTicket, input: &RetrievalItem) -> bool {
+        let RetrievalItem::LongTerm(record) = input else {
+            return false;
+        };
+        let in_scope = match record.scope() {
             MemoryScope::Private(owner) => {
                 owner == ticket.identity() && ticket.query().scope() != SearchScope::Shared
             }
@@ -305,10 +308,17 @@ impl SearchIndex {
                 namespace == ticket.identity().namespace()
                     && ticket.query().scope() != SearchScope::Private
             }
-        }
+        };
+        in_scope
+            && match ticket.query().layer() {
+                moe_memory_core::RetrievalLayer::WorkingContext => false,
+                moe_memory_core::RetrievalLayer::FormalMaterial => record.is_protected(),
+                moe_memory_core::RetrievalLayer::LongTerm
+                | moe_memory_core::RetrievalLayer::All => !record.is_protected(),
+            }
     }
 
-    /// Missing notifications are repaired by comparison with the complete current ticket.
+    /// Missing notifications are repaired only within the ticket's scope and retrieval layer.
     /// Queue merging is record-level; no authoritative commit is performed here.
     pub fn reconcile<Host: RetrievalHost>(
         &mut self,
@@ -322,7 +332,7 @@ impl SearchIndex {
             .map(|slice| (slice.key.clone(), &slice.input))
             .collect();
         self.entries.retain(|key, stored| {
-            !Self::in_scope(ticket, &key.scope)
+            !Self::covered_by_ticket(ticket, &stored.input)
                 || allowed
                     .get(key)
                     .is_some_and(|input| *input == &stored.input)
@@ -332,7 +342,7 @@ impl SearchIndex {
             .map(|slice| (slice.key.record_key(), &slice.input))
             .collect();
         self.queue.retain(|key, input| {
-            !Self::in_scope(ticket, &key.0)
+            !Self::covered_by_ticket(ticket, input)
                 || records.get(key).is_some_and(|current| *current == input)
         });
         let mut missing = BTreeSet::new();
@@ -442,8 +452,9 @@ impl SearchIndex {
             .filter(|slice| !self.entries.contains_key(&slice.key))
             .map(|slice| slice.key.record_key())
             .collect();
-        self.queue
-            .retain(|key, _| !Self::in_scope(ticket, &key.0) || remaining.contains(key));
+        self.queue.retain(|key, input| {
+            !Self::covered_by_ticket(ticket, input) || remaining.contains(key)
+        });
         Ok(())
     }
 
@@ -540,5 +551,180 @@ impl SearchIndex {
     ) -> Result<(), SearchError> {
         self.cache = Some(FileCache::new(protected_directory, max_bytes)?);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod queue_regressions {
+    use moe_memory_core::{
+        CandidateTicket, Category, EmbeddingProfile, Epistemic, MemoryDraft, MemoryScope,
+        MemoryService, Namespace, PetIdentity, PublicationPolicy, ReadPolicy, ReadPurpose,
+        RetrievalLayer, RetrievalPlan, RetrievalQuery, SessionId,
+    };
+
+    use super::{CompletedIndexBatch, SearchIndex, StorageDomain};
+    use crate::{ChunkConfig, SearchHost, vector::UnitVector};
+
+    struct Host(MemoryService);
+
+    impl SearchHost for Host {
+        fn memory(&mut self) -> &mut MemoryService {
+            &mut self.0
+        }
+
+        fn now_ms(&mut self) -> u64 {
+            100
+        }
+    }
+
+    fn ticket(
+        host: &mut Host,
+        owner: &PetIdentity,
+        profile: &EmbeddingProfile,
+        layer: RetrievalLayer,
+    ) -> CandidateTicket {
+        host.0
+            .for_session(
+                owner,
+                &SessionId::new("queue-session").unwrap(),
+                ReadPurpose::OfflineReasoning,
+            )
+            .begin_candidates(
+                &RetrievalQuery::new("").with_layer(layer),
+                RetrievalPlan::new(profile.clone()),
+                100,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn layer_switches_and_cross_layer_commits_preserve_exact_queued_snapshots() {
+        let namespace = Namespace::new("queue-regressions", "user").unwrap();
+        let owner = PetIdentity::new(namespace.clone(), "alice").unwrap();
+        let mut host = Host(MemoryService::new());
+        let ordinary_source = host
+            .0
+            .register_source(
+                MemoryScope::Private(owner.clone()),
+                "ordinary",
+                1,
+                Epistemic::UserStatement,
+            )
+            .unwrap();
+        for text in ["ordinary first", "ordinary second"] {
+            host.0
+                .for_pet(&owner)
+                .create(
+                    MemoryDraft::new(
+                        text,
+                        Category::Episode,
+                        Epistemic::UserStatement,
+                        vec![ordinary_source.clone()],
+                    ),
+                    100,
+                )
+                .unwrap();
+        }
+        let formal_source = host
+            .0
+            .register_source(
+                MemoryScope::Shared(namespace.clone()),
+                "formal",
+                1,
+                Epistemic::Reference,
+            )
+            .unwrap();
+        host.0
+            .set_formal_publication_policy(
+                &namespace,
+                PublicationPolicy::allow_sources(1, vec![formal_source.clone()]),
+            )
+            .unwrap();
+        for text in ["formal first", "formal second"] {
+            let command = host
+                .0
+                .prepare_formal_publication(
+                    &namespace,
+                    MemoryDraft::new(
+                        text,
+                        Category::Protocol,
+                        Epistemic::Reference,
+                        vec![formal_source.clone()],
+                    ),
+                    100,
+                )
+                .unwrap();
+            command.execute(&mut host.0).unwrap();
+        }
+        host.0
+            .set_read_policy(
+                &owner,
+                ReadPolicy::offline(1, vec![ordinary_source, formal_source]),
+            )
+            .unwrap();
+        let profile = EmbeddingProfile::new("fixture", "queue-model", 2).unwrap();
+        let mut index = SearchIndex::new(
+            StorageDomain::new("queue-root").unwrap(),
+            profile.clone(),
+            ChunkConfig::new(1, 512, 16, 1536).unwrap(),
+            16,
+            1,
+            16,
+        )
+        .unwrap();
+        let ordinary = ticket(&mut host, &owner, &profile, RetrievalLayer::LongTerm);
+        let working = ticket(&mut host, &owner, &profile, RetrievalLayer::WorkingContext);
+        let formal = ticket(&mut host, &owner, &profile, RetrievalLayer::FormalMaterial);
+        index.reconcile(&mut host, &ordinary).unwrap();
+        let ordinary_snapshot = index.queue.clone();
+        assert_eq!(ordinary_snapshot.len(), 2);
+        index.reconcile(&mut host, &working).unwrap();
+        assert!(index.queue == ordinary_snapshot);
+        index.reconcile(&mut host, &formal).unwrap();
+        assert_eq!(index.queue.len(), 4);
+        assert!(
+            ordinary_snapshot
+                .iter()
+                .all(|(key, input)| index.queue.get(key) == Some(input))
+        );
+        let mixed_snapshot = index.queue.clone();
+        index.reconcile(&mut host, &working).unwrap();
+        assert!(index.queue == mixed_snapshot);
+        for current in [&formal, &ordinary] {
+            let before = index.queue.clone();
+            let batch = index.take_batch(&mut host, current).unwrap().unwrap();
+            assert_eq!(batch.len(), 1);
+            assert!(index.queue == before);
+            let mut expected = before;
+            assert!(
+                expected.remove(&batch.slices[0].key.record_key())
+                    == Some(batch.slices[0].input.clone())
+            );
+            index
+                .commit(
+                    &mut host,
+                    current,
+                    CompletedIndexBatch {
+                        batch,
+                        vectors: vec![UnitVector::new(vec![1.0, 0.0], 2).unwrap()],
+                    },
+                )
+                .unwrap();
+            assert!(index.queue == expected);
+            index.reconcile(&mut host, &working).unwrap();
+            assert!(index.queue == expected);
+        }
+        assert_eq!(index.queue.len(), 2);
+        assert_eq!(index.entries.len(), 2);
+        let remaining = index.queue.clone();
+        for layer in [
+            RetrievalLayer::All,
+            RetrievalLayer::FormalMaterial,
+            RetrievalLayer::LongTerm,
+        ] {
+            let current = ticket(&mut host, &owner, &profile, layer);
+            index.reconcile(&mut host, &current).unwrap();
+            assert!(index.queue == remaining);
+        }
     }
 }

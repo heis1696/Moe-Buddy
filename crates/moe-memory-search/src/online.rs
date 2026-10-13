@@ -196,9 +196,6 @@ impl Transport {
             model,
             dimension,
             self.options.max_input_bytes,
-            self.options.request_timeout.as_nanos().to_string(),
-            self.options.max_attempts,
-            self.options.retry_delay.as_nanos().to_string(),
             "raw-utf8-byte-bound-v1",
             "scaled-f64-unit-v1"
         ]);
