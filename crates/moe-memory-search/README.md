@@ -1,6 +1,6 @@
 # moe-memory-search
 
-R1/R2/R3：受信宿主显式调用的在线 Embedding、可关闭 Cohere v2 rerank、完整获准集合的 BM25/精确余弦/RRF、分块、有界索引队列、显式可丢弃文件缓存，以及 R3 的最小同步离线检索门面（`SearchMemory`）与窄授权桥。仓内依赖记忆核心与 memory-local，不依赖 Agent；agent-runtime 仅是测试 dev-dependency，Agent 经核心窄契约直接消费门面的离线接线已验证（见 R3 节），完整质量门留在 R4。普通构造、构建和测试不下载模型、不请求外部模型。
+R1–R4 离线工程：受信宿主显式调用的在线 Embedding、可关闭 Cohere v2 rerank、完整获准集合的 BM25/精确余弦/RRF、分块、有界索引队列、显式可丢弃文件缓存，以及 R3 的最小同步离线检索门面（`SearchMemory`）与窄授权桥。仓内依赖记忆核心与 memory-local，不依赖 Agent；agent-runtime 仅是测试 dev-dependency，Agent 经核心窄契约直接消费门面的离线接线已验证（见 R3 节），R4 已冻结中文标签集、补齐安全/Agent 回归并交付真实校验和合成性能入口；真实质量门仍需受信环境执行。普通构造、构建和测试不下载模型、不请求外部模型。
 
 ## 公开接口
 
@@ -165,7 +165,48 @@ Ok(())
 
 `agent-runtime` 仅为 dev-dependency，Agent 正常依赖仍只有核心窄契约，不反依赖 search。受信宿主通过 `AgentServices::new(&mut sessions, &mut facade)` 注入 SearchMemory；混合票必须按真实 `AgentBinding::memory_session()` 和同一身份/用途/完整查询准备。prepare 检查完整读取集与所有发送来源，infer/finish 经健康门重验原受保护上下文；错误完整保留为 `AgentError<SearchError>`，不调用无记忆模型或切回关键词。直接 prepare→infer→finish、查询来源和未入选私密发送项越 grant 拒绝均有离线回归。合成回执只验证留证/依赖判据，不证明真实网络发送或模型质量。
 
-此门面是同步、宿主预先完成排名的最小离线注入，不在 Agent 内启动异步编码、重排、调度或 HTTP。`LocalSearchHost::new(local, now_ms)` 使用宿主本次注入时间，宿主应在阶段边界更新；不能将固定离线时间误称为真实远端调用期间持续采样的时钟。真实模型与 R4 的端到端/质量门仍未验证。
+此门面是同步、宿主预先完成排名的最小离线注入，不在 Agent 内启动异步编码、重排、调度或 HTTP。`LocalSearchHost::new(local, now_ms)` 使用宿主本次注入时间，宿主应在阶段边界更新；不能将固定离线时间误称为真实远端调用期间持续采样的时钟。真实模型端到端/质量门仍未验证；R4 的离线入口与合成基准不提升该状态。
+
+## R4 冻结质量集与显式校验
+
+[冻结夹具](tests/fixtures/r4-chinese-v1.json) 的 SHA-256 为 `2d50243e19510c41514c1299e682ebbd8c490c7cefed18f06423b5c3f32dc6a8`，由 `.gitattributes` 固定 LF。包含 32 条有答案查询（16 私密、16 共享，其中 4 条显式正式资料）、8 条无相关查询，恰好 16 条释义查询；手工冻结相关性等级为 3，未列出为不相关。另有不重叠的 8 条校准记录、12 条校准查询（8 有答案、4 无相关），评测标签不参与阈值选择。未做外部人工盲审，不把标签映射的人工向量当真实模型。
+
+`embedding_check` 是受信宿主独立运行的真实质量入口，不是自动测试、生产后端或模型工具。没有隐式后端；`local` 明确未实现、非零拒绝且不下载资产、不回退 online。支持的在线路径与开关：
+
+```powershell
+cargo run -p moe-memory-search --example embedding_check --locked --offline -- --backend online --rerank off
+cargo run -p moe-memory-search --example embedding_check --locked --offline -- --backend online --rerank on
+cargo run -p moe-memory-search --example embedding_check --locked --offline -- --backend local --rerank off
+```
+
+这里 `--offline` 仅限制 Cargo 依赖解析，**不**禁止明确获准的在线 HTTP。执行前必须由受信宿主在当前进程逐项提供环境设置；示例不枚举凭据库、不继承 Chat 许可：
+
+| 设置 | 要求 |
+| --- | --- |
+| `MOE_R4_ALLOW_EMBEDDING` | 精确值 `synthetic-only:query+entry:private+shared:all-fixture-sources`，仅许可本冻结合成集的 QueryEmbedding/EntryEmbedding、私密与共享范围及全部来源。 |
+| `MOE_R4_EMBEDDING_ENDPOINT` / `MOE_R4_EMBEDDING_MODEL` / `MOE_R4_EMBEDDING_DIMENSION` / `MOE_R4_EMBEDDING_REVISION` | 固定完整 `/embeddings` 端点、原生模型/维度及宿主记录的服务修订；不能固定远端权重时修订只是声明，不是密码学证明。 |
+| `MOE_R4_EMBEDDING_KEY_REF` | 显式指定一个 `MOE_R4_` 前缀的大写环境变量名；该变量的值才是凭据，不直接把真实 Key 写入命令或文档。 |
+| `MOE_R4_ALLOW_RERANK` | 仅 `--rerank on` 需要，精确值 `synthetic-only:query+shortlist:private+shared:all-fixture-sources`；不继承 Embedding 许可。 |
+| `MOE_R4_RERANK_ENDPOINT` / `MOE_R4_RERANK_MODEL` / `MOE_R4_RERANK_REVISION` / `MOE_R4_RERANK_KEY_REF` | 独立完整 `/v2/rerank` 端点、模型、修订及同规则凭据引用。 |
+
+缺资产/配置/许可、维度或协议不符、调用失败、以及质量不达标均非零退出，不 skip 后报通过。先以独立校准的真实余弦分数在固定 `0..=1`、步长 `0.02` 网格选择门槛（最大正确数，并列取更严格值）；再以同语料/权限/条数与字符预算运行新词项 KeywordOnly、严格完整索引 Hybrid、可选 Required rerank。不能改标签、删困难样本或使用评测集重新调参。
+
+冷、热路径分别统计并要求 Hit@5 ≥28/32、释义 ≥12/16 且严格优于关键词、无相关空集 ≥7/8、越权/失效为 0。输出每条查询的固定编号和交付记录编号、噪声/空集、按有答案 32 条平均的 NDCG@5、冷建索引/编码/召回/rerank（含该阶段复验）/装配及热端到端时间；不输出查询正文、凭据或原始响应。每次在线调用最多一次尝试，调用数按阶段报告，远端用量/费用当前适配未暴露则明确 `unavailable`。rerank 另报命中与 NDCG 差，未必有收益，默认关闭。
+
+该入口的宿主在每个 `now_ms()` 检查点动态采样系统时钟，不使用固定时间的 `LocalSearchHost` 冒充真实在途时钟。128 字符/16 重叠/1024 UTF-8 字节只是保守分块/长度拒绝规则，**不是 tokenizer 或远端无截断证明**；即使真实质量达标，也明确输出 tokenizer 和整体未验证边界，不能宣布完整 R4/RAG 通过。
+
+标准测试仅计算指标、运行关键词和使用明确的回环人工向量/重排桩：已知关键词结果固定为 Hit@5 17/32、释义 1/16、无相关空集 7/8、NDCG@5 0.531250；真实 Hybrid/rerank 的对应值尚未取得。常量人工向量必须不能过质量门，Required rerank 故障不能返回降级摘要。完整安全回归与实际验证记录见 [REVIEW](../../docs/REVIEW.md#r4-离线工程与最终复核2026-10-13)。
+
+## R4 合成规模基准
+
+```powershell
+cargo run --release -p moe-memory-search --example scan_bench --locked --offline
+cargo run -p moe-memory-search --example scan_bench --locked --offline -- 100
+```
+
+默认 1,000/10,000 条合成记录；显式小规模参数用于针对性检查。仅连接本进程 `127.0.0.1` 的人工向量端点，经过完整 `take_batch → embed_index_batch → commit` 授权路径填满 `SearchIndex`，最终条目数必须等于规模且缺片数为零。每票至多 8 次发送、换新票继续排空 4096 队列；每票/查询阶段另设不超过 120 秒的控制预算，不更改生产硬限制。
+
+报告建库、完整首次索引、回环编码、核心/索引簿记、冷查询与 7 次热查询 p50/p95、召回/收口/装配；逻辑向量负载按实际 `f64` 的 8 字节计，不是 RSS/完整索引堆占用。文件缓存关闭，磁盘大小 `unmeasured`。固定合成权威时间仅用于离线夹具，墙钟耗时由 `Instant` 采样。10k 完整快照复验成本如实保留，不通过分片或缩小候选伪装完整规模性能；此基准不能证明真实语义、tokenizer、在线费用或 rerank 收益。
 
 ## 显式可丢弃文件缓存
 

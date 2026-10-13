@@ -239,3 +239,5 @@ fn forge(mut report: DeletionBoundary) { report.journal = report.physical_erasur
 ```
 
 验证：针对两个 crate 的 `tests/management.rs` 与适配故障测试，随后执行仓库 fmt、Clippy、workspace test/build 门。真实用户档案、模型连接和网络均不参与夹具。
+
+R4 回归补充：持久化检索门面经四项离线 Agent 场景复核，覆盖释义偏好、纠正后仅新版本、缺向量的可见关键词原因及不相关空集；核心完整快照与健康门保持不变。真实 Embedding/rerank/tokenizer 和真实对话模型仍未验证，详见 [REVIEW](../../docs/REVIEW.md#r4-离线工程与最终复核2026-10-13)。

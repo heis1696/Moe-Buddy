@@ -1,0 +1,656 @@
+{
+  "version": "r4-chinese-v1",
+  "labels": "固定合成中文人工相关性标签；3=直接相关；未列出=不相关。不是模型判分。",
+  "records": [
+    {
+      "id": "p01",
+      "scope": "private",
+      "text": "每天傍晚我都泡一壶茉莉花茶。"
+    },
+    {
+      "id": "p02",
+      "scope": "private",
+      "text": "点面时我总会请店家不要放香菜。"
+    },
+    {
+      "id": "p03",
+      "scope": "private",
+      "text": "我的生日是九月十七日。"
+    },
+    {
+      "id": "p04",
+      "scope": "private",
+      "text": "我家的橘猫叫团子。"
+    },
+    {
+      "id": "p05",
+      "scope": "private",
+      "text": "我把备用钥匙放在玄关蓝色盒子里。"
+    },
+    {
+      "id": "p06",
+      "scope": "private",
+      "text": "我通常晚上十一点半上床睡觉。"
+    },
+    {
+      "id": "p07",
+      "scope": "private",
+      "text": "我对花生过敏，买零食会先检查配料。"
+    },
+    {
+      "id": "p08",
+      "scope": "private",
+      "text": "我周六上午去河边慢跑。"
+    },
+    {
+      "id": "p09",
+      "scope": "private",
+      "text": "读书时我习惯播放没有人声的钢琴曲。"
+    },
+    {
+      "id": "p10",
+      "scope": "private",
+      "text": "我的围巾喜欢选深绿色。"
+    },
+    {
+      "id": "p11",
+      "scope": "private",
+      "text": "我去年夏天在青岛看过海。"
+    },
+    {
+      "id": "p12",
+      "scope": "private",
+      "text": "我出门旅行更愿意坐火车而不是飞机。"
+    },
+    {
+      "id": "p13",
+      "scope": "private",
+      "text": "心情低落时我希望先被安静陪着，不急着听建议。"
+    },
+    {
+      "id": "p14",
+      "scope": "private",
+      "text": "我养的薄荷每隔两天浇一次水。"
+    },
+    {
+      "id": "p15",
+      "scope": "private",
+      "text": "我正在学习用陶轮制作杯子。"
+    },
+    {
+      "id": "p16",
+      "scope": "private",
+      "text": "我喜欢把周计划写在纸质手账上。"
+    },
+    {
+      "id": "s01",
+      "scope": "shared",
+      "text": "图书馆周一闭馆，周二至周日开放。"
+    },
+    {
+      "id": "s02",
+      "scope": "shared",
+      "text": "银杏树的叶片像小扇子，秋天会变黄。"
+    },
+    {
+      "id": "s03",
+      "scope": "shared",
+      "text": "冲泡绿茶宜用八十摄氏度左右的水。"
+    },
+    {
+      "id": "s04",
+      "scope": "shared",
+      "text": "小苏打溶液可去除杯子内壁的茶渍。"
+    },
+    {
+      "id": "s05",
+      "scope": "shared",
+      "text": "社区旧电池回收箱位于北门门卫室。"
+    },
+    {
+      "id": "s06",
+      "scope": "shared",
+      "text": "番茄苗需要充足日照并保持盆土排水通畅。"
+    },
+    {
+      "id": "s07",
+      "scope": "shared",
+      "text": "食物冷藏时应把熟食放在生肉上层。"
+    },
+    {
+      "id": "s08",
+      "scope": "shared",
+      "text": "自行车链条清洁后应擦干并添加润滑油。"
+    },
+    {
+      "id": "s09",
+      "scope": "shared",
+      "text": "遇到雷电应离开孤立大树并进入封闭建筑。"
+    },
+    {
+      "id": "s10",
+      "scope": "shared",
+      "text": "室内发现燃气泄漏时不要开关电器，应通风并到室外报警。"
+    },
+    {
+      "id": "s11",
+      "scope": "shared",
+      "text": "捐赠衣物前应清洗晾干，并确认没有破损。"
+    },
+    {
+      "id": "s12",
+      "scope": "shared",
+      "text": "修补图书破页宜用无酸修补纸，避免普通胶带老化。"
+    },
+    {
+      "id": "s13",
+      "scope": "formal",
+      "text": "受信协议规定：发送前必须核对目的端点与用途许可。"
+    },
+    {
+      "id": "s14",
+      "scope": "formal",
+      "text": "能力说明规定：搜索结果不授予工具执行权限。"
+    },
+    {
+      "id": "s15",
+      "scope": "formal",
+      "text": "审计协议规定：未知传输结果不得登记为成功。"
+    },
+    {
+      "id": "s16",
+      "scope": "formal",
+      "text": "删除协议规定：本地移除不能召回已经交付的外部副本。"
+    }
+  ],
+  "evaluation": [
+    {
+      "id": "q01",
+      "scope": "private",
+      "text": "茉莉花茶",
+      "paraphrase": false,
+      "relevant": {
+        "p01": 3
+      }
+    },
+    {
+      "id": "q02",
+      "scope": "private",
+      "text": "不要放香菜",
+      "paraphrase": false,
+      "relevant": {
+        "p02": 3
+      }
+    },
+    {
+      "id": "q03",
+      "scope": "private",
+      "text": "九月十七日",
+      "paraphrase": false,
+      "relevant": {
+        "p03": 3
+      }
+    },
+    {
+      "id": "q04",
+      "scope": "private",
+      "text": "橘猫",
+      "paraphrase": false,
+      "relevant": {
+        "p04": 3
+      }
+    },
+    {
+      "id": "q05",
+      "scope": "private",
+      "text": "蓝色盒子",
+      "paraphrase": false,
+      "relevant": {
+        "p05": 3
+      }
+    },
+    {
+      "id": "q06",
+      "scope": "private",
+      "text": "十一点半",
+      "paraphrase": false,
+      "relevant": {
+        "p06": 3
+      }
+    },
+    {
+      "id": "q07",
+      "scope": "private",
+      "text": "花生过敏",
+      "paraphrase": false,
+      "relevant": {
+        "p07": 3
+      }
+    },
+    {
+      "id": "q08",
+      "scope": "private",
+      "text": "河边慢跑",
+      "paraphrase": false,
+      "relevant": {
+        "p08": 3
+      }
+    },
+    {
+      "id": "q09",
+      "scope": "private",
+      "text": "阅读的时候爱听哪类背景音乐",
+      "paraphrase": true,
+      "relevant": {
+        "p09": 3
+      }
+    },
+    {
+      "id": "q10",
+      "scope": "private",
+      "text": "脖子上保暖的织物偏好什么色调",
+      "paraphrase": true,
+      "relevant": {
+        "p10": 3
+      }
+    },
+    {
+      "id": "q11",
+      "scope": "private",
+      "text": "上一个暑期曾在哪座城市游览海滨",
+      "paraphrase": true,
+      "relevant": {
+        "p11": 3
+      }
+    },
+    {
+      "id": "q12",
+      "scope": "private",
+      "text": "远行时倾向乘铁路还是航空",
+      "paraphrase": true,
+      "relevant": {
+        "p12": 3
+      }
+    },
+    {
+      "id": "q13",
+      "scope": "private",
+      "text": "难过的时候需要怎样的支持方式",
+      "paraphrase": true,
+      "relevant": {
+        "p13": 3
+      }
+    },
+    {
+      "id": "q14",
+      "scope": "private",
+      "text": "盆里的香草多久补充水分",
+      "paraphrase": true,
+      "relevant": {
+        "p14": 3
+      }
+    },
+    {
+      "id": "q15",
+      "scope": "private",
+      "text": "最近练习的手工技艺是什么",
+      "paraphrase": true,
+      "relevant": {
+        "p15": 3
+      }
+    },
+    {
+      "id": "q16",
+      "scope": "private",
+      "text": "安排每周事务惯用哪种载体",
+      "paraphrase": true,
+      "relevant": {
+        "p16": 3
+      }
+    },
+    {
+      "id": "q17",
+      "scope": "shared",
+      "text": "周一闭馆",
+      "paraphrase": false,
+      "relevant": {
+        "s01": 3
+      }
+    },
+    {
+      "id": "q18",
+      "scope": "shared",
+      "text": "银杏树",
+      "paraphrase": false,
+      "relevant": {
+        "s02": 3
+      }
+    },
+    {
+      "id": "q19",
+      "scope": "shared",
+      "text": "冲泡绿茶",
+      "paraphrase": false,
+      "relevant": {
+        "s03": 3
+      }
+    },
+    {
+      "id": "q20",
+      "scope": "shared",
+      "text": "小苏打",
+      "paraphrase": false,
+      "relevant": {
+        "s04": 3
+      }
+    },
+    {
+      "id": "q21",
+      "scope": "shared",
+      "text": "旧电池",
+      "paraphrase": false,
+      "relevant": {
+        "s05": 3
+      }
+    },
+    {
+      "id": "q22",
+      "scope": "shared",
+      "text": "番茄苗",
+      "paraphrase": false,
+      "relevant": {
+        "s06": 3
+      }
+    },
+    {
+      "id": "q23",
+      "scope": "shared",
+      "text": "熟食",
+      "paraphrase": false,
+      "relevant": {
+        "s07": 3
+      }
+    },
+    {
+      "id": "q24",
+      "scope": "shared",
+      "text": "自行车链条",
+      "paraphrase": false,
+      "relevant": {
+        "s08": 3
+      }
+    },
+    {
+      "id": "q25",
+      "scope": "shared",
+      "text": "暴风雨打雷时能否躲在独木下面",
+      "paraphrase": true,
+      "relevant": {
+        "s09": 3
+      }
+    },
+    {
+      "id": "q26",
+      "scope": "shared",
+      "text": "闻到煤气味该采取哪些安全步骤",
+      "paraphrase": true,
+      "relevant": {
+        "s10": 3
+      }
+    },
+    {
+      "id": "q27",
+      "scope": "shared",
+      "text": "送给公益机构的旧衣服如何预处理",
+      "paraphrase": true,
+      "relevant": {
+        "s11": 3
+      }
+    },
+    {
+      "id": "q28",
+      "scope": "shared",
+      "text": "书页撕裂后用何种材料粘补更稳妥",
+      "paraphrase": true,
+      "relevant": {
+        "s12": 3
+      }
+    },
+    {
+      "id": "q29",
+      "scope": "formal",
+      "text": "资料传给服务之前要核查什么",
+      "paraphrase": true,
+      "relevant": {
+        "s13": 3
+      }
+    },
+    {
+      "id": "q30",
+      "scope": "formal",
+      "text": "检索到操作说明就能直接执行吗",
+      "paraphrase": true,
+      "relevant": {
+        "s14": 3
+      }
+    },
+    {
+      "id": "q31",
+      "scope": "formal",
+      "text": "无法确认是否送达能记作已完成吗",
+      "paraphrase": true,
+      "relevant": {
+        "s15": 3
+      }
+    },
+    {
+      "id": "q32",
+      "scope": "formal",
+      "text": "清掉设备上的数据会撤回远端拷贝吗",
+      "paraphrase": true,
+      "relevant": {
+        "s16": 3
+      }
+    },
+    {
+      "id": "q33",
+      "scope": "private",
+      "text": "量子纠缠实验需要什么仪器",
+      "paraphrase": false,
+      "relevant": {}
+    },
+    {
+      "id": "q34",
+      "scope": "private",
+      "text": "古巴比伦楔形文字怎样解读",
+      "paraphrase": false,
+      "relevant": {}
+    },
+    {
+      "id": "q35",
+      "scope": "private",
+      "text": "深空探测器如何穿越辐射带",
+      "paraphrase": false,
+      "relevant": {}
+    },
+    {
+      "id": "q36",
+      "scope": "private",
+      "text": "珊瑚礁白化有哪些诱因",
+      "paraphrase": false,
+      "relevant": {}
+    },
+    {
+      "id": "q37",
+      "scope": "shared",
+      "text": "中微子振荡如何测量",
+      "paraphrase": false,
+      "relevant": {}
+    },
+    {
+      "id": "q38",
+      "scope": "shared",
+      "text": "拜占庭建筑穹顶结构是什么",
+      "paraphrase": false,
+      "relevant": {}
+    },
+    {
+      "id": "q39",
+      "scope": "shared",
+      "text": "反物质湮灭产生多少能量",
+      "paraphrase": false,
+      "relevant": {}
+    },
+    {
+      "id": "q40",
+      "scope": "formal",
+      "text": "火星陨石同位素定年规范",
+      "paraphrase": false,
+      "relevant": {}
+    }
+  ],
+  "calibration_records": [
+    {
+      "id": "c01",
+      "scope": "private",
+      "text": "我每天早晨七点练习口琴。"
+    },
+    {
+      "id": "c02",
+      "scope": "private",
+      "text": "我的书签是一片压干的枫叶。"
+    },
+    {
+      "id": "c03",
+      "scope": "private",
+      "text": "我习惯在周三给祖母打电话。"
+    },
+    {
+      "id": "c04",
+      "scope": "private",
+      "text": "我想在冬天学习滑雪。"
+    },
+    {
+      "id": "c05",
+      "scope": "shared",
+      "text": "太阳能热水器依靠阳光加热储水。"
+    },
+    {
+      "id": "c06",
+      "scope": "shared",
+      "text": "棉布清洗后应放在通风处晾干。"
+    },
+    {
+      "id": "c07",
+      "scope": "shared",
+      "text": "月相的变化来自日地月相对位置的改变。"
+    },
+    {
+      "id": "c08",
+      "scope": "shared",
+      "text": "向日葵的种子成熟后可以榨油。"
+    }
+  ],
+  "calibration": [
+    {
+      "id": "k01",
+      "scope": "private",
+      "text": "早上几点吹奏随身簧片乐器",
+      "paraphrase": true,
+      "relevant": {
+        "c01": 3
+      }
+    },
+    {
+      "id": "k02",
+      "scope": "private",
+      "text": "夹在书中的位置标记用什么制作",
+      "paraphrase": true,
+      "relevant": {
+        "c02": 3
+      }
+    },
+    {
+      "id": "k03",
+      "scope": "private",
+      "text": "每周哪天联系奶奶",
+      "paraphrase": true,
+      "relevant": {
+        "c03": 3
+      }
+    },
+    {
+      "id": "k04",
+      "scope": "private",
+      "text": "寒季准备尝试哪项运动",
+      "paraphrase": true,
+      "relevant": {
+        "c04": 3
+      }
+    },
+    {
+      "id": "k05",
+      "scope": "shared",
+      "text": "屋顶利用日照提供热水的设备原理",
+      "paraphrase": true,
+      "relevant": {
+        "c05": 3
+      }
+    },
+    {
+      "id": "k06",
+      "scope": "shared",
+      "text": "洗好的纯棉织物怎样干燥",
+      "paraphrase": true,
+      "relevant": {
+        "c06": 3
+      }
+    },
+    {
+      "id": "k07",
+      "scope": "shared",
+      "text": "为什么夜空里的月亮形状会不同",
+      "paraphrase": true,
+      "relevant": {
+        "c07": 3
+      }
+    },
+    {
+      "id": "k08",
+      "scope": "shared",
+      "text": "哪种朝阳花的籽能提取食用油",
+      "paraphrase": true,
+      "relevant": {
+        "c08": 3
+      }
+    },
+    {
+      "id": "k09",
+      "scope": "private",
+      "text": "超导磁悬浮有哪些临界条件",
+      "paraphrase": false,
+      "relevant": {}
+    },
+    {
+      "id": "k10",
+      "scope": "private",
+      "text": "侏罗纪翼龙的化石分布",
+      "paraphrase": false,
+      "relevant": {}
+    },
+    {
+      "id": "k11",
+      "scope": "shared",
+      "text": "拜占庭金币铸造工艺",
+      "paraphrase": false,
+      "relevant": {}
+    },
+    {
+      "id": "k12",
+      "scope": "shared",
+      "text": "黑洞霍金辐射的频谱",
+      "paraphrase": false,
+      "relevant": {}
+    }
+  ]
+}

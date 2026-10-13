@@ -1,22 +1,47 @@
+//! Synthetic-scale Hybrid benchmark over a real `SearchIndex`. A loopback-only
+//! OpenAI-compatible endpoint (see `support/bench.rs`) returns deterministic
+//! artificial vectors, and the index is filled strictly through the authorized
+//! `take_batch` → `embed_index_batch` → `commit` path; no production raw-vector
+//! entry exists or is used. Cold and hot Hybrid queries are then measured end
+//! to end: ticket, query encoding, recall, core completion, and assembly.
+//! Vectors are hash-clustered synthetic values, so results measure offline
+//! throughput only, not semantic quality; no real model, dataset, outbound
+//! traffic, or file cache is involved.
+
+#[path = "support/bench.rs"]
+mod bench;
+
 use std::error::Error;
 use std::mem::size_of;
 use std::time::{Duration, Instant};
 
 use moe_memory_core::{
-    Category, EmbeddingProfile, Epistemic, MemoryDraft, MemoryScope, MemoryService, Namespace,
-    PetIdentity, ReadPolicy, ReadPurpose, RetrievalLayer, RetrievalPlan, RetrievalQuery,
-    SearchScope, SessionId,
+    Category, Epistemic, MemoryDraft, MemoryScope, MemoryService, Namespace, PetIdentity,
+    ReadPolicy, ReadPurpose, RetrievalLayer, RetrievalPlan, RetrievalQuery, SearchScope, SessionId,
+    SourceRef, TransmissionPolicy, TransmissionUsage,
 };
 use moe_memory_search::{
-    ChunkConfig, HybridConfig, RerankMode, SearchHost, SearchIndex, StorageDomain, hybrid_rank,
+    CallControl, Cancellation, ChunkConfig, HybridConfig, OnlineEmbedding, OnlineOptions,
+    RerankMode, SearchHost, SearchIndex, SearchMode, StorageDomain, hybrid_rank,
 };
 
+use bench::{LoopbackEmbeddingServer, VECTOR_DIMENSION};
+
 const NOW_MS: u64 = 1_000_000;
-const VECTOR_DIMENSION: usize = 32;
+/// Transmission receipts the core authority allows per ticket; a fresh ticket
+/// continues the batch fill once they are exhausted.
+const MAX_SENDS_PER_TICKET: usize = 8;
+const INDEX_QUEUE_CAPACITY: usize = 4_096;
+const INDEX_BATCH_LIMIT: usize = 32;
+const INDEX_VECTOR_CAPACITY: usize = 65_536;
+const MINIMUM_COSINE: f64 = 0.8;
+const HOT_QUERY_SAMPLES: usize = 7;
+/// Explicit overall loopback budget, one fresh budget per phase.
+const PHASE_BUDGET: Duration = Duration::from_secs(120);
+const DEFAULT_SCALES: &[usize] = &[1_000, 10_000];
 
 struct Host {
     memory: MemoryService,
-    now_ms: u64,
 }
 
 impl SearchHost for Host {
@@ -25,29 +50,45 @@ impl SearchHost for Host {
     }
 
     fn now_ms(&mut self) -> u64 {
-        self.now_ms
+        NOW_MS
     }
 }
 
 struct QueryReport {
     total: Duration,
     ticket: Duration,
-    retrieval: Duration,
+    encode: Duration,
+    recall: Duration,
     completion: Duration,
     assembly: Duration,
-    mode: moe_memory_search::SearchMode,
+    mode: SearchMode,
     vector_hits: usize,
+    lexical_hits: usize,
     top5: Vec<String>,
 }
 
-fn build_authority(count: usize) -> Result<(Host, PetIdentity, SessionId), Box<dyn Error>> {
+struct QueryFixture<'a> {
+    host: &'a mut Host,
+    index: &'a mut SearchIndex,
+    embedding: &'a OnlineEmbedding,
+    control: &'a CallControl,
+    owner: &'a PetIdentity,
+    session: &'a SessionId,
+    source: &'a SourceRef,
+}
+
+fn build_authority(
+    count: usize,
+    endpoint: &str,
+) -> Result<(Host, PetIdentity, SessionId, SourceRef), Box<dyn Error>> {
     let mut memory = MemoryService::new();
     let owner = PetIdentity::new(
         Namespace::new("scan-bench", "synthetic-user")?,
         "synthetic-pet",
     )?;
+    let scope = MemoryScope::Private(owner.clone());
     let source = memory.register_source(
-        MemoryScope::Private(owner.clone()),
+        scope.clone(),
         "synthetic-benchmark-fixture",
         1,
         Epistemic::UserStatement,
@@ -66,92 +107,73 @@ fn build_authority(count: usize) -> Result<(Host, PetIdentity, SessionId), Box<d
             NOW_MS,
         )?;
     }
-    memory.set_read_policy(&owner, ReadPolicy::offline(1, vec![source]))?;
+    memory.set_read_policy(&owner, ReadPolicy::offline(1, vec![source.clone()]))?;
+    memory.set_transmission_policy(
+        &owner,
+        TransmissionPolicy::new(
+            1,
+            TransmissionUsage::QueryEmbedding,
+            endpoint,
+            vec![source.clone()],
+        )?
+        .with_scope(scope.clone())
+        .transmit_query(),
+    )?;
+    memory.set_transmission_policy(
+        &owner,
+        TransmissionPolicy::new(
+            1,
+            TransmissionUsage::EntryEmbedding,
+            endpoint,
+            vec![source.clone()],
+        )?
+        .with_scope(scope),
+    )?;
 
     Ok((
-        Host {
-            memory,
-            now_ms: NOW_MS,
-        },
+        Host { memory },
         owner,
         SessionId::new("scan-bench-session")?,
+        source,
     ))
 }
 
-fn synthetic_unit_vector(state: &mut u64) -> Vec<f32> {
-    let mut vector = Vec::with_capacity(VECTOR_DIMENSION);
-    let mut norm_squared = 0.0_f64;
-    for _ in 0..VECTOR_DIMENSION {
-        *state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        let component = (((*state >> 32) as u32 as f64 / u32::MAX as f64) * 2.0 - 1.0) as f32;
-        norm_squared += f64::from(component) * f64::from(component);
-        vector.push(component);
-    }
-    let norm = norm_squared.sqrt() as f32;
-    for component in &mut vector {
-        *component /= norm;
-    }
-    vector
-}
-
-fn encode_synthetic_vectors(count: usize) -> (Vec<Vec<f32>>, Vec<f32>, Duration) {
-    let started = Instant::now();
-    let mut state = 0x4d4f_452d_5343_414e_u64;
-    let vectors: Vec<_> = (0..count)
-        .map(|_| synthetic_unit_vector(&mut state))
-        .collect();
-    let query = vectors.last().expect("benchmark has records").clone();
-    (vectors, query, started.elapsed())
-}
-
-fn scan_top5(query: &[f32], vectors: &[Vec<f32>]) -> Vec<(usize, f32)> {
-    let mut scores: Vec<_> = vectors
-        .iter()
-        .enumerate()
-        .map(|(row, vector)| {
-            let score: f32 = query
-                .iter()
-                .zip(vector)
-                .map(|(query_value, value)| query_value * value)
-                .sum();
-            (row, score)
-        })
-        .collect();
-    scores.sort_by(|left, right| {
-        right
-            .1
-            .total_cmp(&left.1)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    scores.truncate(5);
-    scores
-}
-
-fn run_query(
-    host: &mut Host,
-    index: &mut SearchIndex,
-    owner: &PetIdentity,
-    session: &SessionId,
+async fn run_query(
+    fixture: QueryFixture<'_>,
     query: &RetrievalQuery,
     plan: &RetrievalPlan,
     config: &HybridConfig,
 ) -> Result<QueryReport, Box<dyn Error>> {
+    let QueryFixture {
+        host,
+        index,
+        embedding,
+        control,
+        owner,
+        session,
+        source,
+    } = fixture;
     let started = Instant::now();
     let ticket_started = Instant::now();
-    let ticket = host
+    let mut ticket = host
         .memory
         .for_session(owner, session, ReadPurpose::OfflineReasoning)
         .begin_candidates(query, plan.clone(), NOW_MS)?;
+    host.memory
+        .bind_query_provenance(&mut ticket, vec![source.clone()], &[], NOW_MS)?;
     let ticket_elapsed = ticket_started.elapsed();
 
-    let retrieval_started = Instant::now();
-    let ranking = hybrid_rank(index, host, &ticket, None, config)?;
+    let encode_started = Instant::now();
+    let encoded = embedding.embed_query(host, &mut ticket, control).await?;
+    let encode_elapsed = encode_started.elapsed();
+
+    let recall_started = Instant::now();
+    let ranking = hybrid_rank(index, host, &ticket, Some(&encoded), config)?;
+    let ranked = ranking.ranking().to_vec();
     let mode = ranking.mode();
     let vector_hits = ranking.vector_hits();
-    let ranked = ranking.ranking().to_vec();
-    let retrieval_elapsed = retrieval_started.elapsed();
+    let lexical_hits = ranking.lexical_hits();
+    let recall_elapsed = recall_started.elapsed();
 
     let completion_started = Instant::now();
     let task = host
@@ -175,11 +197,13 @@ fn run_query(
     Ok(QueryReport {
         total: started.elapsed(),
         ticket: ticket_elapsed,
-        retrieval: retrieval_elapsed,
+        encode: encode_elapsed,
+        recall: recall_elapsed,
         completion: completion_elapsed,
         assembly: assembly_elapsed,
         mode,
         vector_hits,
+        lexical_hits,
         top5,
     })
 }
@@ -188,123 +212,217 @@ fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
-fn report_query(label: &str, report: &QueryReport) {
-    println!(
-        "{label}: e2e_ms={:.3} ticket_ms={:.3} retrieval_ms={:.3} core_completion_ms={:.3} assembly_ms={:.3} mode={:?} vector_hits={} top5={:?}",
-        millis(report.total),
-        millis(report.ticket),
-        millis(report.retrieval),
-        millis(report.completion),
-        millis(report.assembly),
-        report.mode,
-        report.vector_hits,
-        report.top5,
-    );
+fn percentile_ms(samples: &[Duration], fraction: f64) -> f64 {
+    let mut sorted: Vec<Duration> = samples.to_vec();
+    sorted.sort();
+    let rank = ((samples.len() as f64 * fraction).ceil() as usize).clamp(1, samples.len());
+    millis(sorted[rank - 1])
 }
 
-fn run_case(count: usize) -> Result<(), Box<dyn Error>> {
+async fn run_case(count: usize) -> Result<(), Box<dyn Error>> {
+    let case_started = Instant::now();
     let authority_started = Instant::now();
-    let (mut host, owner, session) = build_authority(count)?;
+    let server = LoopbackEmbeddingServer::bind("synthetic-bench-embedding").await?;
+    let endpoint = server.endpoint();
+    let embedding = OnlineEmbedding::new(
+        &endpoint,
+        "synthetic-bench-loopback",
+        "synthetic-bench-embedding",
+        VECTOR_DIMENSION,
+        OnlineOptions::default(),
+    )?;
+    let profile = embedding.profile().clone();
+    let (mut host, owner, session, source) = build_authority(count, &endpoint)?;
     let authority_elapsed = authority_started.elapsed();
 
-    let (vectors, vector_query, fixture_encoding_elapsed) = encode_synthetic_vectors(count);
-    let vector_payload_bytes: usize = vectors
-        .iter()
-        .map(|vector| vector.len() * size_of::<f32>())
-        .sum();
-    let cold_scan_started = Instant::now();
-    let cold_scan = scan_top5(&vector_query, &vectors);
-    let cold_scan_elapsed = cold_scan_started.elapsed();
-    let hot_scan_started = Instant::now();
-    let hot_scan = scan_top5(&vector_query, &vectors);
-    let hot_scan_elapsed = hot_scan_started.elapsed();
-
-    let profile = EmbeddingProfile::new("synthetic", "scan-cost-only", VECTOR_DIMENSION)?;
-    let plan = RetrievalPlan::new(profile.clone());
+    let chunk_config = ChunkConfig::new(1, 256, 16, 1_024)?;
+    let config = HybridConfig::new(
+        profile.clone(),
+        1,
+        MINIMUM_COSINE,
+        true,
+        RerankMode::Disabled,
+        20,
+    )?;
+    let mut index = SearchIndex::new(
+        StorageDomain::new("synthetic-scan-bench")?,
+        profile.clone(),
+        chunk_config,
+        INDEX_QUEUE_CAPACITY,
+        INDEX_BATCH_LIMIT,
+        INDEX_VECTOR_CAPACITY,
+    )?;
+    let plan = RetrievalPlan::new(profile);
     let query = RetrievalQuery::new("jasmine tea")
         .with_scope(SearchScope::Private)
         .with_layer(RetrievalLayer::LongTerm)
         .with_limit(5);
-    let config = HybridConfig::new(profile.clone(), 1, 0.8, true, RerankMode::Disabled, 20)?;
-    let chunk_config = ChunkConfig::new(1, 256, 16, 1024)?;
-    let mut index = SearchIndex::new(
-        StorageDomain::new("synthetic-scan-bench")?,
-        profile,
-        chunk_config,
-        4096,
-        32,
-        65_536,
-    )?;
-
-    let ticket_started = Instant::now();
-    let ticket = host
-        .memory
-        .for_session(&owner, &session, ReadPurpose::OfflineReasoning)
-        .begin_candidates(&query, plan.clone(), NOW_MS)?;
-    let candidate_elapsed = ticket_started.elapsed();
-    let first_index_started = Instant::now();
-    let first_batch = index.take_batch(&mut host, &ticket)?;
-    let first_batch_slices = first_batch.as_ref().map_or(0, |batch| batch.len());
-    drop(first_batch);
-    let status = index.reconcile(&mut host, &ticket)?;
-    let first_index_elapsed = first_index_started.elapsed();
-    let authorized_candidates = ticket.candidates().len();
-    drop(ticket);
-
-    let cold_query = run_query(
-        &mut host, &mut index, &owner, &session, &query, &plan, &config,
-    )?;
-    let hot_query = run_query(
-        &mut host, &mut index, &owner, &session, &query, &plan, &config,
-    )?;
-    let retrieval_top5_stable = cold_query.top5 == hot_query.top5;
-    let vector_top5_stable = cold_scan == hot_scan;
-    if !retrieval_top5_stable || !vector_top5_stable {
-        return Err(std::io::Error::other("top-5 results were not deterministic").into());
+    let fill_started = Instant::now();
+    let mut fill_encoding = Duration::ZERO;
+    let mut fill_tickets = 0usize;
+    let mut fill_batches = 0usize;
+    let final_status = loop {
+        let mut ticket = host
+            .memory
+            .for_session(&owner, &session, ReadPurpose::OfflineReasoning)
+            .begin_candidates(&query, plan.clone(), NOW_MS)?;
+        let status = index.reconcile(&mut host, &ticket)?;
+        if status.missing_chunks == 0 {
+            break status;
+        }
+        fill_tickets += 1;
+        let fill_control = CallControl::new(Cancellation::default(), PHASE_BUDGET)?;
+        let mut ticket_batches = 0usize;
+        for _ in 0..MAX_SENDS_PER_TICKET {
+            let Some(batch) = index.take_batch(&mut host, &ticket)? else {
+                break;
+            };
+            let encode_started = Instant::now();
+            let completed = embedding
+                .embed_index_batch(&mut host, &mut ticket, batch, &fill_control)
+                .await?;
+            fill_encoding += encode_started.elapsed();
+            index.commit(&mut host, &ticket, completed)?;
+            ticket_batches += 1;
+        }
+        fill_batches += ticket_batches;
+        if ticket_batches == 0 {
+            return Err(std::io::Error::other("index queue stalled before completion").into());
+        }
+    };
+    let fill_elapsed = fill_started.elapsed();
+    if final_status.indexed_records != count || final_status.queued_records != 0 {
+        return Err(std::io::Error::other(format!(
+            "index fill incomplete: indexed={} missing={} queued={}",
+            final_status.indexed_records, final_status.missing_chunks, final_status.queued_records
+        ))
+        .into());
     }
 
-    println!("=== synthetic offline scan benchmark: records={count} ===");
+    let query_control = CallControl::new(Cancellation::default(), PHASE_BUDGET)?;
+    let cold = run_query(
+        QueryFixture {
+            host: &mut host,
+            index: &mut index,
+            embedding: &embedding,
+            control: &query_control,
+            owner: &owner,
+            session: &session,
+            source: &source,
+        },
+        &query,
+        &plan,
+        &config,
+    )
+    .await?;
+    let mut hot = Vec::with_capacity(HOT_QUERY_SAMPLES);
+    for _ in 0..HOT_QUERY_SAMPLES {
+        hot.push(
+            run_query(
+                QueryFixture {
+                    host: &mut host,
+                    index: &mut index,
+                    embedding: &embedding,
+                    control: &query_control,
+                    owner: &owner,
+                    session: &session,
+                    source: &source,
+                },
+                &query,
+                &plan,
+                &config,
+            )
+            .await?,
+        );
+    }
+    if cold.mode != SearchMode::Hybrid
+        || hot
+            .iter()
+            .any(|report| report.mode != SearchMode::Hybrid || report.top5 != cold.top5)
+    {
+        return Err(std::io::Error::other("hybrid queries were not deterministic").into());
+    }
+
+    let hot_total: Vec<Duration> = hot.iter().map(|report| report.total).collect();
+    let hot_ticket: Vec<Duration> = hot.iter().map(|report| report.ticket).collect();
+    let hot_encode: Vec<Duration> = hot.iter().map(|report| report.encode).collect();
+    let hot_recall: Vec<Duration> = hot.iter().map(|report| report.recall).collect();
+    let hot_completion: Vec<Duration> = hot.iter().map(|report| report.completion).collect();
+    let hot_assembly: Vec<Duration> = hot.iter().map(|report| report.assembly).collect();
+    let vector_payload_bytes = count * VECTOR_DIMENSION * size_of::<f64>();
+
+    println!("=== loopback hybrid benchmark: records={count} ===");
     println!(
-        "authority=MemoryService(in-memory) authority_build_ms={:.3} authorized_candidates={authorized_candidates}",
+        "authority=MemoryService(in-memory) authority_build_ms={:.3} authorized_candidates={count}",
         millis(authority_elapsed),
     );
     println!(
-        "fixture_vector_encode_ms={:.3} dimension={VECTOR_DIMENSION} manual_vector_payload_bytes={vector_payload_bytes}",
-        millis(fixture_encoding_elapsed),
+        "loopback_endpoint=127.0.0.1/embeddings dimension={VECTOR_DIMENSION} vectors=hash_clustered_artificial server_requests={} server_vectors={}",
+        server.requests(),
+        server.vectors(),
     );
     println!(
-        "candidate_ticket_ms={:.3} first_index_prepare_ms={:.3} first_index_state=queued_only first_batch_slices={first_batch_slices} queued_records={} indexed_records={} missing_chunks={}",
-        millis(candidate_elapsed),
-        millis(first_index_elapsed),
-        status.queued_records,
-        status.indexed_records,
-        status.missing_chunks,
+        "index_fill tickets={fill_tickets} batches={fill_batches} total_ms={:.3} loopback_encoding_ms={:.3} core_index_bookkeeping_ms={:.3} bookkeeping_note=\"includes per-batch reconcile over the full authorized candidate snapshot (O(n) per batch, n={count})\"",
+        millis(fill_elapsed),
+        millis(fill_encoding),
+        millis(fill_elapsed - fill_encoding),
     );
     println!(
-        "manual_vector_scan_cold_ms={:.3} manual_vector_scan_hot_ms={:.3} manual_top5_rows={:?}",
-        millis(cold_scan_elapsed),
-        millis(hot_scan_elapsed),
-        cold_scan.iter().map(|(row, _)| row).collect::<Vec<_>>(),
+        "final_status indexed_records={} missing_chunks=0 queued_records=0 fill_note=\"queue capacity {INDEX_QUEUE_CAPACITY} drained across tickets; completeness asserted, no partial delivery\"",
+        final_status.indexed_records,
     );
     println!(
-        "search_index_vector_bytes=0 search_index_entries={} file_cache_bytes=unmeasured(file cache disabled)",
-        status.indexed_records,
+        "index_logical_vector_bytes={vector_payload_bytes} formula=\"{count} records × 1 chunk × {VECTOR_DIMENSION} dims × {} B\" rss=not_measured file_cache=disabled(unmeasured)",
+        size_of::<f64>(),
     );
-    report_query("cold_query", &cold_query);
-    report_query("hot_query", &hot_query);
     println!(
-        "embedding=unmeasured tokenizer=unmeasured rerank=disabled semantic_quality=not_measured synthetic_vectors=scan_cost_only retrieval_top5_stable={retrieval_top5_stable} manual_scan_top5_stable={vector_top5_stable}",
+        "cold_query e2e_ms={:.3} ticket_ms={:.3} query_encode_ms={:.3} recall_ms={:.3} core_completion_ms={:.3} assembly_ms={:.3} mode={:?} vector_hits={} lexical_hits={} top5={:?}",
+        millis(cold.total),
+        millis(cold.ticket),
+        millis(cold.encode),
+        millis(cold.recall),
+        millis(cold.completion),
+        millis(cold.assembly),
+        cold.mode,
+        cold.vector_hits,
+        cold.lexical_hits,
+        cold.top5,
+    );
+    println!(
+        "hot_query samples={HOT_QUERY_SAMPLES} e2e_p50_ms={:.3} e2e_p95_ms={:.3} ticket_p50_ms={:.3} query_encode_p50_ms={:.3} recall_p50_ms={:.3} recall_p95_ms={:.3} completion_p50_ms={:.3} assembly_p50_ms={:.3} vector_hits={} lexical_hits={}",
+        percentile_ms(&hot_total, 0.50),
+        percentile_ms(&hot_total, 0.95),
+        percentile_ms(&hot_ticket, 0.50),
+        percentile_ms(&hot_encode, 0.50),
+        percentile_ms(&hot_recall, 0.50),
+        percentile_ms(&hot_recall, 0.95),
+        percentile_ms(&hot_completion, 0.50),
+        percentile_ms(&hot_assembly, 0.50),
+        hot[0].vector_hits,
+        hot[0].lexical_hits,
+    );
+    println!(
+        "semantic_quality=not_measured real_embedding=unverified loopback_vectors_only=true rerank=disabled case_total_ms={:.3}",
+        millis(case_started.elapsed()),
     );
     println!();
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn Error>> {
     println!(
-        "No network, model assets, or file cache; Hybrid ranking uses its explicit keyword fallback."
+        "No outbound network or model assets: the embedding endpoint is an in-process 127.0.0.1 loopback returning deterministic artificial vectors; results measure offline throughput only."
     );
-    for count in [1_000, 10_000] {
-        run_case(count)?;
+    let scales: Vec<usize> = match std::env::args().skip(1).collect::<Vec<_>>() {
+        args if args.is_empty() => DEFAULT_SCALES.to_vec(),
+        args => args
+            .iter()
+            .map(|scale| scale.parse::<usize>().map_err(|_| "invalid scale argument"))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    for count in &scales {
+        run_case(*count).await?;
     }
     Ok(())
 }

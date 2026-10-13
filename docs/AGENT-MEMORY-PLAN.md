@@ -1,6 +1,6 @@
 # Moe Buddy：现行计划与决策
 
-> 更新：2026-10-13。M0–M5、上下文精进与 G0–G5 已交付离线范围；两项留存 P1 已修复。记忆系统内部 RAG 的 R0–R3 离线范围已交付：纯契约、在线协议适配、混合检索/索引，以及健康门覆盖的记忆门面与离线 Agent 最小注入；最近 workspace 独立清单为 848 项（含 doctest，历史快照见 REVIEW）。R1 真实 Embedding/rerank/tokenizer 门仍未验证；下一批为 R4 回归、质量与最终复核，缺真实环境时仅按 MEMORY 的显式例外继续离线施工。G6–G8 仍暂停，真实对话模型、对外 HTTP 网关、渠道和生产 Hooks 均未联调；R1 仅记忆模型出站 HTTP 的回环协议已测。
+> 更新：2026-10-13。M0–M5、上下文精进与 G0–G5 已交付离线范围；两项留存 P1 已修复。记忆系统内部 RAG 的 R0–R4 离线工程已实施：纯契约、在线协议适配、混合检索/索引、健康门覆盖的记忆门面与离线 Agent 最小注入，以及冻结质量工程、真实校验入口与合成规模基准；最近 workspace 独立清单为 871 项（含 doctest，历史快照见 REVIEW）。R1 真实 Embedding/rerank/tokenizer 门仍未验证；R4 真实质量门仍因缺受信环境/完整许可未完成，仅按 MEMORY 显式例外交付离线工程，不自动开启其他阶段。G6–G8 仍暂停，真实对话模型、对外 HTTP 网关、渠道和生产 Hooks 均未联调；R1 仅记忆模型出站 HTTP 的回环协议已测。
 
 ## 文档入口
 
@@ -43,7 +43,7 @@ moe-memory-local     moe-agent-runtime
 - 核心零第三方依赖；memory-local 仅依赖核心。运行层的 sha2 仅计算无正文导入指纹；CLI 边界使用 serde/serde_json，均不因此授予网络或模型权限。
 - 公开接口以 [memory-core](../crates/moe-memory-core/README.md)、[memory-local](../crates/moe-memory-local/README.md)、[agent-runtime](../crates/moe-agent-runtime/README.md)、[cli-hooks](../crates/moe-cli-hooks/README.md) 与生成的 Rustdoc 为准。raw-local 的公开 API 由 Rustdoc 及 [文件契约](GATEWAY.md#本地原文存储) 说明。
 - `AgentServices` 经核心 `MemoryContextAccess` 窄契约支持内存、LocalMemory 与显式注入的 SearchMemory；默认关键词不变，后端健康错误原样保留，完整读取/查询/实际发送来源均受会话许可约束。此为离线最小接线，不是生产闭环；夹具公开、职责集中和全局失效等整理项见 [审核意见](REVIEW.md#3-分级整理意见)。
-- RAG 属于记忆系统内部扩展，不另建业务系统或记忆大类。已新增唯一 `moe-memory-search` 适配 crate，实现 OpenAI-compatible 在线 Embedding、Cohere v2 可选 rerank 和纯精确扫描；R2 已实现索引生命周期与混合召回，R3 已完成持久化健康门和离线 Agent 注入；本地模型与 R4 完整质量评估尚未实现。核心继续负责授权、版本与上下文；适配层依赖评审和精确版本见其 README，不让 Agent 反向依赖它。在线计算不要求云端存储记忆，不因配置 API Key 自动获得外传权。实施边界、依赖评审、窄接口与验收见 [RAG 方案](MEMORY.md#rag-检索扩展分批施工)。
+- RAG 属于记忆系统内部扩展，不另建业务系统或记忆大类。已新增唯一 `moe-memory-search` 适配 crate，实现 OpenAI-compatible 在线 Embedding、Cohere v2 可选 rerank 和纯精确扫描；R2 已实现索引生命周期与混合召回，R3 已完成持久化健康门和离线 Agent 注入；R4 离线质量工程/基准已实施，本地模型与真实完整质量评估仍未验证。核心继续负责授权、版本与上下文；适配层依赖评审和精确版本见其 README，不让 Agent 反向依赖它。在线计算不要求云端存储记忆，不因配置 API Key 自动获得外传权。实施边界、依赖评审、窄接口与验收见 [RAG 方案](MEMORY.md#rag-检索扩展分批施工)。
 - 不迁入旧项目 UI、动画、依赖或存档；桌面壳与渲染方案另定，不因采用 Rust 自动选定 GUI 框架。
 
 ## 阶段与暂停范围
@@ -53,7 +53,7 @@ moe-memory-local     moe-agent-runtime
 | M0–M2 | 纯记忆 CRUD、本地日志及授权读取 | 私密实例隔离，来源/版本校验；重启重新授权。 |
 | M3–M5 | 生命周期/取消、受控发布及离线对话 | 候选需宿主审查，不连接真实模型或授予传输权。 |
 | 上下文精进 | 受保护装配、来源追溯与受控压缩 | 摘要未核验，不自动晋升长期记忆。 |
-| R0–R4 | R0 已交付核心密封候选票据、混合任务复验与传输许可契约（含查询许可、发送集复验与派生依赖加固）；R1 已实现在线 Embedding/Cohere rerank/精确扫描及独立预设用途，协议夹具已测但真实门未验证；R2 已实现混合检索与索引，R3 已交付门面/离线 Agent 接线；R4 负责回归/质量与最终复核 | R0 无模型/网络/文件/时钟接入；R1–R4 分批门见 MEMORY 的 RAG 章节。记忆模型出站适配不重启 G6–G8 的对外网关/聊天/渠道；无明确授权不外传。 |
+| R0–R4 | R0 已交付核心密封候选票据、混合任务复验与传输许可契约（含查询许可、发送集复验与派生依赖加固）；R1 已实现在线 Embedding/Cohere rerank/精确扫描及独立预设用途，协议夹具已测但真实门未验证；R2 已实现混合检索与索引，R3 已交付门面/离线 Agent 接线；R4 已实施安全回归、冻结集/独立校准、显式真实入口、合成1k/10k基准与离线复核；真实质量门未完成 | R0 无模型/网络/文件/时钟接入；R1–R4 分批门见 MEMORY 的 RAG 章节。记忆模型出站适配不重启 G6–G8 的对外网关/聊天/渠道；无明确授权不外传。 |
 | G0–G2 | 预设、可信入口、内存暂存及统一离线 Agent | 纯文本/表现提示分离，无实际工具或渠道执行。 |
 | G3–G4 | 原文回收、受控管理、可恢复快照及独立文件适配 | 时长/容量/根/域/许可显式提供；保留故障与平台耐久限制。 |
 | G5 | Hooks 事件和 Claude Code 2.1.286 适配 | 固定版本核验；合成进程测试不是生产 Hook 安装。 |

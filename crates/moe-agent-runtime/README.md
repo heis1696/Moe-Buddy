@@ -473,3 +473,5 @@ token 校验仅排除空值、空白/控制字符和超长值；没有随机生�
 实际 Claude Code 2.1.286 codec 与宿主接线在 `moe-cli-hooks` 边界 crate，
 只有该边界引入经评审的 serde/serde_json；纯运行层仍只依赖记忆核心与标准库。
 契约、包内核验依据与验收记录见 [G5 Hooks](../../docs/GATEWAY.md#hooks-适配)。
+
+R4 回归补充：窄契约故障桩覆盖成功 prepare 后的 infer 健康故障（同一实际模型探针零调用）及成功 infer 后的 finish 故障（账本无成功终态）；SearchMemory 四场景回归位于检索 crate，仅为 dev-dependency 集成，不改变运行层正常依赖。真实 Embedding/rerank/tokenizer 和真实对话模型仍未验证，详见 [REVIEW](../../docs/REVIEW.md#r4-离线工程与最终复核2026-10-13)。
