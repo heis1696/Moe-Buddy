@@ -135,47 +135,117 @@ impl fmt::Debug for TextChunk {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ChunkView<'text> {
+    pub(crate) ordinal: usize,
+    pub(crate) start_char: usize,
+    pub(crate) end_char: usize,
+    text: &'text str,
+}
+
+impl ChunkView<'_> {
+    pub(crate) fn text(&self) -> &str {
+        self.text
+    }
+
+    pub(crate) fn to_owned(self) -> TextChunk {
+        TextChunk {
+            ordinal: self.ordinal,
+            start_char: self.start_char,
+            end_char: self.end_char,
+            text: self.text.to_owned(),
+        }
+    }
+}
+
+pub(crate) struct ChunkIter<'text, 'config> {
+    text: &'text str,
+    config: &'config ChunkConfig,
+    start_byte: usize,
+    start_char: usize,
+    ordinal: usize,
+    done: bool,
+}
+
+pub(crate) fn chunk_views<'text, 'config>(
+    text: &'text str,
+    config: &'config ChunkConfig,
+) -> ChunkIter<'text, 'config> {
+    ChunkIter {
+        text,
+        config,
+        start_byte: 0,
+        start_char: 0,
+        ordinal: 0,
+        done: false,
+    }
+}
+
+impl<'text> Iterator for ChunkIter<'text, '_> {
+    type Item = Result<ChunkView<'text>, SearchError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.start_byte >= self.text.len() {
+            return None;
+        }
+        if self.ordinal >= MAX_CHUNKS {
+            self.done = true;
+            return Some(Err(SearchError::InputTooLong));
+        }
+        let window = match measure_window(self.text, self.start_byte, self.config) {
+            Ok(window) => window,
+            Err(error) => {
+                self.done = true;
+                return Some(Err(error));
+            }
+        };
+        let (cut_byte, end_char) = if window.byte_end == self.text.len() {
+            (window.byte_end, self.start_char + window.chars)
+        } else {
+            let cut_byte = find_boundary(
+                self.text,
+                self.start_byte,
+                window.byte_end,
+                self.config.overlap_chars(),
+            )
+            .unwrap_or(window.byte_end);
+            (
+                cut_byte,
+                self.start_char + self.text[self.start_byte..cut_byte].chars().count(),
+            )
+        };
+        let view = ChunkView {
+            ordinal: self.ordinal,
+            start_char: self.start_char,
+            end_char,
+            text: &self.text[self.start_byte..cut_byte],
+        };
+        self.ordinal += 1;
+        if cut_byte == self.text.len() {
+            self.done = true;
+        } else {
+            let next_char = if end_char - self.start_char > self.config.overlap_chars() {
+                end_char - self.config.overlap_chars()
+            } else {
+                self.start_char + 1
+            };
+            self.start_byte =
+                advance_chars(self.text, self.start_byte, next_char - self.start_char);
+            self.start_char = next_char;
+        }
+        Some(Ok(view))
+    }
+}
+
 /// Splits `text` into deterministic, overlap-bearing character slices under
 /// the configured character, byte, and count budgets. Empty text yields no
 /// slices. Fails with `SearchError::InputTooLong` when a single character
 /// exceeds the byte budget or the input would need more than the capped
 /// slice count; it never truncates or drops text.
 pub fn split_chunks(text: &str, config: &ChunkConfig) -> Result<Vec<TextChunk>, SearchError> {
-    let mut chunks = Vec::new();
-    let mut start_byte = 0usize;
-    let mut start_char = 0usize;
-    while start_byte < text.len() {
-        if chunks.len() >= MAX_CHUNKS {
-            return Err(SearchError::InputTooLong);
-        }
-        let window = measure_window(text, start_byte, config)?;
-        if window.byte_end == text.len() {
-            chunks.push(TextChunk {
-                ordinal: chunks.len(),
-                start_char,
-                end_char: start_char + window.chars,
-                text: text[start_byte..].to_owned(),
-            });
-            break;
-        }
-        let cut_byte = find_boundary(text, start_byte, window.byte_end, config.overlap_chars())
-            .unwrap_or(window.byte_end);
-        let cut_char = start_char + text[start_byte..cut_byte].chars().count();
-        let next_char = if cut_char - start_char > config.overlap_chars() {
-            cut_char - config.overlap_chars()
-        } else {
-            start_char + 1
-        };
-        chunks.push(TextChunk {
-            ordinal: chunks.len(),
-            start_char,
-            end_char: cut_char,
-            text: text[start_byte..cut_byte].to_owned(),
-        });
-        start_byte = advance_chars(text, start_byte, next_char - start_char);
-        start_char = next_char;
-    }
-    Ok(chunks)
+    chunk_views(text, config)
+        .map(|chunk| chunk.map(ChunkView::to_owned))
+        .collect()
 }
 
 struct Window {
@@ -554,6 +624,20 @@ mod tests {
         let second = split_chunks(text, &config).unwrap();
         assert_eq!(first, second);
         assert_complete_coverage(text, &config, &first);
+    }
+
+    #[test]
+    fn borrowed_chunk_views_point_into_the_parent_text() {
+        let text = "abcdefgh";
+        let config = ChunkConfig::new(1, 4, 3, 64).unwrap();
+        let mut chunks = chunk_views(text, &config);
+        let first = chunks.next().unwrap().unwrap();
+        let second = chunks.next().unwrap().unwrap();
+
+        assert_eq!(first.text(), "abcd");
+        assert_eq!(first.text().as_ptr(), text.as_ptr());
+        assert_eq!(second.text(), "bcde");
+        assert_eq!(second.text().as_ptr(), text[1..].as_ptr());
     }
 
     #[test]

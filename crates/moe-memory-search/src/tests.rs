@@ -22,6 +22,86 @@ struct UnhealthyHost {
     recoveries: usize,
 }
 
+#[test]
+fn rerank_chunk_ties_preserve_long_term_first_and_working_context_last() {
+    let mut fixture = Fixture::new(&["aaaabbbb"]);
+    fixture
+        .host
+        .service
+        .put_working_context(
+            &fixture.owner,
+            &SessionId::new("session").unwrap(),
+            "active",
+            1,
+            MemoryDraft::new(
+                "aaaabbbb",
+                Category::WorkingContext,
+                Epistemic::UserStatement,
+                vec![fixture.source.clone()],
+            )
+            .with_lifecycle(moe_memory_core::Lifecycle::ShortTerm),
+            100,
+        )
+        .unwrap();
+    let index = SearchIndex::new(
+        StorageDomain::new("trusted-root-a").unwrap(),
+        fixture.profile.clone(),
+        ChunkConfig::new(1, 4, 0, 16).unwrap(),
+        256,
+        32,
+        4096,
+    )
+    .unwrap();
+    for (layer, expected) in [
+        (RetrievalLayer::LongTerm, "aaaa"),
+        (RetrievalLayer::WorkingContext, "bbbb"),
+    ] {
+        let ticket = fixture.ticket(RetrievalQuery::new("").with_layer(layer));
+        let references: Vec<_> = ticket
+            .candidates()
+            .iter()
+            .map(|candidate| candidate.candidate_ref())
+            .collect();
+        assert_eq!(references.len(), 1);
+        assert_eq!(
+            index.rerank_chunks(&ticket, &references, None).unwrap(),
+            vec![expected.to_owned()],
+        );
+    }
+}
+
+#[tokio::test]
+async fn ranking_failure_preserves_the_standard_error_chain() {
+    let mut fixture = Fixture::new(&["tea"]);
+    let ticket = fixture.ticket(RetrievalQuery::new("tea"));
+    let mut index = fixture.index();
+    let config = fixture.config(0.5);
+    let ranking = hybrid_rank(&mut index, &mut fixture.host, &ticket, None, &config).unwrap();
+    let generation = fixture.host.service.generation();
+    fixture.host.service.cancel_tasks(generation).unwrap();
+    let control = CallControl::new(Cancellation::default(), Duration::from_secs(1)).unwrap();
+    let failure = rerank_or_fallback(
+        &index,
+        &mut fixture.host,
+        ticket,
+        ranking,
+        None,
+        None,
+        &control,
+    )
+    .await
+    .unwrap_err();
+    let cause = std::error::Error::source(&failure).unwrap();
+    assert!(std::ptr::eq(
+        cause.downcast_ref::<SearchError>().unwrap(),
+        failure.error(),
+    ));
+    assert_eq!(
+        cause.source().unwrap().downcast_ref::<MemoryError>(),
+        Some(&MemoryError::TaskCancelled),
+    );
+}
+
 impl crate::RetrievalHost for UnhealthyHost {
     fn authority(&mut self) -> &mut dyn crate::SearchAuthority {
         self

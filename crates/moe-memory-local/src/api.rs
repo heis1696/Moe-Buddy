@@ -275,6 +275,38 @@ impl LocalMemory {
             }))
     }
 
+    /// Cancels every in-flight task at the current generation under an
+    /// operation ID this facade picks itself.
+    ///
+    /// Each explicit call is a new cancel operation, never a replay: after the
+    /// health gate the facade reads the current generation and probes at
+    /// most one more candidate ID than its complete idempotency ledger has
+    /// entries, guaranteeing an unused ID while skipping candidates that
+    /// legitimate business requests occupy. No business ID is reserved or
+    /// rejected. The chosen
+    /// candidate then goes through the exact [`LocalMemory::cancel_tasks`]
+    /// path — CAS on the expected generation, capacity checks, journal append
+    /// and sync before publish — and the returned receipt carries the
+    /// operation ID actually used. A write or sync failure returns the
+    /// original error without any retry and closes the facade with
+    /// [`PersistenceError::RecoveryRequired`]; the host must reopen and
+    /// recover before issuing further work.
+    pub fn cancel_current_tasks(&mut self) -> Result<Committed<u64>, PersistenceError> {
+        self.ready()?;
+        if self.operations.len() >= MAX_OPERATIONS {
+            return Err(PersistenceError::CapacityExceeded);
+        }
+        let generation = self.service.generation();
+        for attempt in 0..=self.operations.len() {
+            let candidate =
+                OperationId::new(format!("moe-memory-local-cancel-{generation}-{attempt}"))?;
+            if !self.operations.contains_key(&candidate) {
+                return self.cancel_tasks(candidate, generation);
+            }
+        }
+        Err(PersistenceError::CapacityExceeded)
+    }
+
     pub fn revoke_source(
         &mut self,
         operation_id: OperationId,

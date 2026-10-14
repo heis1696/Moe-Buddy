@@ -219,11 +219,13 @@ operationId 在整个日志内唯一。相同 ID 与完全相同的请求返回�
 
 `LocalMemory` 实现核心 `MemoryContextAccess` 窄 trait，关联错误为 `PersistenceError`；`begin_memory_task`、`assemble_context` 和 `context_view` 均经本地健康门后委托核心授权与失效校验。它也公开 `assemble_context`、`context_view`、`begin_compaction`、`apply_compaction`，先检查本地健康状态，再复验真实任务和投影版本。这些接口均不追加日志、不分配 operationId、不产生耐久回执；压缩结果只是运行时未核验摘要，不能作为新事实或共享授权。重开后旧上下文及票据均失效，不确定写盘后所有入口拒绝。
 
-`LocalMemory` 还以 `PersistenceError` 健康门转发核心 `set_transmission_policy`、`validate_candidate_ticket`、`bind_query_provenance`、`prepare_transmission`、`record_transmission`、`fail_transmission` 和 `recover_failed_rerank`；`LocalMemoryReader` 的 `begin_candidates` / `complete_retrieval` 同样先检查健康状态。票据、发送集合、查询来源证明和实际发送回执均原样交由核心完整复验，不开放可变 service/inner；`generation` 与 `cancel_tasks` 沿用既有入口。详情及核心调用示例见 [上下文契约](../../docs/MEMORY.md#上下文与压缩) 和 [核心 API](../moe-memory-core/README.md)。
+`LocalMemory` 还以 `PersistenceError` 健康门转发核心 `set_transmission_policy`、`validate_candidate_ticket`、`bind_query_provenance`、`prepare_transmission`、`record_transmission`、`fail_transmission` 和 `recover_failed_rerank`；`LocalMemoryReader` 的 `begin_candidates` / `complete_retrieval` 同样先检查健康状态。票据、发送集合、查询来源证明和实际发送回执均原样交由核心完整复验，不开放可变 service/inner；索引重建等内部栅栏的取消经 `cancel_current_tasks` 由本库选取未占用 ID 后复用原提交链。详情及核心调用示例见 [上下文契约](../../docs/MEMORY.md#上下文与压缩) 和 [核心 API](../moe-memory-core/README.md)。
 
 ## M3 管理与恢复
 
 完整核心语义见 [M3 契约](../../docs/MEMORY.md#生命周期与取消)。`LocalMemoryClient` 提供 `archive`、`restore_archive`、`replace` 与仅元数据的 `status`；根提供 `revoke_source`、严格升版的 `restore_source`、`generation`、CAS `cancel_tasks`、`validate_task`、`create_from_task`。只有成功持久化操作返回 `Committed`，仍遵守排他锁、完整请求 operationId 幂等、私有副本、追加、文件同步、再发布的顺序。替代的旧状态与新条目写在同一帧，不会只发布一半。
+
+`cancel_current_tasks()` 是宿主与内部栅栏（如检索索引重建）共用的窄入口：每次显式调用都是一次新取消操作，不是幂等重放。健康门后按当前代际在本库完整幂等账本中选取未占用的 operationId；最多检查账本条目数加一的不同候选即可保证找到空位，被合法业务请求占用的候选直接跳过，任何业务 ID 都不被预留或拒绝。随后完全复用 `cancel_tasks` 的 CAS、容量检查、追加同步与发布顺序，仍受原有操作数、日志容量与代际上限约束。成功回执 `Committed<u64>` 携带实际使用的 ID 与新代际；追加/同步不确定失败原样返回且不自动重试，门面随即进入 `RecoveryRequired`，须由宿主重开验证并恢复后处置。
 
 全库取消代际、来源撤权、归档/替代/删除墓碑及精确记录依赖经日志重放恢复；运行标记、读取策略、上下文、身份和缓存不恢复。`revoke_access`、`remove_working_context`、`remove_identity_view` 与配置同属运行时管理，无 operationId/耐久回执，重开后默认拒绝；恢复旧日志不能恢复宽权限。含工作条目的任务拒绝持久化派生，不能借此把会话临时输入自动升级为长期证据。
 

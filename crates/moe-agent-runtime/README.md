@@ -4,6 +4,69 @@ API 预设、可信桌宠入口、有界会话暂存、统一离线 Agent 及原
 
 使用标准库、`moe-memory-core` 的稳定身份/授权读取/上下文投影，以及关闭默认特性的 `sha2`（仅用于无正文导入账本的 SHA-256 指纹）；不反向修改记忆核心，不访问文件、网络或系统时钟。配置、凭据引用和鉴权状态只在当前进程内存在；入口本身不授予记忆读取、模型传输或工具权限，没有上游请求或磁盘原文持久化。依赖评审与当前审核见 [修复与架构审核](../../docs/REVIEW.md)。
 
+## 动画编排 A1
+
+`animation` 是独立于 `WorkflowRuntime` 的纯 Rust 单主体通道内核，不使用业务流程的 DAG 规则，不负责素材导入、解码、像素绘制、GUI 或模型调用。完整冻结契约与阶段门见 [现行计划](../../docs/AGENT-MEMORY-PLAN.md#首版冻结契约a02026-10-13)，无头证据见 [审核记录](../../docs/REVIEW.md#动画编排-a1独立审核2026-10-13)。合成播放器仅在测试目录中存在，不作为产品后端导出。
+
+- `AnimationClip::new` 登记非空 ASCII ID、非零资产版本和正整数毫秒时长；不接收文件路径、格式或字节，不证明资产已加载。`AnimationSpec` 是可编辑的执行草稿；`validate_animation` 与 `AnimationDefinition::new` 共用静态校验，后者捕获不可变 `Arc` 快照，只有只读访问器，不支持在途热改。
+- 动作入口、可选收尾、片段节点、`Once/Loop`、`Finish` 和四种边条件构成动作图。边及状态绑定按优先级降序、同优先级声明顺序裁决；参数/触发即时环包括不可达环均拒绝，正时长播放边界环合法。收尾子图只允许单次及至多一个完成后继，必须终结。上限为 128 Clip/动作/总节点/绑定、512 边、64 布尔参数/触发；ID 为 1–128 字节的 ASCII 字母数字或 `_`/`-`。
+- 每个桌宠由宿主持有自己的 `Animator<P>`，它独占一个 `ClipPlayer`。`sync_state`、`set_parameter` 和 `trigger` 只接受受信宿主命令；未知参数/触发拒绝，未绑定的合法状态请求正常退出。相同选择不重播已经自然结束的动作；显式 `request_action` 可重播。重复状态/选择二元组不撤销显式候选，真正改选可替换它；只保留一个最新候选，每种触发至多一份且不跨动作继承。
+- 显式请求返回 `Accepted` 或无副作用的 `RejectedLowerPriority`。同优先级等待正常退出，高优先级按新动作的 `Immediate/AfterExit` 策略；状态改选不会被旧优先级无限阻挡。`request_exit` 等当前单次完成或循环边界进入可选收尾；已在收尾中不重入，普通退出、同优先级及 `AfterExit` 不截断它，只有有效高优先级 `Immediate` 可抢占。`stop` 独立强停，不播放收尾或代表业务回滚。
+- `prepare` 必须核对具体资产/模式/能力且不停止旧播放；准备成功后仍必须取得旧票据的停止确认才能 `start`。每次开始的 `PlaybackTicket` 私有构造，绑定实例、定义版本、Clip/资产版本和单调序号，不复用耗尽序号。只允许同步回传收到的票据，没有任意外部事件提交入口；保证跨播放隔离，不保证同一播放内操作级防重放。
+- `ClipPlayer::advance` 是游标/时间边界唯一权威，每次回传实际消耗及至多一个模式匹配的边界；无边界消耗全部步长，有边界消耗正时间且不超步长。`Animator::advance` 续传后继余量，每次最多处理 128 次转换/边界，返回 `Yielded` 并保留余量，可用零增量继续；累加溢出先拒绝且不改实例。成功强停、无后继终止及故障确认停止清空旧余量、候选、触发，新请求不会借零增量消费旧债。
+- `pause/resume` 成功重复调用幂等。暂停冻结游标和余量，正增量拒绝、零增量只查询，不积累时间；状态、参数、触发和显式请求只更新待处理意图，不准备、启动或转换，恢复后处理。不支持暂停明确返回 `PauseUnsupported`；强停不受暂停限制并清除暂停标记。普通命令只处理零时间意图，不排空已有时间债。
+- `AnimationError<P::Error>` 保留后端原类型和 `Error::source` 错误链；后端错误/非法回报进入故障锁定，不自动重试开始或推进，只允许显式 `stop` 确认清空后重新接收动作。`snapshot` 返回版本、动作/节点/票据、状态/选择/候选、暂停/故障/退出标记及余量的独立只读报告；`playback_progress` 校验后端只读位置及票据，不开放后端可变访问。
+
+下面只构造不可变动作定义，不伪造实际播放或呈现成功：
+
+```rust
+use moe_agent_runtime::animation::{
+    AnimationAction, AnimationBinding, AnimationClip, AnimationDefinition,
+    AnimationNode, AnimationSpec, Animator, ClipPlayer, PlaybackMode, PreemptionPolicy,
+};
+
+let definition = AnimationDefinition::new(AnimationSpec {
+    version: 1,
+    clips: vec![AnimationClip::new("rest", 1, 40)?],
+    actions: vec![AnimationAction {
+        id: "resting".into(), entry: "body".into(), exit: None, priority: 0,
+        preemption: PreemptionPolicy::AfterExit,
+        nodes: vec![AnimationNode {
+            id: "body".into(), clip: "rest".into(), mode: PlaybackMode::Loop,
+            edges: vec![],
+        }],
+    }],
+    parameters: vec![], triggers: vec![],
+    bindings: vec![AnimationBinding {
+        state: "rest".into(), parameter: None, action: "resting".into(), priority: 0,
+    }],
+})?;
+assert_eq!(definition.version(), 1);
+
+fn attach_host_player<P: ClipPlayer>(definition: AnimationDefinition, player: P) -> Animator<P> {
+    Animator::new(definition, player)
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+A2 素材层和实际显示未纳入本次主干集成；下一阶段须另行明确范围与验收。
+
+播放票据与发布定义不开放修改入口：
+
+```compile_fail
+use moe_agent_runtime::animation::PlaybackTicket;
+fn rewrite(ticket: &mut PlaybackTicket) {
+    ticket.sequence = 1;
+}
+```
+
+```compile_fail
+use moe_agent_runtime::animation::AnimationDefinition;
+fn rewrite(definition: &mut AnimationDefinition) {
+    definition.actions()[0].entry = "another-node".into();
+}
+```
+
 ## 预设管理
 
 - `PresetConfig::new` 校验显示名、协议标识、端点、凭据引用、模型及扩展参数；只描述配置，不表示有协议适配器或供应商可用性证明。
@@ -242,12 +305,14 @@ let mut agent = AgentRuntime::new(&ingress, AgentLimits::new(8, 64, 4096, 4096)?
 let access = AgentAccess::new(&ingress, &request, &presets, 0);
 let binding = agent.bind_session(&access, &mut sessions, &registration.session,
     vec![authority, source])?;
-let mut task = agent.prepare(&access, AgentServices::new(&mut sessions, &mut memory),
+let mut workflow = AgentWorkflow::start()?;
+workflow.prepare(&mut agent, &access, AgentServices::new(&mut sessions, &mut memory),
     &binding, &registration.interaction, &RetrievalQuery::new(""))?;
-let result = agent.infer(&access, AgentServices::new(&mut sessions, &mut memory),
-    &mut task, &mut FixtureModel)?;
-let delivery = agent.finish(&access, AgentServices::new(&mut sessions, &mut memory),
-    &mut task, &result)?;
+workflow.infer(&agent, &access, AgentServices::new(&mut sessions, &mut memory),
+    &mut FixtureModel)?;
+let delivery = workflow.finish(&agent, &access,
+    AgentServices::new(&mut sessions, &mut memory))?;
+assert_eq!(workflow.progress().status, WorkflowStatus::Succeeded);
 assert_eq!(delivery.state(), TerminalState::Completed);
 assert_eq!(delivery.text(), Some("合成人设：合成获准事实"));
 assert_eq!(delivery.reply_target().as_str(), "original-target");
@@ -270,6 +335,48 @@ let forged = AgentTask {};
 use moe_agent_runtime::AgentResult;
 let forged = AgentResult {};
 ```
+
+## 程序流程执行层
+
+`WorkflowDefinition` 由受信 Rust 程序使用静态标识与 `WorkflowStep` 定义；没有模型输入、脚本、表达式或反序列化入口。定义 ID/节点 ID 限 1–128 个 ASCII 字母、数字、`-_.`，版本必须非零，节点数为 1–`MAX_WORKFLOW_STEPS`（128）。构造时拒绝重复节点、缺失/重复前置与循环（含自依赖），成功定义不可变；`start` 捕获定义快照，新版本不改变在途实例。
+
+`WorkflowRuntime::new(capacity)` 显式提供正的累计实例容量；终态仍计入容量，不自动驱逐证据或复用句柄。每个实例仅允许一个在途节点；`begin(run, step_id)` 必须等于当前第一个已满足全部成功前置的待执行节点，同为就绪时按定义声明顺序推进。允许向前引用前置节点，但不是条件分支，所有节点都需执行；一个实例等待结果不阻塞另一个实例。
+
+`begin` 返回私有构造的 `WorkflowExecution`，`complete` 只接受该具体实例/节点执行的票据。跨运行协调器、重复、过期或取消后票据均拒绝；失败、未知或取消立即停止，不自动重试或允许跳节点。`cancel` 对已取消实例幂等，不改写其他终态，也不撤销宿主已发生的副作用。`progress` 返回独立元数据快照，修改快照不修改运行状态；定义/票据/进度无正文或凭据，流程状态不是业务提交、外部送达或工具执行回执。
+
+```rust
+use moe_agent_runtime::{WorkflowDefinition, WorkflowOutcome, WorkflowRuntime,
+    WorkflowStatus, WorkflowStep};
+
+let definition = WorkflowDefinition::new("synthetic-flow", 1, vec![
+    WorkflowStep::new("prepare", &[]),
+    WorkflowStep::new("finish", &["prepare"]),
+])?;
+let mut runtime = WorkflowRuntime::new(8)?;
+let run = runtime.start(&definition)?;
+let prepare = runtime.begin(&run, "prepare")?;
+runtime.complete(&prepare, WorkflowOutcome::Succeeded)?;
+let finish = runtime.begin(&run, "finish")?;
+runtime.complete(&finish, WorkflowOutcome::Succeeded)?;
+assert_eq!(runtime.progress(&run)?.status, WorkflowStatus::Succeeded);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+```compile_fail
+use moe_agent_runtime::WorkflowRun;
+let forged = WorkflowRun {};
+```
+
+```compile_fail
+use moe_agent_runtime::WorkflowExecution;
+let forged = WorkflowExecution {};
+```
+
+`AgentWorkflow::start()` 固定定义 `offline-agent` v1 的 `prepare → infer → finish`，将 G2 私有任务与结果保留在包装器内；上述合成离线示例经过该入口。每步仍调用原 `AgentRuntime` 方法，沿用当前来源、权限、预设、版本、时间与最终提交复验；`AgentWorkflowError<E>::Agent` 保留原 `AgentError<E>` 和后端错误链，不新增传输、查看或工具权限。顺序错误在业务调用前拒绝，原 G2 直连 API 不变。
+
+`infer` 节点成功仅表示获得待裁决的模型结果；模型失败/取消/未知仍须执行 `finish`，由会话账本登记实际终态后映射为流程 Failed/Cancelled/Unknown，不伪造成功。任何 Agent 方法返回错误即停止该包装器，不重试推理或最终登记；与原 G2 可显式重试背压的直连入口不同，宿主须另外处置未终结交互，流程 Failed 不冒充会话 Failed 回执。准备后调用 `cancel(access, sessions)` 先走 G1 授权取消，成功才停止流程并丢弃私有任务/结果；授权取消失败保留进度。准备前仅取消本地流程，重复已取消调用不重交账本。
+
+内核无 I/O、系统时钟、全局活动角色或新增依赖；业务执行由宿主完成。没有并行调度、复杂分支/循环、自动重试、跨重启恢复或运行日志接线，不改变 G6–G8 暂停及 R4 真实门未通过的事实。
 
 ## G3 原文生命周期与本机回收区
 

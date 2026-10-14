@@ -185,7 +185,11 @@ impl std::fmt::Display for RankingFailure {
     }
 }
 
-impl std::error::Error for RankingFailure {}
+impl std::error::Error for RankingFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
 
 /// Authorizes before any statistics, similarity, ranking or budget calculation.
 /// Neither this function nor cache hits can complete/deliver a core task.

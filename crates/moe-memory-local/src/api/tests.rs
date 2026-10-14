@@ -1234,6 +1234,180 @@ fn failed_journal_blocks_m2_views_and_volatile_configuration() {
 }
 
 #[test]
+fn internal_cancel_skips_candidates_occupied_by_legitimate_business_requests() {
+    let (mut memory, _, pet, _) = fixture();
+    let before = memory.generation().unwrap();
+    let occupied = OperationId::new(format!("moe-memory-local-cancel-{}-0", before + 1)).unwrap();
+    let business = memory
+        .register_source(
+            occupied.clone(),
+            MemoryScope::Private(pet.clone()),
+            "business",
+            1,
+            Epistemic::UserStatement,
+        )
+        .unwrap();
+    let committed = memory.cancel_current_tasks().unwrap();
+    assert_eq!(
+        committed.operation_id().as_str(),
+        format!("moe-memory-local-cancel-{}-1", before + 1)
+    );
+    assert_eq!(committed.value(), &(before + 2));
+    assert_eq!(committed.sequence(), business.sequence() + 1);
+    let confirmed = memory
+        .register_source(
+            occupied,
+            MemoryScope::Private(pet.clone()),
+            "business",
+            1,
+            Epistemic::UserStatement,
+        )
+        .unwrap();
+    assert_eq!(confirmed.sequence(), business.sequence());
+    assert_eq!(confirmed.value(), business.value());
+    assert_eq!(memory.generation().unwrap(), before + 2);
+}
+
+#[test]
+fn consecutive_internal_cancels_and_reopen_stay_fresh_operations() {
+    let (mut memory, state, pet, source) = fixture();
+    let first = memory.cancel_current_tasks().unwrap();
+    let second = memory.cancel_current_tasks().unwrap();
+    assert_ne!(first.operation_id(), second.operation_id());
+    assert_eq!(second.value(), &(*first.value() + 1));
+    assert_eq!(memory.generation().unwrap(), *second.value());
+    drop(memory);
+    let mut reopened = LocalMemory::recover(Box::new(FaultJournal(state.clone()))).unwrap();
+    let third = reopened.cancel_current_tasks().unwrap();
+    assert_ne!(third.operation_id(), first.operation_id());
+    assert_ne!(third.operation_id(), second.operation_id());
+    assert_eq!(third.value(), &(*second.value() + 1));
+    let appends = state.lock().unwrap().appends;
+    let confirmed = reopened
+        .register_source(
+            OperationId::new("source").unwrap(),
+            MemoryScope::Private(pet.clone()),
+            "message",
+            1,
+            Epistemic::UserStatement,
+        )
+        .unwrap();
+    assert_eq!(confirmed.sequence(), 1);
+    assert_eq!(confirmed.value(), &source);
+    assert_eq!(state.lock().unwrap().appends, appends);
+}
+
+#[test]
+fn internal_cancel_skips_more_than_sixty_four_occupied_candidates() {
+    let (mut memory, state, pet, _) = fixture();
+    let occupied_count = 128;
+    let cancel_generation = memory.generation().unwrap() + occupied_count;
+    for attempt in 0..occupied_count {
+        memory
+            .register_source(
+                OperationId::new(format!(
+                    "moe-memory-local-cancel-{cancel_generation}-{attempt}"
+                ))
+                .unwrap(),
+                MemoryScope::Private(pet.clone()),
+                "filler",
+                1,
+                Epistemic::UserStatement,
+            )
+            .unwrap();
+    }
+    assert_eq!(memory.generation().unwrap(), cancel_generation);
+    let appends = state.lock().unwrap().appends;
+    let committed = memory.cancel_current_tasks().unwrap();
+    assert_eq!(
+        committed.operation_id().as_str(),
+        format!("moe-memory-local-cancel-{cancel_generation}-{occupied_count}")
+    );
+    assert_eq!(committed.value(), &(cancel_generation + 1));
+    assert_eq!(state.lock().unwrap().appends, appends + 1);
+    assert!(!memory.failed);
+    memory
+        .cancel_tasks(
+            OperationId::new("business-cancel").unwrap(),
+            cancel_generation + 1,
+        )
+        .unwrap();
+}
+
+#[test]
+fn internal_cancel_real_journal_capacity_rejects_without_publishing() {
+    let (mut memory, state, _, _) = fixture();
+    let generation = memory.generation().unwrap();
+    let operations = memory.operations.len();
+    let appends = state.lock().unwrap().appends;
+    memory.length = MAX_JOURNAL_BYTES;
+    assert!(matches!(
+        memory.cancel_current_tasks(),
+        Err(PersistenceError::CapacityExceeded)
+    ));
+    assert_eq!(memory.generation().unwrap(), generation);
+    assert_eq!(memory.operations.len(), operations);
+    assert_eq!(state.lock().unwrap().appends, appends);
+    assert!(!memory.failed);
+}
+
+#[test]
+fn internal_cancel_write_failure_fails_closed_and_never_auto_retries() {
+    for fault in [Fault::BeforeWrite, Fault::Sync] {
+        let (mut memory, state, pet, source) = fixture();
+        let session = SessionId::new("current").unwrap();
+        memory
+            .set_read_policy(&pet, ReadPolicy::offline(1, vec![source.clone()]))
+            .unwrap();
+        let task = memory
+            .for_session(&pet, &session, ReadPurpose::OfflineReasoning)
+            .begin_task(&RetrievalQuery::new(""), 100)
+            .unwrap();
+        let generation = memory.generation().unwrap();
+        state.lock().unwrap().fault = fault;
+        assert!(matches!(
+            memory.cancel_current_tasks(),
+            Err(PersistenceError::Io(_))
+        ));
+        assert_eq!(memory.service.generation(), generation);
+        assert!(matches!(
+            memory.cancel_current_tasks(),
+            Err(PersistenceError::RecoveryRequired)
+        ));
+        drop(memory);
+        state.lock().unwrap().fault = Fault::None;
+        let mut recovered = LocalMemory::recover(Box::new(FaultJournal(state.clone()))).unwrap();
+        let written = u64::from(matches!(fault, Fault::Sync));
+        assert_eq!(recovered.generation().unwrap(), generation + written);
+        recovered
+            .set_read_policy(&pet, ReadPolicy::offline(1, vec![source.clone()]))
+            .unwrap();
+        assert!(matches!(
+            recovered.create_from_task(
+                OperationId::new("late").unwrap(),
+                &task,
+                draft(&source),
+                200
+            ),
+            Err(PersistenceError::Memory(MemoryError::TaskCancelled))
+        ));
+        if matches!(fault, Fault::Sync) {
+            let appends = state.lock().unwrap().appends;
+            let confirmed = recovered
+                .cancel_tasks(
+                    OperationId::new(format!("moe-memory-local-cancel-{generation}-0")).unwrap(),
+                    generation,
+                )
+                .unwrap();
+            assert_eq!(confirmed.value(), &(generation + 1));
+            assert_eq!(state.lock().unwrap().appends, appends);
+        }
+        let committed = recovered.cancel_current_tasks().unwrap();
+        assert_eq!(committed.value(), &(generation + written + 1));
+    }
+}
+
+#[test]
 fn valid_v1_journal_with_more_than_ten_thousand_deletions_still_recovers() {
     fn append(
         bytes: &mut Vec<u8>,

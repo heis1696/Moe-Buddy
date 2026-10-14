@@ -1,6 +1,8 @@
 #![doc = include_str!("../README.md")]
 
 mod agent;
+mod agent_workflow;
+pub mod animation;
 mod diagnostics;
 mod error;
 mod hooks;
@@ -8,12 +10,14 @@ mod ingress;
 mod preset;
 mod session;
 mod validation;
+mod workflow;
 
 pub use agent::{
     AgentAccess, AgentBinding, AgentDelivery, AgentError, AgentLimits, AgentResult, AgentRuntime,
     AgentServices, AgentTask, ModelFailure, ModelOutcome, OfflineInput, OfflineModel,
     PresentationEvent,
 };
+pub use agent_workflow::{AgentWorkflow, AgentWorkflowError};
 pub use diagnostics::{
     BackgroundCode, CaptureSetting, CaptureStrategy, Category, CategorySet, ClockReading,
     DetailLevel, DiagnosticKind, DiagnosticsConfig, DiagnosticsError, DiagnosticsService,
@@ -47,4 +51,9 @@ pub use session::{
     RestoredRawFragment, RetentionZone, SessionAccess, SessionId, SessionLimits, SessionRuntime,
     SessionSnapshot, SessionTiming, StagedEvent, TerminalReceipt, TerminalState, UserEvent,
     UserEventKind,
+};
+pub use workflow::{
+    MAX_WORKFLOW_STEPS, WorkflowDefinition, WorkflowError, WorkflowExecution, WorkflowOutcome,
+    WorkflowProgress, WorkflowRun, WorkflowRuntime, WorkflowStatus, WorkflowStep,
+    WorkflowStepProgress, WorkflowStepStatus,
 };

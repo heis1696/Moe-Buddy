@@ -1,7 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use moe_memory_core::{CandidateTicket, MemoryScope};
 use serde_json::{Value, json};
@@ -188,57 +189,71 @@ impl SearchIndex {
         if value["profile"] != profile(self) || value["chunks"] != config(self) {
             return Err(SearchError::ProfileMismatch);
         }
-        let allowed: BTreeMap<_, _> = self
-            .expected(ticket)?
-            .into_iter()
-            .map(|slice| (key_value(&slice.key).to_string(), slice))
-            .collect();
         let entries = value["entries"]
             .as_array()
             .ok_or(SearchError::CacheUnavailable)?;
         if entries.len() > 65536 {
             return Err(SearchError::CacheUnavailable);
         }
-        let mut seen = BTreeSet::new();
-        let mut restored = BTreeMap::new();
+        let mut cached = BTreeMap::new();
         for entry in entries {
             let key = entry["key"]
                 .as_array()
                 .filter(|key| key.len() == 10)
                 .ok_or(SearchError::CacheUnavailable)?;
             let encoded_key = Value::Array(key.clone()).to_string();
-            if !seen.insert(encoded_key.clone()) {
+            if cached.contains_key(&encoded_key) {
                 return Err(SearchError::CacheUnavailable);
             }
             let values = entry["vector"]
                 .as_array()
                 .filter(|values| values.len() == self.profile.dimension())
                 .ok_or(SearchError::CacheUnavailable)?;
-            let values: Vec<_> = values
-                .iter()
-                .map(|value| {
-                    value
-                        .as_f64()
-                        .filter(|value| value.is_finite())
-                        .ok_or(SearchError::CacheUnavailable)
-                })
-                .collect::<Result<_, _>>()?;
-            let norm = values.iter().map(|value| value * value).sum::<f64>();
+            let mut norm = 0.0;
+            for value in values {
+                let value = value
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .ok_or(SearchError::CacheUnavailable)?;
+                norm += value * value;
+            }
             if !norm.is_finite() || (norm - 1.0).abs() > 1e-8 {
                 return Err(SearchError::CacheUnavailable);
             }
-            let vector = UnitVector::new(values, self.profile.dimension())
-                .map_err(|_| SearchError::CacheUnavailable)?;
-            if let Some(slice) = allowed.get(&encoded_key) {
+            cached.insert(encoded_key, &entry["vector"]);
+        }
+        let mut restored = BTreeMap::new();
+        let mut parent_inputs = BTreeMap::new();
+        self.visit_expected(ticket, |key, _, input, _| {
+            if let Some(values) = cached
+                .remove(&key_value(&key).to_string())
+                .and_then(Value::as_array)
+            {
+                let values = values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_f64()
+                            .filter(|value| value.is_finite())
+                            .ok_or(SearchError::CacheUnavailable)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let vector = UnitVector::new(values, self.profile.dimension())
+                    .map_err(|_| SearchError::CacheUnavailable)?;
+                let record = key.record_key();
+                let parent = parent_inputs
+                    .entry(record)
+                    .or_insert_with(|| Arc::new(input.clone()));
                 restored.insert(
-                    slice.key.clone(),
+                    key,
                     StoredVector {
-                        input: slice.input.clone(),
+                        input: Arc::clone(parent),
                         vector,
                     },
                 );
             }
-        }
+            Ok(true)
+        })?;
         let added = restored
             .keys()
             .filter(|key| !self.entries.contains_key(*key))
@@ -257,16 +272,17 @@ impl SearchIndex {
         ticket: &CandidateTicket,
     ) -> Result<(), SearchError> {
         self.authorize(host, ticket)?;
-        let entries: Vec<_> = self
-            .expected(ticket)?
-            .into_iter()
-            .filter_map(|slice| {
-                self.entries
-                    .get(&slice.key)
-                    .filter(|stored| stored.input == slice.input)
-                    .map(|stored| json!({"key": key_value(&slice.key), "vector": stored.vector.0}))
-            })
-            .collect();
+        let mut entries = Vec::new();
+        self.visit_expected(ticket, |key, _, input, _| {
+            if let Some(stored) = self
+                .entries
+                .get(&key)
+                .filter(|stored| stored.input.as_ref() == input)
+            {
+                entries.push(json!({"key": key_value(&key), "vector": stored.vector.0}));
+            }
+            Ok(true)
+        })?;
         let value = json!({"format": 1, "domain": self.domain.0, "profile": profile(self), "chunks": config(self), "entries": entries});
         self.cache
             .as_ref()

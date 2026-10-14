@@ -4,11 +4,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use moe_agent_runtime::{
     AgentAccess, AgentBinding, AgentDelivery, AgentError, AgentLimits, AgentResult, AgentRuntime,
-    AgentServices, AgentTask, CallerSubject, ChannelId, ChannelScope, EventRole, GatewayError,
-    IngressToken, ModelFailure, ModelOutcome, OfflineInput, OfflineModel, PresentationEvent,
-    PresetConfig, PresetId, PresetPurpose, PresetRegistry, RawIngressCall, Registration,
-    RelatedEvent, ReplyTarget, SessionAccess, SessionLimits, SessionRuntime, SessionTiming,
-    TerminalState, TrustedIngress, TrustedRequest, UserEvent, UserEventKind,
+    AgentServices, AgentTask, AgentWorkflow, AgentWorkflowError, CallerSubject, ChannelId,
+    ChannelScope, EventRole, GatewayError, IngressToken, ModelFailure, ModelOutcome, OfflineInput,
+    OfflineModel, PresentationEvent, PresetConfig, PresetId, PresetPurpose, PresetRegistry,
+    RawIngressCall, Registration, RelatedEvent, ReplyTarget, SessionAccess, SessionLimits,
+    SessionRuntime, SessionTiming, TerminalState, TrustedIngress, TrustedRequest, UserEvent,
+    UserEventKind, WorkflowError, WorkflowStatus, WorkflowStepProgress, WorkflowStepStatus,
 };
 use moe_memory_core::{
     Category, ContextView, EmbeddingProfile, Epistemic, Lifecycle, MemoryContextAccess,
@@ -2004,4 +2005,656 @@ fn unselected_transmission_sources_must_fit_the_session_grant() {
         )
         .unwrap_err();
     assert_eq!(error, AgentError::MemoryScopeDenied);
+}
+
+#[test]
+fn agent_workflow_drives_the_prepare_infer_finish_chain() {
+    let mut fixture = Fixture::new(limits());
+    let mut flow = AgentWorkflow::start().unwrap();
+    let progress = flow.progress();
+    assert_eq!(progress.definition_id, "offline-agent");
+    assert_eq!(progress.definition_version, 1);
+    assert_eq!(progress.status, WorkflowStatus::Ready);
+    assert_eq!(progress.next_step, Some("prepare"));
+    assert_eq!(
+        progress.steps,
+        vec![
+            WorkflowStepProgress {
+                id: "prepare",
+                status: WorkflowStepStatus::Pending,
+            },
+            WorkflowStepProgress {
+                id: "infer",
+                status: WorkflowStepStatus::Pending,
+            },
+            WorkflowStepProgress {
+                id: "finish",
+                status: WorkflowStepStatus::Pending,
+            },
+        ]
+    );
+    flow.prepare(
+        &mut fixture.agent,
+        &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+        AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        &fixture.binding,
+        &fixture.registration.interaction,
+        &RetrievalQuery::new(""),
+    )
+    .unwrap();
+    assert_eq!(flow.progress().next_step, Some("infer"));
+    let mut model = Probe::default();
+    flow.infer(
+        &fixture.agent,
+        &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 1),
+        AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        &mut model,
+    )
+    .unwrap();
+    assert_eq!(model.calls, 1);
+    assert_eq!(flow.progress().next_step, Some("finish"));
+    let delivery = flow
+        .finish(
+            &fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 2),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        )
+        .unwrap();
+    assert_eq!(delivery.state(), TerminalState::Completed);
+    assert!(delivery.text().unwrap().contains(PERSONA));
+    assert!(delivery.text().unwrap().contains(FACT));
+    assert_eq!(delivery.reply_target().as_str(), "desktop-target");
+    let progress = flow.progress();
+    assert_eq!(progress.status, WorkflowStatus::Succeeded);
+    assert_eq!(progress.next_step, None);
+    assert_eq!(
+        fixture.snapshot(2).events.last().unwrap().body(),
+        delivery.text().unwrap()
+    );
+}
+
+#[test]
+fn agent_workflow_rejects_out_of_order_and_repeated_calls_without_extra_inference() {
+    let mut fixture = Fixture::new(limits());
+    let mut flow = AgentWorkflow::start().unwrap();
+    let mut model = Probe::default();
+    assert!(matches!(
+        flow.infer(
+            &fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+            &mut model,
+        ),
+        Err(AgentWorkflowError::Workflow(WorkflowError::StepNotReady))
+    ));
+    assert!(matches!(
+        flow.finish(
+            &fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        ),
+        Err(AgentWorkflowError::Workflow(WorkflowError::StepNotReady))
+    ));
+    assert_eq!(model.calls, 0);
+    flow.prepare(
+        &mut fixture.agent,
+        &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+        AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        &fixture.binding,
+        &fixture.registration.interaction,
+        &RetrievalQuery::new(""),
+    )
+    .unwrap();
+    assert!(matches!(
+        flow.prepare(
+            &mut fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+            &fixture.binding,
+            &fixture.registration.interaction,
+            &RetrievalQuery::new(""),
+        ),
+        Err(AgentWorkflowError::Workflow(WorkflowError::StepNotReady))
+    ));
+    flow.infer(
+        &fixture.agent,
+        &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+        AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        &mut model,
+    )
+    .unwrap();
+    assert_eq!(model.calls, 1);
+    assert!(matches!(
+        flow.infer(
+            &fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+            &mut model,
+        ),
+        Err(AgentWorkflowError::Workflow(WorkflowError::StepNotReady))
+    ));
+    flow.finish(
+        &fixture.agent,
+        &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+        AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+    )
+    .unwrap();
+    assert!(matches!(
+        flow.finish(
+            &fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        ),
+        Err(AgentWorkflowError::Workflow(WorkflowError::RunStopped))
+    ));
+    assert!(matches!(
+        flow.prepare(
+            &mut fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+            &fixture.binding,
+            &fixture.registration.interaction,
+            &RetrievalQuery::new(""),
+        ),
+        Err(AgentWorkflowError::Workflow(WorkflowError::RunStopped))
+    ));
+    assert!(matches!(
+        flow.infer(
+            &fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+            &mut model,
+        ),
+        Err(AgentWorkflowError::Workflow(WorkflowError::RunStopped))
+    ));
+    assert_eq!(model.calls, 1);
+    assert_eq!(flow.progress().status, WorkflowStatus::Succeeded);
+}
+
+#[test]
+fn agent_workflow_preserves_original_errors_and_stops_on_revocation_or_version_drift() {
+    for stage in [0, 1, 2] {
+        let mut fixture = Fixture::new(limits());
+        let mut flow = AgentWorkflow::start().unwrap();
+        let mut model = Probe::default();
+        match stage {
+            0 => fixture.agent.revoke_binding(&fixture.binding).unwrap(),
+            1 => fixture
+                .memory
+                .set_read_policy(fixture.request.identity(), ReadPolicy::deny_all(2))
+                .unwrap(),
+            _ => {
+                flow.prepare(
+                    &mut fixture.agent,
+                    &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+                    AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+                    &fixture.binding,
+                    &fixture.registration.interaction,
+                    &RetrievalQuery::new(""),
+                )
+                .unwrap();
+                flow.infer(
+                    &fixture.agent,
+                    &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 1),
+                    AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+                    &mut model,
+                )
+                .unwrap();
+                let id = PresetId::new("synthetic-chat").unwrap();
+                let version = fixture
+                    .presets
+                    .resolve(PresetPurpose::Chat)
+                    .unwrap()
+                    .version();
+                fixture
+                    .presets
+                    .update(&id, version, config("rotated-model"))
+                    .unwrap();
+            }
+        }
+        let error = if stage == 2 {
+            flow.finish(
+                &fixture.agent,
+                &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 2),
+                AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+            )
+            .unwrap_err()
+        } else {
+            flow.prepare(
+                &mut fixture.agent,
+                &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+                AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+                &fixture.binding,
+                &fixture.registration.interaction,
+                &RetrievalQuery::new(""),
+            )
+            .unwrap_err()
+        };
+        if stage == 0 {
+            assert!(matches!(
+                error,
+                AgentWorkflowError::Agent(AgentError::Gateway(GatewayError::Revoked))
+            ));
+        } else if stage == 1 {
+            assert!(matches!(
+                error,
+                AgentWorkflowError::Agent(AgentError::Memory(MemoryError::AccessDenied))
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                AgentWorkflowError::Agent(AgentError::Gateway(GatewayError::VersionConflict))
+            ));
+        }
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(flow.progress().status, WorkflowStatus::Failed);
+        assert_eq!(flow.progress().next_step, None);
+        assert!(matches!(
+            flow.infer(
+                &fixture.agent,
+                &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+                AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+                &mut model,
+            ),
+            Err(AgentWorkflowError::Workflow(WorkflowError::RunStopped))
+        ));
+        assert!(matches!(
+            flow.finish(
+                &fixture.agent,
+                &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+                AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+            ),
+            Err(AgentWorkflowError::Workflow(WorkflowError::RunStopped))
+        ));
+        assert_eq!(model.calls, if stage == 2 { 1 } else { 0 });
+    }
+}
+
+#[test]
+fn agent_workflow_finish_registers_real_terminal_states_for_nonsuccess() {
+    for (outcome, state, status) in [
+        (
+            ModelOutcome::Failed(ModelFailure::Unavailable),
+            TerminalState::Failed,
+            WorkflowStatus::Failed,
+        ),
+        (
+            ModelOutcome::Cancelled,
+            TerminalState::Cancelled,
+            WorkflowStatus::Cancelled,
+        ),
+        (
+            ModelOutcome::Unknown,
+            TerminalState::Unknown,
+            WorkflowStatus::Unknown,
+        ),
+    ] {
+        let mut fixture = Fixture::new(limits());
+        let mut flow = AgentWorkflow::start().unwrap();
+        flow.prepare(
+            &mut fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+            &fixture.binding,
+            &fixture.registration.interaction,
+            &RetrievalQuery::new(""),
+        )
+        .unwrap();
+        let mut model = Probe {
+            outcome: Some(outcome),
+            ..Probe::default()
+        };
+        flow.infer(
+            &fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+            &mut model,
+        )
+        .unwrap();
+        assert_eq!(model.calls, 1);
+        assert_eq!(flow.progress().status, WorkflowStatus::Ready);
+        let delivery = flow
+            .finish(
+                &fixture.agent,
+                &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 1),
+                AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+            )
+            .unwrap();
+        assert_eq!(delivery.state(), state);
+        assert!(delivery.text().is_none());
+        assert!(delivery.presentation().is_empty());
+        assert_eq!(flow.progress().status, status);
+        assert_eq!(fixture.snapshot(1).events[0].terminal(), Some(state));
+        assert!(matches!(
+            flow.finish(
+                &fixture.agent,
+                &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 1),
+                AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+            ),
+            Err(AgentWorkflowError::Workflow(WorkflowError::RunStopped))
+        ));
+    }
+}
+
+#[test]
+fn agent_workflow_authorized_cancel_stops_and_registers_cancellation() {
+    let mut fixture = Fixture::new(limits());
+    let mut flow = AgentWorkflow::start().unwrap();
+    flow.prepare(
+        &mut fixture.agent,
+        &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+        AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        &fixture.binding,
+        &fixture.registration.interaction,
+        &RetrievalQuery::new(""),
+    )
+    .unwrap();
+    flow.cancel(
+        &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 1),
+        &mut fixture.sessions,
+    )
+    .unwrap();
+    let progress = flow.progress();
+    assert_eq!(progress.status, WorkflowStatus::Cancelled);
+    assert_eq!(progress.next_step, None);
+    assert_eq!(
+        fixture.snapshot(1).events[0].terminal(),
+        Some(TerminalState::Cancelled)
+    );
+    flow.cancel(
+        &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 2),
+        &mut fixture.sessions,
+    )
+    .unwrap();
+    let mut model = Probe::default();
+    assert!(matches!(
+        flow.prepare(
+            &mut fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 2),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+            &fixture.binding,
+            &fixture.registration.interaction,
+            &RetrievalQuery::new(""),
+        ),
+        Err(AgentWorkflowError::Workflow(WorkflowError::RunStopped))
+    ));
+    assert!(matches!(
+        flow.infer(
+            &fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 2),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+            &mut model,
+        ),
+        Err(AgentWorkflowError::Workflow(WorkflowError::RunStopped))
+    ));
+    assert!(matches!(
+        flow.finish(
+            &fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 2),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        ),
+        Err(AgentWorkflowError::Workflow(WorkflowError::RunStopped))
+    ));
+    assert_eq!(model.calls, 0);
+}
+
+#[test]
+fn agent_workflow_cancel_before_prepare_only_stops_the_local_flow() {
+    let mut fixture = Fixture::new(limits());
+    let mut flow = AgentWorkflow::start().unwrap();
+    flow.cancel(
+        &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+        &mut fixture.sessions,
+    )
+    .unwrap();
+    assert_eq!(flow.progress().status, WorkflowStatus::Cancelled);
+    let snapshot = fixture.snapshot(0);
+    assert_eq!(snapshot.events.len(), 1);
+    assert_eq!(snapshot.events[0].terminal(), None);
+    assert!(matches!(
+        flow.prepare(
+            &mut fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+            &fixture.binding,
+            &fixture.registration.interaction,
+            &RetrievalQuery::new(""),
+        ),
+        Err(AgentWorkflowError::Workflow(WorkflowError::RunStopped))
+    ));
+}
+
+#[test]
+fn agent_workflow_failed_cancel_keeps_progress_unchanged() {
+    let mut fixture = Fixture::new(limits());
+    let mut flow = AgentWorkflow::start().unwrap();
+    flow.prepare(
+        &mut fixture.agent,
+        &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+        AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        &fixture.binding,
+        &fixture.registration.interaction,
+        &RetrievalQuery::new(""),
+    )
+    .unwrap();
+    fixture
+        .sessions
+        .revoke_session(
+            SessionAccess::new(&fixture.ingress, &fixture.request, 1),
+            &fixture.registration.session,
+        )
+        .unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            flow.cancel(
+                &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 1),
+                &mut fixture.sessions,
+            ),
+            Err(AgentWorkflowError::Agent(AgentError::Gateway(
+                GatewayError::Revoked
+            )))
+        ));
+    }
+    let progress = flow.progress();
+    assert_eq!(progress.status, WorkflowStatus::Ready);
+    assert_eq!(progress.next_step, Some("infer"));
+}
+
+#[test]
+fn agent_workflow_backpressure_never_fakes_success() {
+    let mut fixture = Fixture::new(limits());
+    let mut flow = AgentWorkflow::start().unwrap();
+    flow.prepare(
+        &mut fixture.agent,
+        &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+        AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        &fixture.binding,
+        &fixture.registration.interaction,
+        &RetrievalQuery::new(""),
+    )
+    .unwrap();
+    let mut model = Probe {
+        outcome: Some(ModelOutcome::Text {
+            text: "x".repeat(2048),
+            presentation: vec![],
+        }),
+        ..Probe::default()
+    };
+    flow.infer(
+        &fixture.agent,
+        &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+        AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        &mut model,
+    )
+    .unwrap();
+    assert_eq!(model.calls, 1);
+    for size in [8192, 8192, 8192, 8192, 8192, 8192, 8192, 7000] {
+        fixture
+            .sessions
+            .append_related(
+                SessionAccess::new(&fixture.ingress, &fixture.request, 0),
+                &fixture.registration.interaction,
+                RelatedEvent::new(EventRole::ExternalAgent, "x".repeat(size)),
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        flow.finish(
+            &fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        ),
+        Err(AgentWorkflowError::Agent(AgentError::Gateway(
+            GatewayError::CapacityExceeded
+        )))
+    ));
+    assert_eq!(flow.progress().status, WorkflowStatus::Failed);
+    assert_eq!(model.calls, 1);
+    let snapshot = fixture.snapshot(0);
+    assert_eq!(snapshot.events.len(), 9);
+    assert_eq!(snapshot.events[0].terminal(), None);
+    assert!(matches!(
+        flow.finish(
+            &fixture.agent,
+            &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+            AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        ),
+        Err(AgentWorkflowError::Workflow(WorkflowError::RunStopped))
+    ));
+}
+
+#[test]
+fn agent_workflow_debug_redacts_private_state() {
+    let mut fixture = Fixture::new(limits());
+    fixture.working("synthetic-private-working", 1, 0);
+    let mut flow = AgentWorkflow::start().unwrap();
+    flow.prepare(
+        &mut fixture.agent,
+        &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0),
+        AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        &fixture.binding,
+        &fixture.registration.interaction,
+        &RetrievalQuery::new(""),
+    )
+    .unwrap();
+    flow.infer(
+        &fixture.agent,
+        &AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 1),
+        AgentServices::new(&mut fixture.sessions, &mut fixture.memory),
+        &mut Probe::default(),
+    )
+    .unwrap();
+    let debug = format!("{flow:?}");
+    assert_eq!(debug, "AgentWorkflow(REDACTED)");
+    for secret in [
+        USER,
+        PERSONA,
+        FACT,
+        "synthetic-private-working",
+        "desktop-token",
+    ] {
+        assert!(!debug.contains(secret), "debug leaked a synthetic sentinel");
+    }
+}
+
+#[test]
+fn agent_workflow_preserves_backend_errors_at_each_stage_without_retry() {
+    for stage in 0..3 {
+        let mut fixture = Fixture::new(limits());
+        let mut backend = FaultableMemory {
+            memory: std::mem::replace(&mut fixture.memory, MemoryService::new()),
+            faulted: false,
+        };
+        let mut flow = AgentWorkflow::start().unwrap();
+        let mut model = Probe::default();
+        let access = AgentAccess::new(&fixture.ingress, &fixture.request, &fixture.presets, 0);
+        if stage > 0 {
+            flow.prepare(
+                &mut fixture.agent,
+                &access,
+                AgentServices::new(&mut fixture.sessions, &mut backend),
+                &fixture.binding,
+                &fixture.registration.interaction,
+                &RetrievalQuery::new(""),
+            )
+            .unwrap();
+        }
+        if stage > 1 {
+            flow.infer(
+                &fixture.agent,
+                &access,
+                AgentServices::new(&mut fixture.sessions, &mut backend),
+                &mut model,
+            )
+            .unwrap();
+        }
+        backend.faulted = true;
+        let error = match stage {
+            0 => flow.prepare(
+                &mut fixture.agent,
+                &access,
+                AgentServices::new(&mut fixture.sessions, &mut backend),
+                &fixture.binding,
+                &fixture.registration.interaction,
+                &RetrievalQuery::new(""),
+            ),
+            1 => flow.infer(
+                &fixture.agent,
+                &access,
+                AgentServices::new(&mut fixture.sessions, &mut backend),
+                &mut model,
+            ),
+            _ => flow
+                .finish(
+                    &fixture.agent,
+                    &access,
+                    AgentServices::new(&mut fixture.sessions, &mut backend),
+                )
+                .map(|_| ()),
+        }
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentWorkflowError::Agent(AgentError::Memory(PersistenceError::RecoveryRequired))
+        ));
+        let agent_error = std::error::Error::source(&error).unwrap();
+        assert!(
+            agent_error
+                .downcast_ref::<AgentError<PersistenceError>>()
+                .is_some()
+        );
+        assert!(
+            agent_error
+                .source()
+                .unwrap()
+                .downcast_ref::<PersistenceError>()
+                .is_some()
+        );
+        let progress = flow.progress();
+        assert_eq!(progress.status, WorkflowStatus::Failed);
+        assert_eq!(progress.steps[stage].status, WorkflowStepStatus::Failed);
+        assert_eq!(progress.next_step, None);
+        backend.faulted = false;
+        assert!(matches!(
+            flow.infer(
+                &fixture.agent,
+                &access,
+                AgentServices::new(&mut fixture.sessions, &mut backend),
+                &mut model,
+            ),
+            Err(AgentWorkflowError::Workflow(WorkflowError::RunStopped))
+        ));
+        assert!(matches!(
+            flow.finish(
+                &fixture.agent,
+                &access,
+                AgentServices::new(&mut fixture.sessions, &mut backend),
+            ),
+            Err(AgentWorkflowError::Workflow(WorkflowError::RunStopped))
+        ));
+        assert_eq!(model.calls, usize::from(stage == 2));
+        let snapshot = fixture.snapshot(0);
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(snapshot.events[0].terminal(), None);
+    }
 }

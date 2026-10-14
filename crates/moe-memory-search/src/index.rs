@@ -10,8 +10,10 @@ use moe_memory_core::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ChunkConfig, EncodedQuery, RetrievalHost, SearchError, TextChunk, cache::FileCache,
-    split_chunks, vector::UnitVector,
+    ChunkConfig, EncodedQuery, RetrievalHost, SearchError, TextChunk,
+    cache::FileCache,
+    chunk::{ChunkView, chunk_views},
+    vector::UnitVector,
 };
 
 /// Trusted host binding, not a request-supplied tenant or a read capability.
@@ -85,15 +87,46 @@ impl IndexKey {
 }
 
 pub(crate) struct StoredVector {
-    pub(crate) input: RetrievalItem,
+    pub(crate) input: Arc<RetrievalItem>,
     pub(crate) vector: UnitVector,
 }
 
 pub(crate) struct IndexSlice {
     pub(crate) key: IndexKey,
     pub(crate) reference: CandidateRef,
-    pub(crate) input: RetrievalItem,
+    pub(crate) input: Arc<RetrievalItem>,
     pub(crate) chunk: TextChunk,
+}
+
+fn index_key(
+    domain: &StorageDomain,
+    profile: &EmbeddingProfile,
+    config: &ChunkConfig,
+    input: &RetrievalItem,
+    fingerprint: [u8; 32],
+    chunk: ChunkView<'_>,
+) -> Option<IndexKey> {
+    let RetrievalItem::LongTerm(record) = input else {
+        return None;
+    };
+    Some(IndexKey {
+        domain: domain.clone(),
+        scope: record.scope().clone(),
+        parent: record.version_ref(),
+        config: config.clone(),
+        ordinal: chunk.ordinal,
+        start: chunk.start_char,
+        end: chunk.end_char,
+        fingerprint,
+        profile: profile.clone(),
+    })
+}
+
+fn same_chunk(view: ChunkView<'_>, chunk: &TextChunk) -> bool {
+    view.ordinal == chunk.ordinal()
+        && view.start_char == chunk.start_char()
+        && view.end_char == chunk.end_char()
+        && view.text() == chunk.text()
 }
 
 /// Sealed by an index from current core-authorized inputs; not constructible from IDs.
@@ -121,11 +154,28 @@ impl IndexBatch {
             return Err(SearchError::InvalidInput("invalid index batch"));
         }
         for slice in &self.slices {
-            if ticket.candidate(&slice.reference) != Some(&slice.input) {
+            if ticket.candidate(&slice.reference) != Some(slice.input.as_ref()) {
                 return Err(SearchError::StaleIndexWork);
             }
-            let expected = split_chunks(slice.input.text(), &self.config)?;
-            if expected.get(slice.chunk.ordinal()) != Some(&slice.chunk) {
+            let fingerprint: [u8; 32] = Sha256::digest(slice.input.text().as_bytes()).into();
+            let mut expected_key = None;
+            for chunk in chunk_views(slice.input.text(), &self.config) {
+                let chunk = chunk?;
+                if chunk.ordinal == slice.chunk.ordinal() {
+                    if !same_chunk(chunk, &slice.chunk) {
+                        return Err(SearchError::StaleIndexWork);
+                    }
+                    expected_key = index_key(
+                        &self.domain,
+                        &self.profile,
+                        &self.config,
+                        slice.input.as_ref(),
+                        fingerprint,
+                        chunk,
+                    );
+                }
+            }
+            if expected_key.as_ref() != Some(&slice.key) {
                 return Err(SearchError::StaleIndexWork);
             }
         }
@@ -156,7 +206,7 @@ pub struct SearchIndex {
     pub(crate) profile: EmbeddingProfile,
     pub(crate) config: ChunkConfig,
     pub(crate) entries: BTreeMap<IndexKey, StoredVector>,
-    queue: BTreeMap<RecordKey, RetrievalItem>,
+    queue: BTreeMap<RecordKey, Arc<RetrievalItem>>,
     queue_capacity: usize,
     batch_limit: usize,
     pub(crate) vector_capacity: usize,
@@ -263,37 +313,40 @@ impl SearchIndex {
         Ok(())
     }
 
-    pub(crate) fn expected(
+    pub(crate) fn visit_expected<'ticket>(
         &self,
-        ticket: &CandidateTicket,
-    ) -> Result<Vec<IndexSlice>, SearchError> {
-        let mut slices = Vec::new();
+        ticket: &'ticket CandidateTicket,
+        mut visit: impl FnMut(
+            IndexKey,
+            CandidateRef,
+            &'ticket RetrievalItem,
+            ChunkView<'ticket>,
+        ) -> Result<bool, SearchError>,
+    ) -> Result<bool, SearchError> {
         for candidate in ticket.candidates() {
             let RetrievalItem::LongTerm(record) = candidate.item() else {
                 continue;
             };
             let fingerprint: [u8; 32] = Sha256::digest(record.text().as_bytes()).into();
-            for chunk in split_chunks(record.text(), &self.config)? {
-                let key = IndexKey {
-                    domain: self.domain.clone(),
-                    scope: record.scope().clone(),
-                    parent: record.version_ref(),
-                    config: self.config.clone(),
-                    ordinal: chunk.ordinal(),
-                    start: chunk.start_char(),
-                    end: chunk.end_char(),
+            let reference = candidate.candidate_ref();
+            for chunk in chunk_views(record.text(), &self.config) {
+                let chunk = chunk?;
+                let Some(key) = index_key(
+                    &self.domain,
+                    &self.profile,
+                    &self.config,
+                    candidate.item(),
                     fingerprint,
-                    profile: self.profile.clone(),
-                };
-                slices.push(IndexSlice {
-                    key,
-                    reference: candidate.candidate_ref(),
-                    input: candidate.item().clone(),
                     chunk,
-                });
+                ) else {
+                    continue;
+                };
+                if !visit(key, reference.clone(), candidate.item(), chunk)? {
+                    return Ok(false);
+                }
             }
         }
-        Ok(slices)
+        Ok(true)
     }
 
     fn covered_by_ticket(ticket: &CandidateTicket, input: &RetrievalItem) -> bool {
@@ -326,51 +379,68 @@ impl SearchIndex {
         ticket: &CandidateTicket,
     ) -> Result<IndexStatus, SearchError> {
         self.authorize(host, ticket)?;
-        let expected = self.expected(ticket)?;
-        let allowed: BTreeMap<_, _> = expected
-            .iter()
-            .map(|slice| (slice.key.clone(), &slice.input))
-            .collect();
-        self.entries.retain(|key, stored| {
-            !Self::covered_by_ticket(ticket, &stored.input)
-                || allowed
-                    .get(key)
-                    .is_some_and(|input| *input == &stored.input)
-        });
-        let records: BTreeMap<_, _> = expected
-            .iter()
-            .map(|slice| (slice.key.record_key(), &slice.input))
-            .collect();
-        self.queue.retain(|key, input| {
-            !Self::covered_by_ticket(ticket, input)
-                || records.get(key).is_some_and(|current| *current == input)
-        });
+        let mut records = BTreeMap::new();
+        let mut queue_inputs = BTreeMap::new();
+        let mut queue_order = Vec::new();
+        let mut matching_keys = BTreeSet::new();
         let mut missing = BTreeSet::new();
         let mut present = BTreeSet::new();
+        let mut missing_chunks = 0;
+        let mut queue_full = false;
         let mut status = IndexStatus {
             candidates: ticket.candidates().len(),
-            reasons: std::mem::take(&mut self.notices),
             ..IndexStatus::default()
         };
-        for slice in expected {
-            if self.entries.contains_key(&slice.key) {
-                present.insert(slice.key.record_key());
+        self.visit_expected(ticket, |key, _, input, _| {
+            let record = key.record_key();
+            records.entry(record.clone()).or_insert(input);
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|stored| stored.input.as_ref() == input)
+            {
+                matching_keys.insert(key);
+                present.insert(record);
+            } else {
+                missing_chunks += 1;
+                if missing.insert(record.clone()) {
+                    queue_order.push(record.clone());
+                    queue_inputs.insert(record, input);
+                }
+            }
+            Ok(true)
+        })?;
+        self.entries.retain(|key, stored| {
+            !Self::covered_by_ticket(ticket, stored.input.as_ref()) || matching_keys.contains(key)
+        });
+        self.queue.retain(|key, input| {
+            !Self::covered_by_ticket(ticket, input.as_ref())
+                || records
+                    .get(key)
+                    .is_some_and(|current| *current == input.as_ref())
+        });
+        status.reasons = std::mem::take(&mut self.notices);
+        for record in queue_order {
+            if self.queue.contains_key(&record) {
                 continue;
             }
-            status.missing_chunks += 1;
-            let record = slice.key.record_key();
-            missing.insert(record.clone());
-            if self.queue.contains_key(&record) || self.queue.len() < self.queue_capacity {
-                self.queue.insert(record, slice.input);
-            } else if !status.reasons.contains(&SearchReason::QueueFull) {
-                status.reasons.push(SearchReason::QueueFull);
+            if self.queue.len() < self.queue_capacity {
+                if let Some(input) = queue_inputs.get(&record) {
+                    self.queue.insert(record, Arc::new((**input).clone()));
+                }
+            } else {
+                queue_full = true;
             }
         }
+        status.missing_chunks = missing_chunks;
         status.indexed_records = present.len();
         status.queued_records = missing
             .iter()
             .filter(|key| self.queue.contains_key(*key))
             .count();
+        if queue_full {
+            status.reasons.push(SearchReason::QueueFull);
+        }
         if status.missing_chunks > 0 {
             status.reasons.push(SearchReason::PartialIndex);
         }
@@ -387,15 +457,26 @@ impl SearchIndex {
         if self.in_flight.upgrade().is_some() {
             return Err(SearchError::InvalidInput("index batch already in flight"));
         }
-        let slices: Vec<_> = self
-            .expected(ticket)?
-            .into_iter()
-            .filter(|slice| {
-                self.queue.get(&slice.key.record_key()) == Some(&slice.input)
-                    && !self.entries.contains_key(&slice.key)
-            })
-            .take(self.batch_limit)
-            .collect();
+        let mut slices = Vec::with_capacity(self.batch_limit);
+        self.visit_expected(ticket, |key, reference, input, chunk| {
+            let record = key.record_key();
+            let Some(queued) = self
+                .queue
+                .get(&record)
+                .filter(|queued| queued.as_ref() == input)
+            else {
+                return Ok(true);
+            };
+            if !self.entries.contains_key(&key) {
+                slices.push(IndexSlice {
+                    key,
+                    reference,
+                    input: Arc::clone(queued),
+                    chunk: chunk.to_owned(),
+                });
+            }
+            Ok(slices.len() < self.batch_limit)
+        })?;
         if slices.is_empty() {
             return Ok(None);
         }
@@ -437,6 +518,14 @@ impl SearchIndex {
         if added > self.vector_capacity.saturating_sub(self.entries.len()) {
             return Err(SearchError::InvalidInput("index vector capacity exceeded"));
         }
+        let batch_keys: BTreeSet<_> = batch.slices.iter().map(|slice| slice.key.clone()).collect();
+        let mut remaining = BTreeSet::new();
+        self.visit_expected(ticket, |key, _, _, _| {
+            if !self.entries.contains_key(&key) && !batch_keys.contains(&key) {
+                remaining.insert(key.record_key());
+            }
+            Ok(true)
+        })?;
         for (slice, vector) in batch.slices.into_iter().zip(completed.vectors) {
             self.entries.insert(
                 slice.key,
@@ -446,14 +535,8 @@ impl SearchIndex {
                 },
             );
         }
-        let remaining: BTreeSet<_> = self
-            .expected(ticket)?
-            .into_iter()
-            .filter(|slice| !self.entries.contains_key(&slice.key))
-            .map(|slice| slice.key.record_key())
-            .collect();
         self.queue.retain(|key, input| {
-            !Self::covered_by_ticket(ticket, input) || remaining.contains(key)
+            !Self::covered_by_ticket(ticket, input.as_ref()) || remaining.contains(key)
         });
         Ok(())
     }
@@ -471,21 +554,22 @@ impl SearchIndex {
             return Err(SearchError::ProfileMismatch);
         }
         let mut records: BTreeMap<CandidateRef, f64> = BTreeMap::new();
-        for slice in self.expected(ticket)? {
+        self.visit_expected(ticket, |key, reference, input, _| {
             if let Some(stored) = self
                 .entries
-                .get(&slice.key)
-                .filter(|stored| stored.input == slice.input)
+                .get(&key)
+                .filter(|stored| stored.input.as_ref() == input)
             {
                 let score = query.vector.cosine(&stored.vector);
                 if score >= minimum {
                     records
-                        .entry(slice.reference)
+                        .entry(reference)
                         .and_modify(|current| *current = current.max(score))
                         .or_insert(score);
                 }
             }
-        }
+            Ok(true)
+        })?;
         let mut ranked: Vec<_> = records.into_iter().collect();
         ranked.sort_by(|left, right| {
             right
@@ -502,42 +586,51 @@ impl SearchIndex {
         entries: &[CandidateRef],
         query: Option<&EncodedQuery>,
     ) -> Result<Vec<String>, SearchError> {
-        let slices = self.expected(ticket)?;
+        self.visit_expected(ticket, |_, _, _, _| Ok(true))?;
         entries
             .iter()
             .map(|reference| {
                 let item = ticket
                     .candidate(reference)
                     .ok_or(SearchError::InvalidInput("foreign rerank reference"))?;
+                let fingerprint: [u8; 32] = Sha256::digest(item.text().as_bytes()).into();
+                let working_context = matches!(item, RetrievalItem::WorkingContext(_));
                 let mut best = None;
-                for slice in slices.iter().filter(|slice| &slice.reference == reference) {
-                    let semantic = query
-                        .and_then(|query| {
-                            self.entries
-                                .get(&slice.key)
-                                .map(|stored| query.vector.cosine(&stored.vector))
-                        })
-                        .unwrap_or(-1.0);
-                    let exact = !ticket.query().text().is_empty()
-                        && slice.chunk.text().contains(ticket.query().text());
+                for chunk in chunk_views(item.text(), &self.config) {
+                    let chunk = chunk?;
+                    let semantic = match index_key(
+                        &self.domain,
+                        &self.profile,
+                        &self.config,
+                        item,
+                        fingerprint,
+                        chunk,
+                    )
+                    .and_then(|key| self.entries.get(&key))
+                    .filter(|stored| stored.input.as_ref() == item)
+                    {
+                        Some(stored) => query
+                            .map(|query| query.vector.cosine(&stored.vector))
+                            .unwrap_or(-1.0),
+                        None => -1.0,
+                    };
+                    let exact = matches!(item, RetrievalItem::LongTerm(_))
+                        && !ticket.query().text().is_empty()
+                        && chunk.text().contains(ticket.query().text());
                     let score = (
                         exact,
-                        crate::lexical::matching_terms(ticket.query().text(), slice.chunk.text()),
+                        crate::lexical::matching_terms(ticket.query().text(), chunk.text()),
                         semantic,
                     );
-                    if best.as_ref().is_none_or(|(current, _)| score > *current) {
-                        best = Some((score, slice.chunk.text().to_owned()));
+                    if best.as_ref().is_none_or(|(current, _)| {
+                        score > *current || (working_context && score == *current)
+                    }) {
+                        best = Some((score, chunk.text().to_owned()));
                     }
                 }
                 match best {
                     Some((_, text)) => Ok(text),
-                    None => split_chunks(item.text(), &self.config)?
-                        .into_iter()
-                        .max_by_key(|chunk| {
-                            crate::lexical::matching_terms(ticket.query().text(), chunk.text())
-                        })
-                        .map(|chunk| chunk.text().to_owned())
-                        .ok_or(SearchError::InputTooLong),
+                    None => Err(SearchError::InputTooLong),
                 }
             })
             .collect()
@@ -562,7 +655,7 @@ mod queue_regressions {
         RetrievalLayer, RetrievalPlan, RetrievalQuery, SessionId,
     };
 
-    use super::{CompletedIndexBatch, SearchIndex, StorageDomain};
+    use super::{CompletedIndexBatch, SearchError, SearchIndex, StorageDomain};
     use crate::{ChunkConfig, SearchHost, vector::UnitVector};
 
     struct Host(MemoryService);
@@ -695,6 +788,12 @@ mod queue_regressions {
             let batch = index.take_batch(&mut host, current).unwrap().unwrap();
             assert_eq!(batch.len(), 1);
             assert!(index.queue == before);
+            let batch_key = batch.slices[0].key.clone();
+            let batch_input = std::sync::Arc::clone(&batch.slices[0].input);
+            assert!(std::sync::Arc::ptr_eq(
+                index.queue.get(&batch_key.record_key()).unwrap(),
+                &batch_input
+            ));
             let mut expected = before;
             assert!(
                 expected.remove(&batch.slices[0].key.record_key())
@@ -710,6 +809,10 @@ mod queue_regressions {
                     },
                 )
                 .unwrap();
+            assert!(std::sync::Arc::ptr_eq(
+                &index.entries.get(&batch_key).unwrap().input,
+                &batch_input
+            ));
             assert!(index.queue == expected);
             index.reconcile(&mut host, &working).unwrap();
             assert!(index.queue == expected);
@@ -726,5 +829,72 @@ mod queue_regressions {
             index.reconcile(&mut host, &current).unwrap();
             assert!(index.queue == remaining);
         }
+    }
+
+    #[test]
+    fn invalid_late_candidate_keeps_a_full_queue_unchanged() {
+        let namespace = Namespace::new("queue-atomicity", "user").unwrap();
+        let owner = PetIdentity::new(namespace, "alice").unwrap();
+        let mut host = Host(MemoryService::new());
+        let source = host
+            .0
+            .register_source(
+                MemoryScope::Private(owner.clone()),
+                "synthetic",
+                1,
+                Epistemic::UserStatement,
+            )
+            .unwrap();
+        host.0
+            .for_pet(&owner)
+            .create(
+                MemoryDraft::new(
+                    "short",
+                    Category::Episode,
+                    Epistemic::UserStatement,
+                    vec![source.clone()],
+                ),
+                100,
+            )
+            .unwrap();
+        host.0
+            .set_read_policy(&owner, ReadPolicy::offline(1, vec![source.clone()]))
+            .unwrap();
+        let profile = EmbeddingProfile::new("fixture", "atomicity-model", 2).unwrap();
+        let mut index = SearchIndex::new(
+            StorageDomain::new("atomicity-root").unwrap(),
+            profile.clone(),
+            ChunkConfig::new(1, 2048, 2047, 16384).unwrap(),
+            1,
+            1,
+            1,
+        )
+        .unwrap();
+        let valid = ticket(&mut host, &owner, &profile, RetrievalLayer::LongTerm);
+        assert_eq!(
+            index.reconcile(&mut host, &valid).unwrap().queued_records,
+            1
+        );
+        let queued = index.queue.clone();
+
+        host.0
+            .for_pet(&owner)
+            .create(
+                MemoryDraft::new(
+                    "中".repeat(4096),
+                    Category::Episode,
+                    Epistemic::UserStatement,
+                    vec![source],
+                ),
+                100,
+            )
+            .unwrap();
+        let expanded = ticket(&mut host, &owner, &profile, RetrievalLayer::LongTerm);
+        assert_eq!(expanded.candidates().len(), 2);
+        assert!(matches!(
+            index.reconcile(&mut host, &expanded),
+            Err(SearchError::InputTooLong)
+        ));
+        assert!(index.queue == queued);
     }
 }

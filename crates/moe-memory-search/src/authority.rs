@@ -9,7 +9,7 @@
 use moe_memory_core::{
     CandidateRef, CandidateTicket, MemoryService, TransmissionTicket, TransmissionUsage,
 };
-use moe_memory_local::{LocalMemory, OperationId};
+use moe_memory_local::LocalMemory;
 
 use crate::{SearchError, SearchHost};
 
@@ -53,8 +53,11 @@ pub trait SearchAuthority {
         now_ms: u64,
     ) -> Result<(), SearchError>;
 
-    /// Cancels all in-flight tasks at the authority's current generation in one
-    /// checked step (the `cancel_tasks` fence plus generation read).
+    /// Cancels all in-flight tasks at the authority's current generation in
+    /// one checked step. The in-memory service cancels by generation read
+    /// plus the `cancel_tasks` fence; the persistent facade picks an
+    /// unoccupied operation ID from its own idempotency ledger, so internal
+    /// cancels never collide with legitimate business IDs.
     fn cancel_current_tasks(&mut self) -> Result<(), SearchError>;
 }
 
@@ -190,9 +193,7 @@ impl SearchAuthority for LocalMemory {
     }
 
     fn cancel_current_tasks(&mut self) -> Result<(), SearchError> {
-        let generation = LocalMemory::generation(self)?;
-        let operation = OperationId::new(format!("moe-memory-search-cancel-{generation}"))?;
-        LocalMemory::cancel_tasks(self, operation, generation)?;
+        LocalMemory::cancel_current_tasks(self)?;
         Ok(())
     }
 }

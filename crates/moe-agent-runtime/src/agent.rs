@@ -121,7 +121,7 @@ impl<'a> AgentAccess<'a> {
         }
     }
 
-    fn session(&self) -> SessionAccess<'_> {
+    pub(crate) fn session(&self) -> SessionAccess<'_> {
         SessionAccess::new(self.ingress, self.request, self.now_ms)
     }
 }

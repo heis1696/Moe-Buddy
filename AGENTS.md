@@ -16,9 +16,10 @@ Moe Buddy 是以独立陪伴 Agent 为目标的 Rust Cargo workspace，围绕稳
 | `crates/moe-memory-core` | 纯记忆契约、授权、治理、检索收口与上下文规则。 |
 | `crates/moe-memory-local` | 记忆持久化门面、日志与恢复适配。 |
 | `crates/moe-memory-search` | 记忆系统内的索引、混合召回及 Embedding/rerank 适配。 |
-| `crates/moe-agent-runtime` | API 预设、可信入口、会话暂存/回收、离线 Agent、程序流程执行与纯内存诊断日志。 |
+| `crates/moe-agent-runtime` | API 预设、可信入口、会话暂存/回收、离线 Agent、程序流程执行、动画编排与纯内存诊断日志。 |
 | `crates/moe-raw-local` | 会话原文文件、快照与恢复适配。 |
 | `crates/moe-cli-hooks` | 固定 CLI Hooks 协议的输入输出适配。 |
+| `crates/moe-ui-core` | 纯 UI 管理、类型化控制器/视图组合、逻辑面板生命周期与有界驱动；不选择 GUI 或接管业务权限。 |
 
 ## 诊断日志接入
 
