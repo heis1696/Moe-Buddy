@@ -299,6 +299,45 @@ impl AgentRuntime {
         interaction: &InteractionId,
         query: &RetrievalQuery,
     ) -> Result<AgentTask, AgentError<M::Error>> {
+        self.prepare_for(
+            access,
+            services,
+            binding,
+            interaction,
+            query,
+            ReadPurpose::OfflineReasoning,
+        )
+    }
+
+    /// Prepare model input only after explicit trusted consent for the current preset.
+    /// Memory sources additionally require `ReadPolicy::model_transmission`.
+    pub fn prepare_external<M: MemoryContextAccess + ?Sized>(
+        &mut self,
+        access: &AgentAccess<'_>,
+        services: AgentServices<'_, M>,
+        binding: &AgentBinding,
+        interaction: &InteractionId,
+        query: &RetrievalQuery,
+    ) -> Result<AgentTask, AgentError<M::Error>> {
+        self.prepare_for(
+            access,
+            services,
+            binding,
+            interaction,
+            query,
+            ReadPurpose::ModelTransmission,
+        )
+    }
+
+    fn prepare_for<M: MemoryContextAccess + ?Sized>(
+        &mut self,
+        access: &AgentAccess<'_>,
+        services: AgentServices<'_, M>,
+        binding: &AgentBinding,
+        interaction: &InteractionId,
+        query: &RetrievalQuery,
+        purpose: ReadPurpose,
+    ) -> Result<AgentTask, AgentError<M::Error>> {
         let grant = self.binding(access, binding)?;
         if self.issued.contains(interaction) {
             return Err(AgentError::TaskAlreadyIssued);
@@ -318,7 +357,7 @@ impl AgentRuntime {
             .begin_memory_task(
                 access.request.identity(),
                 binding.memory_session(),
-                ReadPurpose::OfflineReasoning,
+                purpose,
                 query,
                 access.now_ms,
             )
@@ -363,6 +402,7 @@ impl AgentRuntime {
             context,
             conversation,
             phase: Phase::Prepared,
+            external: purpose == ReadPurpose::ModelTransmission,
             last_now_ms: access.now_ms,
         };
         self.issued.push(interaction.clone());
@@ -407,7 +447,7 @@ impl AgentRuntime {
         model: &mut dyn OfflineModel,
     ) -> Result<AgentResult, AgentError<M::Error>> {
         self.validate(access, &mut services, task)?;
-        if task.phase != Phase::Prepared {
+        if task.phase != Phase::Prepared || task.external {
             return Err(AgentError::InvalidTaskState);
         }
         let context = services
@@ -428,6 +468,76 @@ impl AgentRuntime {
             preset_id: &task.preset_id,
             preset_version: task.preset_version,
         });
+        let outcome = match outcome {
+            ModelOutcome::Text {
+                ref text,
+                ref presentation,
+            } if validation::text(text, self.limits.reply_chars).is_err()
+                || presentation.len() > MAX_PRESENTATION_EVENTS =>
+            {
+                ModelOutcome::Failed(ModelFailure::InvalidOutput)
+            }
+            other => other,
+        };
+        task.phase = Phase::Inferred;
+        task.last_now_ms = access.now_ms;
+        Ok(AgentResult {
+            owner: task.result_owner.clone(),
+            outcome,
+        })
+    }
+
+    /// Revalidate the exact context, preset, session and source revisions at dispatch.
+    /// The host must send immediately to this endpoint, without redirects or retries.
+    /// Returned plaintext cannot be recalled; cancellation prevents accepting late output.
+    pub fn dispatch_external<M: MemoryContextAccess + ?Sized>(
+        &self,
+        access: &AgentAccess<'_>,
+        mut services: AgentServices<'_, M>,
+        task: &mut AgentTask,
+    ) -> Result<ExternalInput, AgentError<M::Error>> {
+        self.validate(access, &mut services, task)?;
+        if task.phase != Phase::Prepared || !task.external {
+            return Err(AgentError::InvalidTaskState);
+        }
+        let context = services
+            .memory
+            .context_view(&task.context, access.now_ms)
+            .map_err(AgentError::Memory)?;
+        let preset = access.presets.resolve(PresetPurpose::Chat)?;
+        let input = ExternalInput {
+            endpoint: preset.config().endpoint().to_owned(),
+            model: preset.config().default_model().to_owned(),
+            persona: context
+                .identity()
+                .ok_or(AgentError::PersonaUnavailable)?
+                .text()
+                .to_owned(),
+            memory: context
+                .blocks()
+                .iter()
+                .map(|block| block.text().to_owned())
+                .collect(),
+            conversation: task.conversation.events.clone(),
+        };
+        task.phase = Phase::Dispatched;
+        task.last_now_ms = access.now_ms;
+        Ok(input)
+    }
+
+    /// Accept one host transport result. This grants no authority to model proposals.
+    /// Revocation/version/cancellation checks run again before the normal `finish` path.
+    pub fn complete_external<M: MemoryContextAccess + ?Sized>(
+        &self,
+        access: &AgentAccess<'_>,
+        mut services: AgentServices<'_, M>,
+        task: &mut AgentTask,
+        outcome: ModelOutcome,
+    ) -> Result<AgentResult, AgentError<M::Error>> {
+        self.validate(access, &mut services, task)?;
+        if task.phase != Phase::Dispatched || !task.external {
+            return Err(AgentError::InvalidTaskState);
+        }
         let outcome = match outcome {
             ModelOutcome::Text {
                 ref text,
@@ -493,6 +603,7 @@ impl AgentRuntime {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Prepared,
+    Dispatched,
     Inferred,
     Finished,
 }
@@ -510,6 +621,7 @@ pub struct AgentTask {
     context: RequestContext,
     conversation: SessionSnapshot,
     phase: Phase,
+    external: bool,
     last_now_ms: u64,
 }
 
@@ -664,6 +776,38 @@ impl fmt::Debug for AgentDelivery {
             .field("state", &self.receipt.state)
             .field("failure", &self.failure)
             .finish_non_exhaustive()
+    }
+}
+
+/// Immutable plaintext for a trusted host transport. No credentials or executable tools.
+/// Do not log or persist this request; the source context remains runtime-owned.
+pub struct ExternalInput {
+    endpoint: String,
+    model: String,
+    persona: String,
+    memory: Vec<String>,
+    conversation: Vec<StagedEvent>,
+}
+impl ExternalInput {
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+    pub fn persona(&self) -> &str {
+        &self.persona
+    }
+    pub fn memory(&self) -> &[String] {
+        &self.memory
+    }
+    pub fn conversation(&self) -> &[StagedEvent] {
+        &self.conversation
+    }
+}
+impl fmt::Debug for ExternalInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ExternalInput(REDACTED)")
     }
 }
 

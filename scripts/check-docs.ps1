@@ -5,6 +5,7 @@ $files = @(
     Get-Item -LiteralPath (Join-Path $root 'AGENTS.md'), (Join-Path $root 'README.md')
     Get-ChildItem -LiteralPath (Join-Path $root 'docs') -File -Filter '*.md'
     Get-ChildItem -LiteralPath (Join-Path $root 'crates') -Recurse -File -Filter 'README.md'
+    Get-ChildItem -LiteralPath (Join-Path $root 'apps') -Recurse -File -Filter 'README.md'
 )
 $issues = [System.Collections.Generic.List[string]]::new()
 foreach ($file in $files) {
@@ -46,7 +47,7 @@ foreach ($file in $files) {
             if ([uri]::UnescapeDataString($parts[1]) -notin $headings) { $issues.Add("$($file.Name): missing anchor $target") }
         }
     }
-    foreach ($reference in [regex]::Matches($text, '`(?<path>(?:crates/|docs/)[^`\s]+)`')) {
+    foreach ($reference in [regex]::Matches($text, '`(?<path>(?:crates/|apps/|docs/)[^`\s]+)`')) {
         $relative = $reference.Groups['path'].Value -replace ':\d+(?::\d+)?$', ''
         if (-not (Test-Path -LiteralPath (Join-Path $root $relative))) { $issues.Add("$($file.Name): missing repo path $relative") }
     }

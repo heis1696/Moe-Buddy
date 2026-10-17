@@ -307,6 +307,14 @@ impl LocalMemory {
         Err(PersistenceError::CapacityExceeded)
     }
 
+    /// Explicitly named bridge for adapters whose authority trait also exposes a
+    /// `cancel_current_tasks` method. Keeping the names distinct at the adapter
+    /// boundary prevents Rust method resolution from selecting the trait method
+    /// recursively instead of this persistence operation.
+    pub fn cancel_current_tasks_receipt(&mut self) -> Result<Committed<u64>, PersistenceError> {
+        self.cancel_current_tasks()
+    }
+
     pub fn revoke_source(
         &mut self,
         operation_id: OperationId,

@@ -14,8 +14,8 @@ mod workflow;
 
 pub use agent::{
     AgentAccess, AgentBinding, AgentDelivery, AgentError, AgentLimits, AgentResult, AgentRuntime,
-    AgentServices, AgentTask, ModelFailure, ModelOutcome, OfflineInput, OfflineModel,
-    PresentationEvent,
+    AgentServices, AgentTask, ExternalInput, ModelFailure, ModelOutcome, OfflineInput,
+    OfflineModel, PresentationEvent,
 };
 pub use agent_workflow::{AgentWorkflow, AgentWorkflowError};
 pub use diagnostics::{

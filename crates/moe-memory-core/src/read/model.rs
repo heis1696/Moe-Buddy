@@ -33,6 +33,7 @@ pub enum ReadPurpose {
 pub struct ReadPolicy {
     pub(super) version: u64,
     pub(super) offline: bool,
+    pub(super) model_transmission: bool,
     pub(super) sources: BTreeSet<SourceRef>,
 }
 
@@ -41,6 +42,7 @@ impl ReadPolicy {
         Self {
             version,
             offline: false,
+            model_transmission: false,
             sources: BTreeSet::new(),
         }
     }
@@ -49,6 +51,18 @@ impl ReadPolicy {
         Self {
             version,
             offline: true,
+            model_transmission: false,
+            sources: sources.into_iter().collect(),
+        }
+    }
+
+    /// Explicitly permit model input from precisely these sources as well as offline reads.
+    /// The trusted caller must separately bind a destination and user/conversation consent.
+    pub fn model_transmission(version: u64, sources: Vec<SourceRef>) -> Self {
+        Self {
+            version,
+            offline: true,
+            model_transmission: true,
             sources: sources.into_iter().collect(),
         }
     }

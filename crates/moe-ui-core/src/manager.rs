@@ -401,6 +401,9 @@ impl<Context: 'static> UiManager<Context> {
         let key = PanelKey::new(kind, scope);
         let existing = {
             let registration = erased_registration(&mut self.registrations, entry.registration)?;
+            if let Some(record) = registration.find_pending_by_key(&key) {
+                return Err(UiError::PendingReleaseForKey { key, record });
+            }
             registration.find_by_key(&key)
         };
         if let Some(serial) = existing {

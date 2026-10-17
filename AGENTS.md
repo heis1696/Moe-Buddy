@@ -20,6 +20,8 @@ Moe Buddy 是以独立陪伴 Agent 为目标的 Rust Cargo workspace，围绕稳
 | `crates/moe-raw-local` | 会话原文文件、快照与恢复适配。 |
 | `crates/moe-cli-hooks` | 固定 CLI Hooks 协议的输入输出适配。 |
 | `crates/moe-ui-core` | 纯 UI 管理、类型化控制器/视图组合、逻辑面板生命周期与有界驱动；不选择 GUI 或接管业务权限。 |
+| `crates/moe-chat-app` | 单伙伴文字聊天的纯受信应用组合；复用记忆、预设、Agent 流程、诊断和 UI 管理，独立于传输与渲染。 |
+| `apps/moe-chat-host` | 仅回环的 HTTP 与浏览器展示适配；负责 I/O、时间、随机代际和会话安全，不接管业务规则。 |
 
 ## 诊断日志接入
 

@@ -193,7 +193,7 @@ impl SearchAuthority for LocalMemory {
     }
 
     fn cancel_current_tasks(&mut self) -> Result<(), SearchError> {
-        LocalMemory::cancel_current_tasks(self)?;
+        LocalMemory::cancel_current_tasks_receipt(self)?;
         Ok(())
     }
 }

@@ -1,14 +1,204 @@
 # 审核与验收
 
+## 桌面视觉与布局重做（2026-10-17）
+
+用户要求推翻旧界面，并明确改由领队直接实现。本轮重做限于 `apps/moe-buddy-desktop` 的表现层与相关交互；保留 Windows 原生宿主和既有业务门面，没有新增依赖、素材下载、外传或存档策略，也没有提交、推送或创建分支。
+
+- 新界面：纸白/苔绿主题、带图形和中文标签的 88px 左导航、伙伴标题与真实模式标记、居中限宽聊天、整合编辑/提示/发送的输入卡、按需展开的右侧管理抽屉。空态、消息角色对齐、表单、列表、焦点/禁用状态及错误排版统一调整；运行记录将事件与状态分两行显示，保留原始事件语义。
+- 交互修复：增加真实原生“聊天”导航，收起抽屉后回到输入框，保留聊天和记忆草稿；空列表隐藏覆盖提示的原生列表控件，有内容后恢复可选列表。高度变化按旧视口判断是否贴底，避免缩放或通知条导致阅读跳动；表单紧凑布局保留发送许可、应用按钮与保存说明。自绘按钮不再在持有状态借用时向子控件查询文本，新增控件/字体/画刷纳入撤权、Tab、DPI 重建与资源释放。
+- 定向回归：桌面 51 项通过、1 项历史手动探针忽略。新增或扩展导航/草稿/焦点、空列表遮挡、真实窗口仅改高度后的滚动、96/120/144/192 DPI 的导航/输入卡/通知/模型表单边界与新标题字体检查；既有 IME 策略、记忆增改删、预设切换、未知禁发、撤权及同步重入/销毁回归继续通过。
+- 实际窗口：仅给测试子进程设置隔离 `LOCALAPPDATA`，启动当前原生可执行文件，完成合成消息发送、保存记忆、三个管理入口切换、返回聊天、最小窗口与模型表单拒绝空输入。10 张 120 DPI 截图位于 `target/ui-redesign-screenshots/`，包括空态、空记忆、有消息、记忆、模型、运行、三个最小窗口场景和明确错误；已目视检查。探针在 `target/ui-redesign-final-probe.ps1`，最终数据在 `target/ui-redesign-profile-release/`，窗口正常关闭，未读取真实日用档案或调用外部模型。
+- 缩放边界：正式回归覆盖 100%/125%/150%/200% 的几何与字体；另在 `target/` 下的源码副本运行注入 DPI 绘制探针。192 DPI 窗口超出本机工作区，其截图不计完整窗口像素验收；本轮未更改系统缩放、验证真实跨屏拖动或解决小于最小客户区的屏幕适配。完整实窗截图验收以本机 125% 为准。
+- 最终全链门通过：fmt、workspace Clippy（`-D warnings`）、workspace test/build、严格 Rustdoc（`RUSTDOCFLAGS=-D warnings`），Cargo 使用 `--locked --offline`；文档编码/路径/锚点检查与 diff check 通过，另对未跟踪桌面文件检查 UTF-8 和尾随空白。日志集中于 `target/ui-redesign-gates/`。现行计划与桌面 README 已同步视觉、尺寸和入口。日用接线的三步已执行且没有明确第四阶段，本次重做不启动会话轮转、动画或其他暂停阶段；既有持续日用阻塞仍见下节。
+
+## 日用初版第三步：实用性验收结论（2026-10-17）
+
+结论：阶段 3 的回环原生窗口验收已执行并修复本轮发现的问题；**持续日用验收不通过**，当前仅适合受控短会话试用。未提供真实服务端点／凭据，因此没有真实模型服务验收。领队亲自执行与修改，未派单、未使用子代理、未 commit/push/创建分支，保留既有源码与未跟踪目录。
+
+- 完整链：独立进程启动原生窗口，在模型表单首次配置并应用，发送经真实应用业务链、后台 HTTP 和实际回执显示回复；记忆列表选中后将 `tea` 编辑为 `coffee`，下一轮 HTTP 输入仅含新版本；关闭并重新启动，聊天只读恢复，模型／人设恢复，Key 为空、许可未选中；重新授权后的请求召回持久化记忆，不包含旧进程聊天正文。
+- 异常链：真实 HTTP 401 明确认证失败；8 秒延迟期间可展开记忆抽屉并操作搜索／刷新；服务等待 65 秒触发客户端实际 60 秒超时，未知禁发且重启后仍禁发；坏 JSON 同样隔离，发送动作及重启均未引发重复请求。通过真实 `MessageBoxW` 撤权确认后，8 秒迟到回复未进入 UI，面板和输入禁用。没有把这项单次确认框验证泛化为全部模态交互覆盖。
+- 文件失败：在独立存档制造 `settings.pending` 目录，应用设置显示“设置未保存”，不冒称落盘；重启出现保留现场的读取失败消息框，不创建空档替代。运行期配置已生效与磁盘保存失败是不同状态；测试没有删除失败现场。启动失败消息框的自动确认未使进程及时退出，最后终止了该测试进程，不计为正常关闭验收。
+- 修复①：HTTP 成功但 JSON 无正文、空白正文或超长正文，原先被判为可重试失败；现在均为未知，避免把服务可能已执行的请求当作可安全重试。新增 `successful_http_without_usable_text_is_unknown` 回环回归。
+- 修复②：异步认证失败曾清空原草稿；控制器在请求等待期间保留草稿，明确失败时恢复，期间编辑过的新草稿不被覆盖，撤权清除保留副本。`external_model` 覆盖恢复与新草稿保护，原生 `asynchronous_auth_failure_restores_input_and_error_severity` 验证控件实际回填。
+- 修复③：后台失败和未知提示原先一律使用普通信息严重度；现在使用应用状态映射的 Error／Warn，保留文字和状态形状。修复后的原生截图再次确认认证错误红色提示及输入恢复、未知警告与禁发。
+
+证据均在忽略目录：`target/daily-stage3-probe.ps1`、`daily-stage3-errors.ps1`、`daily-stage3-revoke.ps1`、`daily-stage3-save-failure.ps1`、`daily-stage3-final.ps1`；可控回环服务 `daily-stage3-server.py`；`target/daily-stage3/requests.jsonl` 和 `daily-stage3-audit.py` 校验实际 HTTP 内容、请求次数及应用存档不含合成 Key。仅使用 `target/daily-stage3-*` 隔离 LOCALAPPDATA，没有读取真实用户存档或凭据。第一轮探针漏发列表选中通知而新增两条笔记，已修正探针并以新 profile-b 完整重跑；新一轮只保留修改后的单条笔记。截图位于 `target/daily-stage3-screenshots/`，03/04 为编辑和召回、05/06 为重启恢复、08 为等待中操作、11/14 为未知恢复、13 为真实超时、15 为撤权、17 为读取失败、18/19 为修复后状态；后续截图采用 PrintWindow 避免其他窗口遮挡，均未把截图当成请求内容证明。
+
+针对性回归及主工作区 fmt、workspace Clippy（`-D warnings`）、test/build、严格 Rustdoc 已通过，日志 `target/daily-stage3-gates/`；文档检查及 diff check 随本节更新执行。不沿用历史测试总数。
+
+阻塞与限制评估：
+
+1. 未知／中断记录恢复后持续禁发，没有保留旧请求终态并显式另开会话的入口。一次超时即可阻断后续使用，属持续日用阻塞；不得指导用户删档规避。建议另行明确会话切换／归档与未知保留语义后补入口，而非把 Unknown 改回 Ready。
+2. 外部请求每轮仍保守累计 4096 字回复预留，应用总额 65536 字，短输入约 15 轮即可能耗尽；运行／原文另有累计硬容量，无轮转。该设计是有界试用，不是全天陪伴；不能仅提升常量冒充解决。
+3. 恢复原文可读但不自动进入新会话，持续记忆仍可召回。对隐私边界合理，但用户不能期待重启后无缝接续上下文。新网络请求缺完整诊断 run 事件，当前故障定位依赖聊天状态与宿主提示。
+4. 真实模型兼容性／输出质量、真实 IME、多屏连续拖动及长期 GDI 尚未验；外部渠道、生产 Hooks、工具执行、动画素材未启动。计划只有三个步骤，没有已明确的后续阶段，本轮不再接力同阶段或自动开启暂停项。
+
+## 日用初版第二步：模型后台请求与本地恢复（2026-10-17）
+
+领队亲自实现原生模型表单与后台 Chat Completions 接线，未派单、未创建分支或提交。新增显式模型读取政策及 `prepare_external/dispatch_external/complete_external` 边界，未借用 `OfflineModel` 联网。应用继续单线程组合，宿主线程只处理不可变请求与单结果通道。设置不保存 Key 或发送许可；私密记忆与原文分别复用 LocalMemory 和 RawLocalStore，数据根／30 天正常期与 7 天回收期在 UI 和 README 可见。
+
+定向证据：`crates/moe-chat-app/tests/external_model.rs` 覆盖默认拒绝、单次请求交出、实际结果提交、未知阻止重发、撤权及记忆修订拒绝迟到回复；桌面 `transport` 回环测试校验真实 HTTP 头和 JSON、成功文本、401 及不可解析响应；`storage` 冷开回归覆盖日志笔记修改、聊天恢复、重新授权召回和未结请求恢复后不重发。原文层会将未结交互恢复为取消，应用因此保守隔离恢复的取消／未知，不把恢复当作可继续执行。
+
+主工作区 fmt、workspace Clippy（`-D warnings`）、全部 workspace test/build、严格 Rustdoc、check-docs 和 diff check 通过；日志在忽略目录 `target/daily-stage2-gates/`。最后的原生布局调整另补桌面回归与构建。实际 120 DPI 默认及最小窗口截图为 `target/daily-stage2-screenshots/01-chat.png`、`02-model.png`、`03-model-minimum.png`；已亲自查看模型表单截图，输入、许可、保存位置说明在最小窗口内完整显示。探针 `target/daily-stage2-probe.ps1` 使用隔离的 `target/daily-stage2-profile`，没有读取真实用户聊天或凭据，测试窗口已关闭。
+
+边界：没有真实服务端点／凭据验收；完整首次配置→发送→编辑记忆→召回→重启，以及真实窗口请求中操作、超时、撤权和异常恢复，交下一阶段实用性验收。恢复的原文只读展示，不自动进入新会话输入；未知历史保守禁发，尚无显式放弃未知并另开会话入口。运行和原文均维持既有硬容量，不承诺无限会话或自动轮转。原生 IME、多显示器连续拖动、真实 MessageBox 自动化及长期 GDI 仍未验；外部渠道、生产 Hooks、工具执行与动画素材未启动。
+
+## 日用初版第一步：领队界面与记忆管理（2026-10-17）
+
+- 用户已明确授权真实模型与本地恢复，分步目标见现行计划“日用初版接线”。本节仅记录已完成的第一步，不把模型服务或持久化记为完成；后续第二步继续由领队亲自实现。
+- 原生聊天默认居中限宽，顶部独立入口按需展开管理抽屉；布局增加记忆搜索与多行编辑区，编辑/删除只在选中后可用。修复自绘内缩辅助函数符号错误（此前边框落入子控件而被遮住），收敛标题/状态/提示文案。初始 1120×760、最小 880×640（96 DPI），实际截图检查于 120 DPI 完成。
+- `SearchMemories`、`UpdateMemory`、`DeleteMemory` 通过应用与面板门面；只修改应用明确创建的私密笔记，核心校验来源、归属和版本。快照携带 revision，旧版本更新/删除失败；查询条件写入后保留，最多返回 100 条。原生编辑失败保留输入，确认删除不删除已有聊天，未保存记忆在关闭时提醒。HTTP 白名单未扩大，只调整测试枚举匹配和快照夹具以适配契约新增字段。
+- 新增应用回归 `memory_management.rs`：检索、更新、旧版本拒绝、删除后下轮不召回、隐藏与撤权拒绝；新增原生回归 `memory_editor_search_save_delete_and_unsaved_close`：抽屉扩缩、新增/编辑、搜索、取消/确认删除、关闭取消保留记忆输入。旧原生/应用回归一并验证。取输入文本操作从 `build_window_plan` 的状态借用中移到借用前，避免可重入查询跨活跃借用。
+- 实际窗口截图：`target/daily-ui-screenshots/01-chat.png` 与 `02-memory.png`；实际操作使用合成笔记，窗口已关闭。自动化探针在 `target/daily-ui-probe.ps1`，未触碰真实用户聊天、凭据或存档。测试使用原生确认桩，真实输入法/多屏连续拖动仍未验证。
+- 当前仍只有离线回复和内存状态。第二步需接模型设置、后台请求、持久化/恢复和明确的传输许可；第三步做重启及失败路径实用性验收。禁止通过联网实现 `OfflineModel` 偷渡外传许可，禁止在 UI 中虚构真实模型完成状态。
+- 本阶段主工作区全链门已运行并通过：fmt、workspace Clippy（-D warnings）、workspace test、build、严格 Rustdoc、文档检查和 diff check；Cargo 均使用 --locked --offline。日志在 `target/daily-stage1-gates/`，针对性日志在 `target/daily-stage1-tests.log`。未提交、推送或创建分支。
+
+## 原生宿主生命周期阻塞项修复与计数修正（2026-10-17，第二轮）
+
+- 基线：`021dc48` → `8c09ef3` 限定补丁（`apps/moe-buddy-desktop/src/host/mod.rs`、
+  `src/host/tests.rs`、`docs/REVIEW.md`）经 `git apply --check` 通过后应用到隔离副本，
+  三个文件与 `8c09ef3` 逐字节一致；本节为在该基线上的复审阻塞项修复。上一节（同日）
+  关于本轮 8c09ef3 的"68 个 result 全绿"与"清单 1316 项"记录存在过度断言与重复计数，
+  以本节为准。
+- 阻塞项①根因（`host/mod.rs` 旧 `apply_dpi_at`）：`WM_SETFONT` 扇出与 `SetWindowPos`
+  允许同步回调（自绘重绘回发 `WM_DRAWITEM`、同步 `WM_SIZE` 重入 `refresh`），子类化
+  回调中 `DestroyWindow` 会经 `WM_NCDESTROY` 释放状态 Box，返回后的 `refresh(pointer)`
+  解引用已释放内存。修复：引入窄的窗口实例生命周期——`WM_NCCREATE` 把随机实例代际
+  登记入进程内注册表，`WM_NCDESTROY` 先清 `GWLP_USERDATA`、注销代际再释放 Box；
+  `apply_fonts` 与 `SetWindowPos` 返回后按注册表代际复验（`instance_valid`），失效立即
+  停止，不再解引用指针；`create_stage`、模态确认（撤销/关闭）同样改为代际复验。复验
+  只比对登记表与栈上捕获值，绝不解引用已释放指针；窗口销毁（注销）、HWND 复用或堆
+  地址复用（新实例新代际）都不会误判存活。原 `state_alive` 的"`GWLP_USERDATA` 等于
+  指针"比对不足以排除复用，已废弃。
+- 阻塞项②根因（旧 `apply_window_plan`）：`WindowPlan` 无实例/状态修订校验。阶段 B 的
+  `EnableWindow` 等副作用同步重入（审查员注入 `WM_ENABLE`）完成撤权并嵌套刷新后，
+  外层计划继续执行：重新启用控件并把阶段 A 捕获的过期草稿回写输入框，审查员实测
+  `revoked=true, text="sensitive draft", send_enabled=1`。修复：`DesktopState.revision`
+  修订号在每个结构性 `Action` 成功后递增（`SetDraft` 除外：真实键入由队列驱动，不会
+  在阶段 B 内交错；阶段 B 的 `EN_CHANGE` 只能是本计划 `SetWindowTextW` 的幂等回显，
+  排除它避免良性回显中止剩余布局副作用）；计划捕获构建时的代际+修订号，阶段 B 每个
+  允许同步回调的副作用（撤权清空、逐控件 `EnableWindow`/`ShowWindow`、列表 `LB_*`
+  扇出、草稿回写、`MoveWindow`、`LB_SETITEMHEIGHT`）返回后经 `WindowPlan::valid()`
+  复验，实例失效或修订号前进立即中止，剩余副作用交由重入方自己的刷新收敛。另两处
+  硬化：撤权计划永不回写草稿（`interactive=false` 时 `draft=None`）；`GetWindowTextW`/
+  `LB_GETCURSEL` 按可重入回调对待——`control_text_if_alive`/`selection_if_alive` 返回
+  后复验实例才允许建立下一段借用，并修掉 `LBN_SELCHANGE` 两臂在 `&mut` 借用内调用
+  `LB_GETCURSEL` 违反本模块纪律的问题（查询移出借用）。未引入通用引擎、未吞通知、
+  未用裸指针掩盖活跃借用；`WindowPlan.state` 裸指针仅用于 `valid()` 在实例存活确认后
+  读取修订号。
+- 确定性回归（`src/host/tests.rs`，桌面 crate 38→44 项）：`wm_enable_nested_revocation_
+  stops_stale_plan`（`WM_ENABLE` 子类注入"撤权+嵌套刷新"，断言文本空、发送禁用、记忆
+  面板保持隐藏、实例仍在册——修复前实测会回写"敏感草稿"）；`nested_structural_change_
+  aborts_old_plan_before_writeback`（只撤权不刷新，断言旧计划中止后不回写过期草稿，
+  后续显式刷新收敛）；`wm_setfont_destroy_during_fanout_stops_refresh` 与
+  `set_window_pos_destroy_during_resize_stops_refresh`（`WM_SETFONT`/同步 `WM_SIZE`
+  内销毁主窗口，断言扇出/刷新停止、窗口销毁、注册表注销）；`modal_reentry_delivers_
+  command_and_keeps_window` 与 `destroy_during_modal_confirm_aborts_revoke`（确认桩
+  以 `PostMessageW` 显式投递真实消息进模态循环：重入命令真实生效且窗口保留；模态期
+  销毁后撤权流程立即放弃）；`real_resize_recomputes_layout_from_actual_client`（用
+  `SetWindowPos` 真实改变客户区并缩到最小尺寸，布局与纯几何 `layout::compute` 期望
+  一致——替换原直接发 `WM_SIZE`、客户区实际未变的伪缩放测试）。自证修正：DPI 字体
+  断言改为独立构造期望 `LOGFONTW`（字号/字重/字符集/字体名）经 `GetObjectW` 与生产
+  HFONT 逐字段核对，并用 `CreateFontIndirectW` 现建独立字体在真实 DC 量测行高，不再
+  以生产 `font()` 生成期望；滚动测试覆盖 `SB_THUMBPOSITION` 与 `SB_THUMBTRACK` 两条
+  路径的完整 32 位位置并回验 `SIF_TRACKPOS`（文档注明与真实鼠标拖动的区别：自动化
+  无法注入 `nTrackPos`，验证的是消息处理契约，real mouse dragging was not revalidated in this round）；着色测试用
+  `GetTextColor`/`GetBkColor` 回读所提供 HDC 的实际着色结果，防止参数互换回归。
+- 变异验证（红/绿证据）：把 `WindowPlan::valid()` 临时短路为 `true` 后，两条计划中止
+  测试精确在"过期草稿被回写"断言失败（41 通过 2 失败，其余不回归），恢复后全绿——
+  证明回归针对被修行为。销毁路径不做变异运行（等于故意制造 UB）；其存活复验由注册
+  表注销断言与桩注入销毁测试覆盖。
+- Lead integration verification: added per-call invalidation checks inside font, list,
+  layout, visibility and input-clearing fan-out. Desktop regression: 43 passed, 1 ignored.
+  Integrated workspace fmt, Clippy with warnings denied, tests, build, strict Rustdoc,
+  documentation checks and diff whitespace checks all passed. Logs: `target/desktop-lead-gates/`.
+- The reported 1319 workspace total is withdrawn pending a consistent recount; do not add
+  doctests twice or count subprocess output as separate tests.
+- Limits: callback injection and a modal stub are not real user interaction acceptance.
+  Real mouse dragging, multi-monitor DPI, vendor IME, native MessageBox automation and
+  long-running GDI resource behavior remain unverified. The lead reviewed the final changes;
+  no additional independent reviewer pass was available after the final fixes.
+
+## Native host callback and DPI follow-up (2026-10-17)
+
+- 修复（上一轮局部）：`theme::Metrics` 的字体字号保留 96 DPI 基准值，Win32 `CreateFontW` 入口统一按窗口 DPI 缩放一次；撤权快照应用时清空记忆输入框、Edit 撤销缓冲、所选记忆 ID 与详情文本；垂直滚动拖动读取 `GetScrollInfo(SIF_TRACKPOS)` 的 32 位位置；编辑框/列表框着色消息从 `wParam` 取得 HDC。
+- P1 根因消除（本轮）：`apps/moe-buddy-desktop/src/host/mod.rs` 重写为"状态计算与窗口副作用分离"的两阶段窗口过程，回调不再创建跨可重入 Win32 调用存活的整个 `DesktopState` 可变引用。阶段 A 在短借用内完成视图模型、布局几何与画布量测，允许的 Win32 限于不分发消息的封闭集合（`GetClientRect`、`GetDpiForWindow`、`GetWindowText*`、`LB_/EM_` 只读查询、建字/量测 GDI、`InvalidateRect`/`SetScrollInfo`），产出只含拷贝数据的具名 `WindowPlan`；阶段 B 无借用执行 `SetWindowTextW`、`EnableWindow`、`ShowWindow`、`MoveWindow`、`LB_*`、`WM_SETFONT` 扇出等可同步重入副作用，重入消息（`EN_CHANGE`、`WM_DRAWITEM`/`WM_CTLCOLOR*`、`WM_SIZE`）各自建立自己的短借用，任意时刻至多一个借用存活。未把引用改成裸指针句柄、未加标志吞通知、未用 RefCell 重入 panic 代替修复，也未引入泛化命令引擎。配套修正：模态确认（撤销/关闭）改为阶段机——`MessageBoxW` 在无借用时进入模态循环，返回后先复验 `GWLP_USERDATA` 归属再继续，窗口若在模态期间销毁则不再触碰指针；`DestroyWindow` 只在阶段 B 调用且返回后不再使用指针；`WM_NCDESTROY` 先清空 `GWLP_USERDATA` 再经 `Drop` 释放 GDI 资源与状态 Box 并 `PostQuitMessage`，此后迟到消息取不到指针；消息循环改用局部 HWND + `IsWindow` 判断，销毁后不再解引用状态；`intercept_enter`/`redirect_wheel` 先拷贝所需 HWND、结束借用再 `SendMessageW`；预设选中即时启用按钮的 SELCHANGE 刷新（`update_apply_enabled`）保留。
+- 真实宿主回归：`apps/moe-buddy-desktop/src/host/tests.rs` 在真实窗口类与真实 Win32 控件上驱动（确认框以脚本化桩替换并在桩内泵队列消息模拟模态循环重入；未开放业务权限，未启动真实模态框）：`en_change_reentry_and_set_text_draft_converge`（WM_CHAR 真实键入的 EN_CHANGE 在 `WM_CHAR` 内同步重入、草稿逐字符收敛；实测本机 Windows 的 EDIT 对 `SetWindowTextW` 不回发 EN_CHANGE，草稿保持权威、刷新收敛且无回写循环）、`close_confirm_idno_keeps_draft_then_idyes_destroys` 与 `close_with_empty_draft_destroys_directly`（关闭确认嵌套分发：取消保留窗口与草稿、确认后销毁、销毁后迟到消息安全）、`revoke_clears_text_undo_and_disables_everything`（撤权后聊天与记忆 EDIT 的 `WM_GETTEXT` 均为空、`EM_CANUNDO`/`EM_UNDO` 均为 0、控件全禁用、`WM_SETFOCUS` 不再聚焦聊天输入、撤权后关闭直接销毁）、`dpi_144_and_192_rebuild_real_fonts_once`（144/192 DPI 状态行高与按目标 DPI 现建真实 HFONT 的 `GetTextMetricsW` 度量完全一致，即字体只缩放一次；控件随 `SetWindowPos` 同步移动；实时 `WM_DPICHANGED` 入口收敛）、`thumb_drag_beyond_65535_keeps_full_position`（滚动条置于 70000px 后发 `SB_THUMBPOSITION`，`wParam` 高 16 位截断为 4464 而实现读 `SIF_TRACKPOS` 得完整 70000 并同步滚动条）、`coloring_and_ownerdraw_paths_return_brush_and_flag`（着色返回面板画刷、`WM_DRAWITEM` 返回 1、主窗口与画布 `WM_PAINT` 真实路径）、`send_button_click_delivers_offline_reply`、`memory_panel_flow_remember_select_detail`、`preset_flow_select_enables_apply_and_applies`、`wm_size_recomputes_layout_without_aliasing`（聊天/记忆/预设/布局基本操作）。探针 `probe_dump_host_metrics_to_target`（ignored）转储 DPI/行高/布局/列表状态到忽略目录 `target/desktop-host-probe/host-probe.txt`；本轮为消息级验证，未重新生成截图。
+- 门禁：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo test --workspace --locked`（68 个 result 全绿）、`cargo build --workspace --locked`、`RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps` 均通过（依赖已缓存，`--offline`）；`scripts/check-docs.ps1` PASS（15 个活动 Markdown）；`git diff --check` 干净。独立清单 1316 项（1243 单测 + 73 doctest；moe-buddy-desktop 38 项 = 既有 26 项 + 本轮 11 项原生宿主回归 + 1 项 ignored 探针）。注意：既有 26 项全部是 theme/presenter/layout/chatlog 纯表现模块测试，不代表原生窗口行为；原生行为验收以本轮 `host::tests` 为准。未 commit/push/建分支。
+- 边界与剩余风险：真实 `MessageBoxW` 模态循环未在自动化中驱动（会阻塞），以脚本桩加"无借用进入模态"的结构保证；`SetWindowTextW` 不回发 EN_CHANGE 是本机实测的 OS 行为，若其他版本回发，重入由同一两阶段纪律覆盖（测试不假设其存在）。多显示器实时拖动 DPI、真实中文 IME 各厂商、长时间运行的 GDI 句柄周期与旧平台未验证；动画、多宠窗口、真实模型/渠道仍不在范围。
+
+## Native desktop host (2026-10-15)
+
+> 2026-10-17 更新：桌面宿主已从最小测试面板改造为可用的初期原生桌面 UI；本节记录当前
+> 交付与实际验证。首版仅编译验证的旧状态不再是当前结论。
+
+- 交付：`apps/moe-buddy-desktop` 重写为完整桌面聊天布局——顶部伙伴信息栏（克制身份占位
+  "M" 圆形占位与"离线验收 · 非真实模型 · 仅本机"准确标记）、自绘滚动聊天气泡（贴底自动
+  跟随、上翻保持阅读位置）、舒适输入区（Enter 发送、Shift+Enter 换行、IMM 组合串非空时
+  Enter 不误发、失败保留草稿、空草稿明确反馈）、右侧 记忆/预设/日志 三个独立入口及真实
+  内容（授权记忆列出与"记住"、离线预设目录与"使用此预设"切换、白名单日志投影与刷新）、
+  状态栏（空态/请求中/失败/结果未知各成文案与形状，未知禁用发送）、"撤销授权"入口
+  （确认后全部控件禁用并显示撤销通知）。带未发送草稿关闭先走 `ChatApplication` 关闭确认：
+  取消保留草稿与窗口，确认丢弃后销毁窗口。窗口初始客户区 1024×704、最小 752×480，支持
+  缩放/最小化/关闭，Per-Monitor v2 DPI 感知，Tab 循环与可见焦点框。视觉按 U2 规范：冷白
+  `#F3F5FA`、白面板、深墨 `#252B3D`、墨蓝 `#5263A7`、次要字 `#778096`、边框 `#DCE3EF`，
+  中文 Microsoft YaHei UI、日志 Consolas，8px 间距与 8px 控件圆角。没有角色素材，主区
+  不再绘制大面积简陋角色，仅用身份占位。
+- 结构：单文件拆为纯表现模块 `theme.rs`（U2 颜色/字号/8px 度量）、`presenter.rs`（快照→
+  界面模型纯映射：状态文案、严重度、可用性、离线标记、边栏内容、Enter 策略）、
+  `chatlog.rs`（注入测量器的纯历史布局与滚动钳制/贴底）、`layout.rs`（客户区与面板纯几何、
+  最小尺寸钳制）与 Windows 宿主 `host/mod.rs`（事件循环、控件编排、IME Enter 拦截、动作
+  分发、关闭确认）及 `host/paint.rs`（信息栏/通知条/气泡/空态/状态条/自绘按钮与列表行）。
+  宿主只经既有 `Action` 与快照交互；`windows-sys` 仅追加同锁定版本内的
+  `Win32_UI_Controls/Win32_UI_HiDpi/Win32_UI_Input_Ime` 特性，无新依赖、未换 GUI 框架、
+  未改浏览器夹具；二进制改为 GUI 子系统，启动失败经消息框呈现。
+- 实际窗口验证：本机 Windows 桌面会话启动原生窗口，脚本驱动（消息与真实键鼠）完成
+  空态、空草稿发送反馈、草稿粘贴 + Enter 发送与离线回复气泡、记忆面板记住一条并列出、
+  预设面板选中第二项后按钮启用、应用后标题/列表/详情同步"（使用中）"、日志面板受控
+  事件与刷新、缩到最小客户区 752×480（窗口 768×519，布局无溢出）、带草稿关闭弹出内核
+  确认框、取消保留窗口与草稿、再次关闭确认丢弃后进程以退出码 0 结束。期间发现并修复：
+  预设选中后"使用此预设"未即时启用（SELCHANGE 缺按钮状态刷新）、边栏详情区文字被裁、
+  预设切换后列表行文本未刷新（展示缓存签名改为 FNV-1a 覆盖行文本与激活标记）。
+  12 张截图存于忽略目录 `target/desktop-u2-screenshots/`（01 空态、02 空发送反馈、
+  03 草稿、04 回复、05 记忆空态、06 记住、07/07b/08 预设选中与应用、09 日志、10 最小
+  尺寸、11 关闭确认全屏），操作日志在 `target/desktop-u2-gate-logs/run-desktop.log`。
+- 门禁：纯表现模块 26 项针对性回归（离线标记准确性、结果未知/撤销禁用发送、Enter 策略、
+  面板可见性与行映射、布局钳制、贴底滚动、度量随 DPI 缩放等）全部通过；workspace fmt、
+  全目标严格 Clippy `-D warnings`、test、build、严格 Rustdoc 均 `--locked --offline` 通过，
+  独立 `-- --list` 清单 1231 项（= 上一清单 1205 + 本轮 26，含 doctest，不累加子进程输出），
+  日志在 `target/desktop-u2-gate-logs/`。未执行 commit/push/建分支。
+- 边界：仍是离线内存验收——回复来自明确标注的离线验收模型，不声称真实模型、外部渠道、
+  持久化、素材动画或托盘生命周期；160ms 状态过渡动画、多伙伴窗口、角色素材与文件持久化
+  不在本轮；诊断日志仅经既有授权查询。`apps/moe-chat-host` 仍为回环 HTTP/浏览器回归夹具，
+  其 smoke 覆盖继续用于协议与快照检查。输入法组合判断依赖 IMM 组合串查询，真实中文 IME
+  各厂商行为仅做了机制级验证（组合中 Enter 交还控件），未逐一实测全部输入法。
+
+## UI U2 文字聊天浏览器闭环（2026-10-15，离线闭环已验收）
+
+- 交付：`crates/moe-chat-app` 提供纯受信业务组合，`apps/moe-chat-host` 提供可启动回环宿主及真实浏览器界面。聊天、预设、记忆、日志四面板经 `UiManager` 注册和驱动，展示及生命周期计数来自真实视图回调；动画、桌宠显示、外部渠道、工具和自动落盘未接入。
+- 业务：发送走可信入口、会话登记和 `AgentWorkflow::prepare/infer/finish`，以实际交付回执判断；明确私密记忆写入经授权召回，预设走真实注册表，日志采集与查看许可独立且不含正文或凭据。宿主仅回环，严格 Host/Origin/Cookie/CSRF，请求 ID 有界去重且不淘汰历史后放行重放；非法请求不得执行业务。默认明确标识离线验收，不声称真实模型联调。
+- UI 实测发现并修复：关闭聊天视图曾销毁展示历史；改为应用持有最多128条消息的有界交付投影，重开核验后重新装配，草稿仍由控制器持有。关闭面板不再等于销毁业务会话。发送失败保留输入草稿；驱动错误由应用持有完整有界报告，原错误链不再随临时报告丢失，也不暴露给浏览器。
+- 真实浏览器验证：`scripts/chat-browser-smoke.mjs` 连接实际 Rust 宿主与应用，通过十组检查：真实挂载、IME/换行与发送、记住后召回、预设绑定、受控日志、隐藏/恢复/确认关闭/重开、同步草稿删除后的隐藏/关闭/重开、桌面与窄屏布局、回执丢失不重发及只读恢复、撤权清缓存。撤权前未同步聊天/记忆文本会被浏览器和服务端快照同时清除；截图已目视检查，结果留在 `target/chat-u2-browser/`。前端十二项 Node 定向测试通过。
+- 全链：在独立 `target/chat-u2-verification/clean-build` 通过 workspace fmt、全目标 Clippy `-D warnings`、test、build、严格 rustdoc，构建命令均 `--locked --offline`；最终测试清单独立计数1205项，不累加子进程重复输出。活动 Markdown 的编码/路径/锚点/格式门及 `git diff --check` 通过。本轮仍未 commit/push；真实模型、外部渠道、持久化和动画不在范围内。
+- 终审结果：登记前按真实 Session/Agent 上限预留输入与回复空间；登记后 bind/prepare/infer/finish 失败必须拿到真实取消回执，否则交互隔离、保留原始与处置错误、阻止重试并显示 Unknown。预设目录来自真实视图缓存。`set_draft` 支持空字符串清除，记忆仍拒绝空白；HTTP 分包头严格按完整头预算拒绝超限。诊断错误按原始 `GatewayError` 变体分类，容量/时钟/过期不再误报授权拒绝。两项 UI P3 正式回归、四项应用异常处置回归、宿主新增协议回归均通过。
+
 > 更新：2026-10-14。对象：Moe-Buddy 已复核的记忆、Agent 与 RAG 离线底座及主分支集成。M0–M5、上下文精进与 G0–G5、RAG R0–R4 离线范围的证据分阶段记录；此前 R4 三项 P2 修复后及主目录集成复验的独立清单均为 879 项（含 doctest 及 3 项显式 example 测试），R3 的 848 项仅为历史快照。R4 安全回归、冻结质量工程、显式真实校验入口与合成基准不推进 G6–G8，不接真实对话模型、对外 HTTP 网关、渠道或生产 Hooks；施工和复核当时未执行领队 commit/push/建分支，后续用户明确授权的合并、提交与推送见主分支集成记录。
 > 结论：整体暂不能验收，R4 真实完整质量门尚未完成；用户后续复核复现的三项工程 P2 已修复并补回归，证据见 R4 同节。两项留存 P1 已修复；R4 独立审查和已完成定向回归范围内未发现新的已复现 P0/P1；审查提出的三项安全覆盖 P2 和两项质量工程 P2 均已补齐。Agent 具体记忆耦合已在离线范围经三方法核心窄契约关闭（P2-B）；夹具公开、职责集中和全局失效等整理项仍保留。离线/回环全绿不代表真实模型、生产闭环或完整 RAG 验收通过。
-> 当前主目录：2026-10-14 已集成程序流程执行、已审 A1 动画内核、UI U1 及此前已关闭的记忆层缺陷；本轮独立测试清单为 1124 项（含 doctest），见下节。UI 补充复审的两项生命周期 P2 仍未修，暂不验收；历史 944/1002/1024 等数字只对应各自审核快照。R1/R4 真实门与 G6–G8 暂停边界不变。
+> 当前工作区：以主干 `96c1274` 为基线，U1 补充复审的两项生命周期 P2 已修并新增 7 项正式回归；本轮 UI 65 项、workspace 独立清单 1131 项（含 doctest）与全链门通过。Windows 原生桌面宿主已加入工作区，仍为离线/内存范围；修复尚未提交或推送，动画素材、真实模型/渠道和持久化不在本轮。历史 944/1002/1024/1124 等数字只对应各自审核快照；R1/R4 真实门与其他暂停边界不变。
 
 ## 主干集成与验证（2026-10-14）
 
 - 授权与范围：按用户明确要求在 `main` 集成现有流程层、UI U1、记忆缺陷修复，以及已独立审核的 A1 动画内核。动画仅取 `animation.rs`、`animation/definition.rs`、两份专项回归、公开模块入口和对应 README；两份内核文件的原始 SHA-256 与上文 A1 审核记录一致，集成后的内容逐文件核对一致。没有合入工作树中另有的 `moe-animation-assets` 或其 workspace/素材层变更，没有选择 GUI 或开启 A2/A3。
 - 本轮实际验证：Rust/Cargo 1.99.0，独立构建目录 `target/main-integration-20261014`；先通过动画定义 51 项、运行器 67 项及 UI 原有 58 项，再通过 fmt、workspace 全目标严格 Clippy、workspace test/build、严格 Rustdoc test/doc。Cargo 构建/测试/文档均使用 `--locked --offline`；独立 `-- --list` 清单为 1124 项（含 doctest），不是将专项回归与 workspace 总数重复累加。完整命令日志保留于该目录的 `gate-logs/`。
 - 真实性与遗留项：当前正式测试全绿不关闭 UI 补充复审发现的两项 P2（待释放同 key 重开、隐藏后的失效加载阻止关闭），其反例与修复要求仍见本页 U1 补充复审。记忆真实模型/完整质量门、真实 GUI、动画素材导入/播放、业务诊断接线与工具执行未验收；没有以离线测试代替生产闭环。
+
+## UI U1 两项生命周期 P2 修复（2026-10-14）
+
+- 基线与复现：主干 `96c1274`，修复前新增六项 `headless` 回归全部失败，复现同 key 待释放时再次调用工厂，以及隐藏/新加载/失败修订的失效负载占用队列、阻止普通/确认关闭；不是将编译错误或未运行的探针当作反例。
+- 同 key 资源占用：注册表新增内部待释放按 key 查询；`open` 在工厂、入参与容量分配之前返回 `UiError::PendingReleaseForKey { key, record }`，重试失败仍阻止同 key 重开，成功释放后才允许新建，其他 key 不受影响。回归覆盖部分挂载、普通关闭、隐藏清理失败及失败/成功重试，并断言工厂次数与不同作用域隔离。
+- 失效加载：加载序号前进或耗尽即移除已失效的票据化负载，隐藏、恢复、新加载、修订与释放共享该边界；普通输入和当前有效结果仍保留并阻止普通关闭。原队列/析构断言同步为立即清理语义，驱动 stale 计数不重复统计生命周期已丢弃的负载，没有靠恢复显示或伪造强制撤权绕过保护。
+- 所有权回归：第七项 `revocation` 回归在 `unmount` 入口断言失效负载已析构，覆盖卸载成功与失败后重试。旧强制释放测试原先在待释放同 key 下再次构造实例，改用两个不同桌宠作用域继续验证独立失败记录和撤权边界，不保留已确认的非法重开前提。
+- 验证：UI 65 项；Rust/Cargo 1.99.0，独立目录 `target/ui-p2-chat-20261014` 的 fmt、workspace 全目标严格 Clippy、workspace test/build、严格 Rustdoc test/doc 通过，Cargo 使用 `--locked --offline`。独立 `-- --list` 清单 1131 项，不累加 writer-lock 子进程输出；日志在 `gate-logs/`。本批只关闭两项已知 P2，未选择 GUI、接聊天/诊断业务或扩大模型/落盘权限。
 
 ## 1. 修复闭环
 
@@ -313,6 +503,8 @@ P2 是正式宿主接线前应收口的维护/架构项，不等同于已发生�
 - 未验证：真实 GUI 像素、鼠标/键盘/系统焦点、实际业务预设面板、日志查看租约、业务诊断采集或真实模型均不在 U1。真实像素的紧急隐藏由宿主负责，`revoke` 是控制器必须兑现的敏感缓存清除边界，不承诺物理擦除或业务回滚。U2 需另行明确宿主/依赖/面板并启动；动画 A2/A3、G6–G8 与 R1/R4 真实门不变。本批保留既有未提交改动，没有自行提交、推送或建分支。
 
 ### U1 本轮领队补充复审（2026-10-14）
+
+本节为修前审核快照；两项 P2 的后续修复与验证见本页“UI U1 两项生命周期 P2 修复”，不再将修前结论当作当前验收状态。
 
 - 最新结论：未发现本范围内 P0/P1，但本轮独立反例复现两项生命周期 P2，修复前暂不验收 U1。前述定向用例与早前独立审查通过属于已有覆盖，不代表本轮反例已关闭；无需重做整体架构，也不启动 U2。
 - 审核对象：主目录 HEAD `65b8968a0a7d6b4959c2d55f33e3e271abd05557` 上未提交 U1。审核前后 14 文件源码清单保持不变，归一化 SHA-256 仍为 `8f0d592b1eee8dcd64a1c199f81951bb5be5b5865f51d663ef7451928709b496`，与前述最终源码身份一致。本轮只更新本记录与计划，未修改功能代码、合并、提交或推送。

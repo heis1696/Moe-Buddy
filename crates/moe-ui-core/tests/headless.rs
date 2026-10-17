@@ -132,6 +132,7 @@ impl TestArgs {
 
 /// 控制器与测试共享的开关;测试运行中可切换。
 struct Flags {
+    factory_calls: Cell<u32>,
     close_confirm: Cell<bool>,
     revise_fails: Cell<bool>,
     fail_release: Cell<bool>,
@@ -150,6 +151,7 @@ struct Flags {
 impl Flags {
     fn new() -> Rc<Self> {
         Rc::new(Self {
+            factory_calls: Cell::new(0),
             close_confirm: Cell::new(false),
             revise_fails: Cell::new(false),
             fail_release: Cell::new(false),
@@ -414,6 +416,7 @@ fn fixture_with(setup: UiConfig, level: ScopeLevel) -> Fixture {
             PanelKind::new("probe").unwrap(),
             level,
             move |key: &PanelKey, args: &TestArgs| {
+                flags.factory_calls.set(flags.factory_calls.get() + 1);
                 Ok(UiPanel::new(
                     TestController {
                         model: TestModel {
@@ -775,14 +778,14 @@ fn hide_preserves_accepted_plain_inputs_and_drops_stale_loads() {
     fixture.ui.hide(&mut (), &handle).unwrap();
     let report = fixture.ui.drive(&mut ());
     assert_eq!(report.inputs_delivered(), 0);
-    assert_eq!(report.inputs_pending(), 2);
+    assert_eq!(report.inputs_pending(), 1);
     assert_eq!(report.renders_attempted(), 0);
 
     // 恢复后普通输入继续交付;旧加载结果复验失效。
     fixture.ui.show(&mut (), &handle).unwrap();
     let report = fixture.ui.drive(&mut ());
     assert_eq!(report.inputs_delivered(), 1);
-    assert_eq!(report.inputs_stale(), 1);
+    assert_eq!(report.inputs_stale(), 0);
     assert_eq!(report.inputs_pending(), 0);
     assert!(log_contains(&fixture, "draft=\"kept\""));
     assert!(log_contains(&fixture, "load=[]"));
@@ -1166,7 +1169,7 @@ fn load_tickets_stale_at_enqueue_and_dispatch() {
         .begin_load::<TestController, TestView>(&fixture.entry, &handle)
         .unwrap();
     let report = fixture.ui.drive(&mut ());
-    assert_eq!(report.inputs_stale(), 1);
+    assert_eq!(report.inputs_stale(), 0);
     assert!(log_contains(&fixture, "load=[2]"));
 
     // 关闭后票据对应实例消失。
@@ -1485,6 +1488,249 @@ fn restore_mount_failure_with_unmount_failure_is_quarantined() {
 }
 
 #[test]
+fn p2_pending_cleanup_blocks_same_key_before_factory_and_allows_other_keys() {
+    for failure_kind in 0..3 {
+        let mut fixture = fixture_with(config(8, 8, 8, 8, 8, 8), ScopeLevel::Pet);
+        let first_pet = ScopeIdentity::new("pending-first").unwrap();
+        let other_pet = ScopeIdentity::new("pending-other").unwrap();
+        let first_scope = PanelScope::Pet(first_pet.clone());
+        let error = if failure_kind == 0 {
+            fixture.flags.view_mount_failures.set(1);
+            fixture.flags.view_unmount_failures.set(2);
+            fixture
+                .ui
+                .open(
+                    &mut (),
+                    &fixture.entry,
+                    first_scope.clone(),
+                    Some(&TestArgs::plain("partial-mount")),
+                )
+                .unwrap_err()
+        } else {
+            let handle = open_pet(&mut fixture, &first_pet, "first");
+            fixture.flags.view_unmount_failures.set(2);
+            if failure_kind == 1 {
+                fixture.ui.close(&mut (), &handle).unwrap_err()
+            } else {
+                fixture.ui.hide(&mut (), &handle).unwrap_err()
+            }
+        };
+        let UiError::ReleaseIncomplete { record, key, .. } = error else {
+            panic!("expected pending release for failure {failure_kind}");
+        };
+        assert_eq!(fixture.flags.factory_calls.get(), 1);
+        let error = fixture
+            .ui
+            .open(
+                &mut (),
+                &fixture.entry,
+                first_scope.clone(),
+                Some(&TestArgs::plain("duplicate")),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains(&record.to_string()));
+        assert!(matches!(
+            error,
+            UiError::PendingReleaseForKey {
+                record: refused_record,
+                key: ref refused_key,
+            } if refused_record == record && refused_key == &key
+        ));
+        assert_eq!(fixture.flags.factory_calls.get(), 1);
+        assert!(fixture.ui.list().is_empty());
+        assert_eq!(fixture.ui.pending_releases()[0].key, key);
+
+        let other_handle = open_pet(&mut fixture, &other_pet, "other");
+        assert_eq!(fixture.flags.factory_calls.get(), 2);
+        assert!(fixture.ui.contains(&other_handle));
+        assert!(fixture.ui.retry_release(&mut (), record).is_err());
+        let pending_before_retry = fixture.ui.pending_releases();
+        let reopen_error = fixture.ui.open(
+            &mut (),
+            &fixture.entry,
+            first_scope,
+            Some(&TestArgs::plain("retry-pending")),
+        );
+        assert!(matches!(
+            reopen_error,
+            Err(UiError::PendingReleaseForKey {
+                record: refused_record,
+                key: ref refused_key,
+            }) if refused_record == record && refused_key == &key
+        ));
+        assert_eq!(fixture.flags.factory_calls.get(), 2);
+        assert_eq!(fixture.ui.pending_releases(), pending_before_retry);
+        fixture.ui.retry_release(&mut (), record).unwrap();
+        assert!(fixture.ui.pending_releases().is_empty());
+        let reopened = open_pet(&mut fixture, &first_pet, "reopened");
+        assert!(fixture.ui.contains(&reopened));
+        assert!(fixture.ui.contains(&other_handle));
+        assert_eq!(fixture.flags.factory_calls.get(), 3);
+    }
+}
+
+#[test]
+fn p2_hidden_invalidated_load_does_not_block_close() {
+    let mut fixture = fixture();
+    let handle = open_app(&mut fixture, TestArgs::plain("root"));
+    let ticket = fixture
+        .ui
+        .begin_load::<TestController, TestView>(&fixture.entry, &handle)
+        .unwrap();
+    fixture
+        .ui
+        .submit::<TestController, TestView>(&fixture.entry, &ticket, TestEvent::LoadResult(7))
+        .unwrap();
+    fixture.ui.hide(&mut (), &handle).unwrap();
+    assert_eq!(fixture.ui.get(&handle).unwrap().pending_inputs, 0);
+    for _ in 0..16 {
+        let report = fixture.ui.drive(&mut ());
+        assert_eq!(report.inputs_pending(), 0);
+        assert_eq!(report.inputs_delivered(), 0);
+    }
+    fixture.ui.close(&mut (), &handle).unwrap();
+    assert!(!fixture.ui.contains(&handle));
+    assert!(fixture.ui.pending_releases().is_empty());
+}
+
+#[test]
+fn p2_hidden_invalidated_load_keeps_plain_inputs_and_close_protection() {
+    let mut fixture = fixture();
+    let handle = open_app(&mut fixture, TestArgs::plain("root"));
+    let ticket = fixture
+        .ui
+        .begin_load::<TestController, TestView>(&fixture.entry, &handle)
+        .unwrap();
+    fixture
+        .ui
+        .submit::<TestController, TestView>(&fixture.entry, &ticket, TestEvent::LoadResult(7))
+        .unwrap();
+    fixture
+        .ui
+        .send::<TestController, TestView>(&fixture.entry, &handle, TestEvent::Draft("retained"))
+        .unwrap();
+    fixture.ui.hide(&mut (), &handle).unwrap();
+    assert_eq!(fixture.ui.get(&handle).unwrap().pending_inputs, 1);
+    assert!(matches!(
+        fixture.ui.close(&mut (), &handle),
+        Err(UiError::CloseBlockedByPendingInputs)
+    ));
+    assert_eq!(fixture.ui.drive(&mut ()).inputs_delivered(), 0);
+    fixture.ui.show(&mut (), &handle).unwrap();
+    assert_eq!(fixture.ui.drive(&mut ()).inputs_delivered(), 1);
+    fixture.ui.drive(&mut ());
+    assert!(log_contains(&fixture, r#"draft="retained""#));
+    assert!(log_contains(&fixture, "load=[]"));
+}
+
+#[test]
+fn p2_new_load_reclaims_stale_capacity_but_current_result_blocks_close() {
+    let mut fixture = fixture_with(config(8, 8, 1, 8, 8, 8), ScopeLevel::Application);
+    let handle = open_app(&mut fixture, TestArgs::plain("root"));
+    let old_ticket = fixture
+        .ui
+        .begin_load::<TestController, TestView>(&fixture.entry, &handle)
+        .unwrap();
+    fixture
+        .ui
+        .submit::<TestController, TestView>(&fixture.entry, &old_ticket, TestEvent::LoadResult(1))
+        .unwrap();
+    let current_ticket = fixture
+        .ui
+        .begin_load::<TestController, TestView>(&fixture.entry, &handle)
+        .unwrap();
+    assert_eq!(fixture.ui.get(&handle).unwrap().pending_inputs, 0);
+    fixture
+        .ui
+        .submit::<TestController, TestView>(
+            &fixture.entry,
+            &current_ticket,
+            TestEvent::LoadResult(2),
+        )
+        .unwrap();
+    assert!(matches!(
+        fixture.ui.close(&mut (), &handle),
+        Err(UiError::CloseBlockedByPendingInputs)
+    ));
+    fixture.ui.drive(&mut ());
+    fixture.ui.drive(&mut ());
+    assert!(log_contains(&fixture, "load=[2]"));
+    fixture.ui.close(&mut (), &handle).unwrap();
+    assert!(!fixture.ui.contains(&handle));
+}
+
+#[test]
+fn p2_failed_revision_discards_invalidated_loads_but_keeps_plain_inputs() {
+    let mut fixture = fixture();
+    let handle = open_app(&mut fixture, TestArgs::plain("root"));
+    let ticket = fixture
+        .ui
+        .begin_load::<TestController, TestView>(&fixture.entry, &handle)
+        .unwrap();
+    fixture
+        .ui
+        .send::<TestController, TestView>(&fixture.entry, &handle, TestEvent::Draft("retained"))
+        .unwrap();
+    fixture
+        .ui
+        .submit::<TestController, TestView>(&fixture.entry, &ticket, TestEvent::LoadResult(9))
+        .unwrap();
+    fixture.flags.revise_fails.set(true);
+    assert!(
+        fixture
+            .ui
+            .open(
+                &mut (),
+                &fixture.entry,
+                PanelScope::Application,
+                Some(&TestArgs::plain("failed"))
+            )
+            .is_err()
+    );
+    assert_eq!(fixture.ui.get(&handle).unwrap().pending_inputs, 1);
+    assert!(matches!(
+        fixture.ui.close(&mut (), &handle),
+        Err(UiError::CloseBlockedByPendingInputs)
+    ));
+    assert_eq!(fixture.ui.drive(&mut ()).inputs_delivered(), 1);
+    fixture.ui.drive(&mut ());
+    assert!(log_contains(&fixture, r#"draft="retained""#));
+    assert!(log_contains(&fixture, "load=[]"));
+}
+
+#[test]
+fn p2_hidden_invalidated_load_allows_confirmed_close() {
+    let mut fixture = fixture();
+    let handle = open_app(&mut fixture, TestArgs::plain("root"));
+    fixture.flags.close_confirm.set(true);
+    fixture
+        .ui
+        .send::<TestController, TestView>(
+            &fixture.entry,
+            &handle,
+            TestEvent::Draft("confirm-hidden-draft"),
+        )
+        .unwrap();
+    fixture.ui.drive(&mut ());
+    let ticket = fixture
+        .ui
+        .begin_load::<TestController, TestView>(&fixture.entry, &handle)
+        .unwrap();
+    fixture
+        .ui
+        .submit::<TestController, TestView>(&fixture.entry, &ticket, TestEvent::LoadResult(1))
+        .unwrap();
+    fixture.ui.hide(&mut (), &handle).unwrap();
+    let CloseRequest::ConfirmationPending(confirmation) =
+        fixture.ui.close(&mut (), &handle).unwrap()
+    else {
+        panic!("expected hidden close confirmation");
+    };
+    fixture.ui.confirm_close(&mut (), &confirmation).unwrap();
+    assert!(!fixture.ui.contains(&handle));
+}
+
+#[test]
 fn hide_unmount_failure_quarantines_and_rejects_interaction() {
     let mut fixture = fixture();
     let handle = open_app(&mut fixture, TestArgs::plain("root"));
@@ -1542,8 +1788,10 @@ fn scope_revocation_clears_cache_on_existing_pending_release() {
 
 #[test]
 fn failed_release_clears_focus_and_force_purges_despite_unmount_failure() {
-    let mut fixture = fixture();
-    let handle = open_app(&mut fixture, TestArgs::plain("root"));
+    let mut fixture = fixture_with(config(8, 8, 8, 8, 8, 8), ScopeLevel::Pet);
+    let first_pet = ScopeIdentity::new("first-release").unwrap();
+    let second_pet = ScopeIdentity::new("second-release").unwrap();
+    let handle = open_pet(&mut fixture, &first_pet, "root");
     fixture.ui.focus(&handle).unwrap();
     fixture.flags.fail_release.set(true);
 
@@ -1559,7 +1807,7 @@ fn failed_release_clears_focus_and_force_purges_despite_unmount_failure() {
 
     // 强制释放即使卸载失败也调用控制器敏感缓存清除边界。
     fixture.flags.view_unmount_failures.set(1);
-    let second = open_app(&mut fixture, TestArgs::plain("second"));
+    let second = open_pet(&mut fixture, &second_pet, "second");
     fixture.ui.focus(&second).unwrap();
     let UiError::ReleaseIncomplete {
         record: second_record,

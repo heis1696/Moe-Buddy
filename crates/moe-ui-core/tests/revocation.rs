@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -13,6 +13,7 @@ use moe_ui_core::{
 #[derive(Default)]
 struct ReleaseState {
     fail_unmount: Cell<bool>,
+    drops_before_unmount: RefCell<Option<(Rc<Cell<usize>>, usize)>>,
     revocations: Cell<usize>,
     releases: Cell<usize>,
 }
@@ -116,6 +117,9 @@ impl UiView for View {
     }
 
     fn unmount(&mut self, _context: &mut ()) -> Result<(), UnmountError> {
+        if let Some((drops, expected)) = self.0.drops_before_unmount.borrow().as_ref() {
+            assert_eq!(drops.get(), *expected);
+        }
         if self.0.fail_unmount.get() {
             Err(UnmountError)
         } else {
@@ -196,9 +200,9 @@ fn scope_revocation_drops_queued_payloads_in_existing_failed_release() {
         Err(UiError::ReleaseIncomplete { record, .. }) => record,
         other => panic!("expected failed release, got {other:?}"),
     };
-    assert_eq!(drops.get(), 0);
+    assert_eq!(drops.get(), 1);
     assert!(setup.manager.retry_release(&mut (), record).is_err());
-    assert_eq!(drops.get(), 0);
+    assert_eq!(drops.get(), 1);
     let report =
         setup
             .manager
@@ -216,6 +220,41 @@ fn scope_revocation_drops_queued_payloads_in_existing_failed_release() {
     setup.manager.retry_release(&mut (), record).unwrap();
     assert!(setup.manager.pending_releases().is_empty());
     assert_eq!(setup.state.releases.get(), 1);
+}
+
+#[test]
+fn p2_invalidated_load_payload_drops_before_view_unmount() {
+    for fail_unmount in [false, true] {
+        let mut setup = fixture();
+        let drops = Rc::new(Cell::new(0));
+        let ticket = setup
+            .manager
+            .begin_load(&setup.entry, &setup.handle)
+            .unwrap();
+        assert!(
+            setup
+                .manager
+                .submit(&setup.entry, &ticket, sensitive_payload(&drops))
+                .is_ok()
+        );
+        setup.state.fail_unmount.set(fail_unmount);
+        *setup.state.drops_before_unmount.borrow_mut() = Some((drops.clone(), 1));
+        let result = setup.manager.hide(&mut (), &setup.handle);
+        assert_eq!(drops.get(), 1);
+        if fail_unmount {
+            let Err(UiError::ReleaseIncomplete { record, .. }) = result else {
+                panic!("expected failed unmount");
+            };
+            setup.state.fail_unmount.set(false);
+            setup.manager.retry_release(&mut (), record).unwrap();
+        } else {
+            result.unwrap();
+            assert_eq!(setup.manager.get(&setup.handle).unwrap().pending_inputs, 0);
+            setup.manager.close(&mut (), &setup.handle).unwrap();
+        }
+        assert!(setup.manager.pending_releases().is_empty());
+        assert_eq!(drops.get(), 1);
+    }
 }
 
 #[test]

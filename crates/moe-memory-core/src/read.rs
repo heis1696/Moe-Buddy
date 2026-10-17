@@ -536,7 +536,11 @@ impl MemoryReader<'_> {
             .reads
             .policies
             .get(&self.identity)
-            .filter(|policy| policy.offline && self.purpose == ReadPurpose::OfflineReasoning)
+            .filter(|policy| match self.purpose {
+                ReadPurpose::OfflineReasoning => policy.offline,
+                ReadPurpose::ModelTransmission => policy.model_transmission,
+                _ => false,
+            })
             .ok_or(MemoryError::AccessDenied)
     }
 

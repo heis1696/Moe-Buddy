@@ -603,6 +603,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "moe-buddy-desktop"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "moe-agent-runtime",
+ "moe-chat-app",
+ "moe-memory-core",
+ "moe-memory-local",
+ "moe-raw-local",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "moe-chat-app"
+version = "0.1.0"
+dependencies = [
+ "moe-agent-runtime",
+ "moe-memory-core",
+ "moe-ui-core",
+]
+
+[[package]]
+name = "moe-chat-host"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "moe-chat-app",
+ "serde_json",
+]
+
+[[package]]
 name = "moe-cli-hooks"
 version = "0.1.0"
 dependencies = [

@@ -34,6 +34,10 @@ fn reviewed_turn(
 
 身份绑定、不可变候选和确认句柄不能从模型字段伪造，也没有可变草稿访问器：
 
+Adapter implementations that expose an authority method with the same conceptual operation may
+use `LocalMemory::cancel_current_tasks_receipt` to make the persistence call explicit. It has the
+same health, ID selection, CAS, journal and recovery semantics as `cancel_current_tasks`.
+
 ```compile_fail
 use moe_memory_local::OfflineTurn;
 fn forge(turn: &mut OfflineTurn, task: moe_memory_core::MemoryTask) { turn.task = task; }

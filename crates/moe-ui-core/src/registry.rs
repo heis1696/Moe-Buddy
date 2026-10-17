@@ -355,12 +355,15 @@ where
     /// 失效在途展示加载;已接纳的普通输入不受影响,票据化结果在
     /// 分发前按加载序号复验失效。序号耗尽明确报错,不回绕复用票据。
     fn invalidate_loads(&mut self) -> Result<(), UiError> {
-        self.load_epoch = next_load_epoch(self.load_epoch, &mut self.loads_exhausted)?;
+        let next_epoch = next_load_epoch(self.load_epoch, &mut self.loads_exhausted);
+        self.inputs.retain(|pending| pending.load_epoch.is_none());
+        self.load_epoch = next_epoch?;
         Ok(())
     }
 
     fn expire_loads(&mut self) {
         expire_load_epoch(&mut self.load_epoch, &mut self.loads_exhausted);
+        self.inputs.retain(|pending| pending.load_epoch.is_none());
     }
 
     pub(crate) fn pending_inputs(&self) -> usize {
@@ -401,9 +404,8 @@ where
     }
 
     fn bump_load_epoch(&mut self, stage: Stage) -> Result<(), OpFault> {
-        self.load_epoch = next_load_epoch(self.load_epoch, &mut self.loads_exhausted)
-            .map_err(|error| OpFault::new(stage, Box::new(error)))?;
-        Ok(())
+        self.invalidate_loads()
+            .map_err(|error| OpFault::new(stage, Box::new(error)))
     }
 
     /// 已有实例收到新入参;调用前先失效旧关闭确认,新入参可能改变控制器。
@@ -587,9 +589,8 @@ where
     }
 
     fn begin_load(&mut self) -> Result<u64, UiError> {
-        let epoch = next_load_epoch(self.load_epoch, &mut self.loads_exhausted)?;
-        self.load_epoch = epoch;
-        Ok(epoch)
+        self.invalidate_loads()?;
+        Ok(self.load_epoch)
     }
 
     fn begin_close(&mut self) -> Result<CloseDecision, OpFault> {
@@ -799,6 +800,13 @@ where
             .map(|instance| instance.handle().serial)
     }
 
+    fn find_pending_by_key(&self, key: &PanelKey) -> Option<PendingReleaseId> {
+        self.pending
+            .iter()
+            .find(|record| &record.key == key)
+            .map(|record| record.id)
+    }
+
     fn instance_mut(&mut self, serial: InstanceSerial) -> Option<&mut dyn ErasedPanel<Context>> {
         let index = self.find_index(serial)?;
         Some(self.instances[index].as_mut())
@@ -905,6 +913,7 @@ pub(crate) trait ErasedKind<Context> {
     fn live_count(&self) -> usize;
     fn pending_count(&self) -> usize;
     fn find_by_key(&self, key: &PanelKey) -> Option<InstanceSerial>;
+    fn find_pending_by_key(&self, key: &PanelKey) -> Option<PendingReleaseId>;
     fn instance_mut(&mut self, serial: InstanceSerial) -> Option<&mut dyn ErasedPanel<Context>>;
     fn take_instance(&mut self, serial: InstanceSerial) -> Option<Box<dyn ErasedPanel<Context>>>;
     fn describe(
@@ -962,6 +971,98 @@ pub(crate) fn erased_registration<Context: 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use crate::identity::PanelScope;
+
+    enum LoadTestEvent {
+        Plain(u8),
+        Ticketed(DropProbe),
+    }
+
+    struct DropProbe(Rc<Cell<usize>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    struct LoadTestController {
+        model: (),
+    }
+
+    impl UiController for LoadTestController {
+        type OpenArgs = ();
+        type Model = ();
+        type Event = LoadTestEvent;
+        type Error = std::io::Error;
+
+        fn model(&self) -> &Self::Model {
+            &self.model
+        }
+
+        fn apply(
+            &mut self,
+            _event: Self::Event,
+            _navigation: &mut NavSink<'_>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn revise(
+            &mut self,
+            _args: &Self::OpenArgs,
+            _navigation: &mut NavSink<'_>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn refresh(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn suspend(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn close_request(&mut self) -> CloseDecision {
+            CloseDecision::Allow
+        }
+
+        fn revoke(&mut self) {}
+
+        fn release(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    struct LoadTestView;
+
+    impl UiView for LoadTestView {
+        type Model = ();
+        type Event = LoadTestEvent;
+        type Context = ();
+        type Error = std::io::Error;
+
+        fn mount(&mut self, _context: &mut Self::Context) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn render(
+            &mut self,
+            _model: &Self::Model,
+            _context: &mut Self::Context,
+            _events: &mut EventSink<'_, Self::Event>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn unmount(&mut self, _context: &mut Self::Context) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn interaction_version_exhaustion_does_not_wrap() {
@@ -991,5 +1092,64 @@ mod tests {
         expire_load_epoch(&mut epoch, &mut release_exhausted);
         assert!(release_exhausted);
         assert!(!ticket_epoch_matches(epoch, release_exhausted, u64::MAX));
+    }
+
+    #[test]
+    fn live_panel_load_exhaustion_drops_tickets_and_preserves_plain_inputs() {
+        let dropped = Rc::new(Cell::new(0));
+        let serial = InstanceSerial::new(1).unwrap();
+        let handle = PanelHandle::new(1, 0, serial);
+        let key = PanelKey::new(
+            PanelKind::new("load-probe").unwrap(),
+            PanelScope::Application,
+        );
+        let mut panel = LivePanel::new(
+            handle,
+            key,
+            UiPanel::new(LoadTestController { model: () }, LoadTestView),
+            4,
+        );
+        panel.enqueue_plain(LoadTestEvent::Plain(1));
+        panel.enqueue_ticketed(
+            LoadTestEvent::Ticketed(DropProbe(Rc::clone(&dropped))),
+            u64::MAX,
+        );
+        panel.enqueue_plain(LoadTestEvent::Plain(2));
+        panel.load_epoch = u64::MAX;
+
+        let result = <LivePanel<LoadTestController, LoadTestView> as ErasedPanel<()>>::begin_load(
+            &mut panel,
+        );
+
+        assert!(matches!(result, Err(UiError::CapacityOverflow)));
+        assert_eq!(dropped.get(), 1);
+        assert_eq!(panel.pending_inputs(), 2);
+        let retained = panel
+            .inputs
+            .iter()
+            .map(|pending| match &pending.event {
+                LoadTestEvent::Plain(value) => Some(*value),
+                LoadTestEvent::Ticketed(probe) => {
+                    let _ = probe.0.get();
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retained, [Some(1), Some(2)]);
+        assert!(
+            panel
+                .inputs
+                .iter()
+                .all(|pending| pending.load_epoch.is_none())
+        );
+
+        assert!(matches!(
+            <LivePanel<LoadTestController, LoadTestView> as ErasedPanel<()>>::begin_load(
+                &mut panel
+            ),
+            Err(UiError::CapacityOverflow)
+        ));
+        assert_eq!(dropped.get(), 1);
+        assert_eq!(panel.pending_inputs(), 2);
     }
 }

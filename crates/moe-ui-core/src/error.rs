@@ -148,6 +148,10 @@ pub enum UiError {
     InstanceNotFound,
     /// 待重试释放记录不存在。
     PendingReleaseNotFound,
+    PendingReleaseForKey {
+        key: PanelKey,
+        record: PendingReleaseId,
+    },
     /// 实例不可见;不暗中显示。
     NotVisible,
     /// 首次打开缺少类型化入参。
@@ -222,6 +226,12 @@ impl fmt::Display for UiError {
                 formatter.write_str("panel instance not found for this handle")
             }
             Self::PendingReleaseNotFound => formatter.write_str("pending release record not found"),
+            Self::PendingReleaseForKey { key, record } => {
+                write!(
+                    formatter,
+                    "panel {key} still has pending release {record}; retry cleanup before reopening"
+                )
+            }
             Self::NotVisible => formatter.write_str("panel instance is not visible"),
             Self::MissingOpenArgs => formatter.write_str("first open requires typed open args"),
             Self::CloseBlockedByPendingInputs => formatter.write_str(

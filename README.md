@@ -2,12 +2,14 @@
 
 以独立陪伴 Agent 为目标的 Rust 项目：先建立稳定身份、私密/共享记忆与可信交流入口，再接入真实模型、渠道和桌宠表现。
 
+日用桌面第二步已接可配置模型后台请求及本地私密记忆／聊天恢复，详情见 [桌面说明](apps/moe-buddy-desktop/README.md)。API Key 和发送许可不落盘；当前验证为合成回环与恢复回归，完整实用性验收进入第三步，尚不声称真实模型服务验收。
+
 ## 当前状态
 
 - M0–M5、上下文精进与 G0–G5 的离线范围已交付；两项原文留存 P1 已修复。R0–R4 离线工程及程序流程执行层第一版已完成；R1/R4 真实模型与完整质量门仍未验证，最新独立测试清单和全链证据见 REVIEW。
 - 私密记忆按桌宠实例隔离，共享库可共阅不代表可共写；模型只提议，权限/来源/版本/取消及实际提交由可信服务裁决。
 - 已有预设、会话暂存、回收区、原文文件恢复、固定 CLI Hooks 适配及受控流程执行；流程首接离线 Agent prepare/infer/finish，不接管业务裁决。G6–G8 暂停，未完成真实模型/对外 HTTP 网关/微信/QQ/生产 Hooks 联调；记忆模型出站仅回环协议已验证。
-- 新增 UI 管理与呈现框架的 U1 纯 Rust 内核：类型化面板、作用域隔离、生命周期、焦点和有界驱动；补充复审的两项生命周期 P2 未修，暂不验收；真实 GUI 宿主与业务面板留待 U2 另行确认，不把无头回归称为界面验收。
+- UI 管理 U1 的两项生命周期 P2 已修并补正式回归；U2 已有可运行的本机浏览器文字聊天，实际复用记忆、预设、Agent 流程、诊断与 UI 管理，并完成真实浏览器闭环 smoke。当前明确为离线验收模式，独立复核尚未收口，不冒称真实模型联调。
 - 动画编排 A1 已集成主目录：不可变 Clip 元信息、动作图/状态绑定、抢占/暂停和注入式 `ClipPlayer` 的纯 Rust 内核；不等于素材已加载或真实画面已播放。素材/显示 A2 与工作台 A3 未纳入本次集成。
 - 架构基本分层，但夹具公开、会话职责集中等整理项仍存在；Agent 现经核心窄契约注入记忆门面，不把离线全绿当作生产闭环。
 
@@ -23,6 +25,33 @@
 | 修复、架构待整理项和验收证据 | [审核与验收](docs/REVIEW.md) |
 
 公开 API 与示例：[memory-search](crates/moe-memory-search/README.md)、[memory-core](crates/moe-memory-core/README.md)、[memory-local](crates/moe-memory-local/README.md)、[agent-runtime](crates/moe-agent-runtime/README.md)、[cli-hooks](crates/moe-cli-hooks/README.md)、[ui-core](crates/moe-ui-core/README.md)。raw-local 公开 API 见生成的 Rustdoc；旧项目原始材料见 [只读归档](docs/archive/pet-assistant/README.md)，不是现行实现说明。
+
+## Native desktop companion
+
+The product entry for the current slice is the Windows desktop host:
+
+```powershell
+cargo run -p moe-buddy-desktop --locked --offline
+```
+
+It opens a small always-on-top companion window and drives the same trusted `ChatApplication`
+directly from the native event loop. The character, chat bubble, send action, memory entry and
+activity drawer are desktop presentation concerns; business authorization remains in the Rust
+application layer. This build is still explicitly offline and in-memory, so it does not claim a
+real model, external channel, persistent memory or production animation assets.
+
+`moe-chat-host` remains the loopback HTTP/browser regression fixture. It is useful for protocol
+and browser smoke checks, but it is not the product entry.
+
+## 本机文字聊天
+
+```powershell
+cargo run -p moe-chat-host --locked --offline
+```
+
+在浏览器打开控制台输出的本机地址。聊天、模型预设、明确记住与运行日志均为真实面板；隐藏保留草稿，关闭有草稿时需要确认，关闭面板不等于销毁业务会话。当前使用明确标识的确定性离线回复；仅内存，关闭进程后聊天与记忆清空，不连接外部模型、不自动共享或落盘。
+
+业务边界见 [chat-app](crates/moe-chat-app/README.md)，启动、协议与浏览器验证见 [chat-host](apps/moe-chat-host/README.md)；原生桌面首版见 [moe-buddy-desktop](apps/moe-buddy-desktop/README.md)。桌面壳与动画只接表现适配，不成为聊天或记忆业务的权限来源。
 
 ## 验证
 
