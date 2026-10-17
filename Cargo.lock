@@ -628,15 +628,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "moe-chat-host"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.4.3",
- "moe-chat-app",
- "serde_json",
-]
-
-[[package]]
 name = "moe-cli-hooks"
 version = "0.1.0"
 dependencies = [

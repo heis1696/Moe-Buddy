@@ -9,7 +9,7 @@
 - M0–M5、上下文精进与 G0–G5 的离线范围已交付；两项原文留存 P1 已修复。R0–R4 离线工程及程序流程执行层第一版已完成；R1/R4 真实模型与完整质量门仍未验证，最新独立测试清单和全链证据见 REVIEW。
 - 私密记忆按桌宠实例隔离，共享库可共阅不代表可共写；模型只提议，权限/来源/版本/取消及实际提交由可信服务裁决。
 - 已有预设、会话暂存、回收区、原文文件恢复、固定 CLI Hooks 适配及受控流程执行；流程首接离线 Agent prepare/infer/finish，不接管业务裁决。G6–G8 暂停，未完成真实模型/对外 HTTP 网关/微信/QQ/生产 Hooks 联调；记忆模型出站仅回环协议已验证。
-- UI 管理 U1 的两项生命周期 P2 已修并补正式回归；U2 已有可运行的本机浏览器文字聊天，实际复用记忆、预设、Agent 流程、诊断与 UI 管理，并完成真实浏览器闭环 smoke。当前明确为离线验收模式，独立复核尚未收口，不冒称真实模型联调。
+- UI 管理 U1 的两项生命周期 P2 已修并补正式回归；U2 已交付 Windows 原生桌面首版，复用记忆、预设、Agent 流程、诊断与 UI 管理，并接入受控真实模型请求与本地恢复。浏览器验证宿主已移除，当前仍不冒称真实模型服务验收。
 - 动画编排 A1 已集成主目录：不可变 Clip 元信息、动作图/状态绑定、抢占/暂停和注入式 `ClipPlayer` 的纯 Rust 内核；不等于素材已加载或真实画面已播放。素材/显示 A2 与工作台 A3 未纳入本次集成。
 - 架构基本分层，但夹具公开、会话职责集中等整理项仍存在；Agent 现经核心窄契约注入记忆门面，不把离线全绿当作生产闭环。
 
@@ -40,18 +40,9 @@ activity drawer are desktop presentation concerns; business authorization remain
 application layer. This build is still explicitly offline and in-memory, so it does not claim a
 real model, external channel, persistent memory or production animation assets.
 
-`moe-chat-host` remains the loopback HTTP/browser regression fixture. It is useful for protocol
-and browser smoke checks, but it is not the product entry.
+## 业务边界与入口
 
-## 本机文字聊天
-
-```powershell
-cargo run -p moe-chat-host --locked --offline
-```
-
-在浏览器打开控制台输出的本机地址。聊天、模型预设、明确记住与运行日志均为真实面板；隐藏保留草稿，关闭有草稿时需要确认，关闭面板不等于销毁业务会话。当前使用明确标识的确定性离线回复；仅内存，关闭进程后聊天与记忆清空，不连接外部模型、不自动共享或落盘。
-
-业务边界见 [chat-app](crates/moe-chat-app/README.md)，启动、协议与浏览器验证见 [chat-host](apps/moe-chat-host/README.md)；原生桌面首版见 [moe-buddy-desktop](apps/moe-buddy-desktop/README.md)。桌面壳与动画只接表现适配，不成为聊天或记忆业务的权限来源。
+业务边界见 [chat-app](crates/moe-chat-app/README.md)，桌面入口见 [moe-buddy-desktop](apps/moe-buddy-desktop/README.md)。桌面壳与动画只接表现适配，不成为聊天或记忆业务的权限来源。
 
 ## 验证
 
@@ -65,4 +56,4 @@ cargo build --workspace --locked
 powershell -NoProfile -File scripts/check-docs.ps1
 ```
 
-不自行提交或推送，不默认放行云传输、全量用户查看或工具执行。
+提交与推送须用户明确授权；不默认放行云传输、全量用户查看或工具执行。
