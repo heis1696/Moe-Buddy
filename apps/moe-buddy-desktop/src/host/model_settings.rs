@@ -77,16 +77,21 @@ pub(super) unsafe fn save(pointer: *mut DesktopState) {
 }
 
 pub(super) unsafe fn start(pointer: *mut DesktopState) {
-    let main = {
+    let (main, waiting) = {
         let state = &mut *pointer;
-        let Some(input) = state.app.take_external_request() else {
+        let Some(request) = state.app.take_external_request() else {
             return;
         };
+        let (input, ticket) = request.into_parts();
         match crate::transport::start(input, state.model_key.clone()) {
-            Ok(worker) => state.model_worker = Some(worker),
+            Ok(worker) => {
+                state.model_worker = Some(worker);
+                state.model_ticket = Some(ticket);
+            }
             Err(_) => {
                 let now = elapsed_ms(state);
                 if let Err(error) = state.app.complete_external(
+                    ticket,
                     moe_agent_runtime::ModelOutcome::Failed(
                         moe_agent_runtime::ModelFailure::Unavailable,
                     ),
@@ -96,28 +101,37 @@ pub(super) unsafe fn start(pointer: *mut DesktopState) {
                 }
             }
         }
-        state.main
+        (state.main, state.model_worker.is_some())
     };
-    SetTimer(main, 9, 100, None);
+    if waiting {
+        SetTimer(main, 9, 100, None);
+    }
 }
 
 pub(super) unsafe fn poll(pointer: *mut DesktopState) {
     let main = {
         let state = &mut *pointer;
-        let Some(worker) = &state.model_worker else {
+        let Some(worker) = state.model_worker.take() else {
+            let main = state.main;
+            KillTimer(main, 9);
             return;
         };
         let reply = match worker.try_recv() {
             Ok(reply) => reply,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                state.model_worker = Some(worker);
+                return;
+            }
             Err(_) => crate::transport::Reply {
                 outcome: moe_agent_runtime::ModelOutcome::Unknown,
                 message: "请求线程已中断；结果未知，不会重发",
             },
         };
-        state.model_worker = None;
+        let Some(ticket) = state.model_ticket.take() else {
+            return;
+        };
         let now = elapsed_ms(state);
-        match state.app.complete_external(reply.outcome, now) {
+        match state.app.complete_external(ticket, reply.outcome, now) {
             Ok(()) => {
                 let severity = presenter::status(&state.app.snapshot()).severity;
                 state.view.error = Some((reply.message.into(), severity));

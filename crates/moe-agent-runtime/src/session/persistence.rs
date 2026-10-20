@@ -221,6 +221,67 @@ pub struct RawSnapshotV1 {
     fragments: Vec<SnapshotFragment>,
 }
 
+/// Result of a validated bounded snapshot decode. An over-budget result keeps
+/// control evidence and exact costs but exposes no partially decoded snapshot.
+#[derive(Debug)]
+pub struct RawSnapshotDecode {
+    snapshot: Option<RawSnapshotV1>,
+    domain: RawDomainKey,
+    event_count: usize,
+    decoded_event_count: usize,
+    body_bytes: usize,
+    decoded_body_bytes: usize,
+    latest_user_interaction: Option<(u64, Option<TerminalState>)>,
+    has_unsettled_user_interaction: bool,
+}
+
+impl RawSnapshotDecode {
+    pub fn domain(&self) -> &RawDomainKey {
+        &self.domain
+    }
+
+    pub fn event_count(&self) -> usize {
+        self.event_count
+    }
+
+    pub fn decoded_event_count(&self) -> usize {
+        self.decoded_event_count
+    }
+
+    pub fn body_bytes(&self) -> usize {
+        self.body_bytes
+    }
+
+    pub fn decoded_body_bytes(&self) -> usize {
+        self.decoded_body_bytes
+    }
+
+    pub fn latest_user_interaction(&self) -> Option<(u64, Option<TerminalState>)> {
+        self.latest_user_interaction
+    }
+
+    pub fn has_unsettled_user_interaction(&self) -> bool {
+        self.has_unsettled_user_interaction
+    }
+
+    pub fn into_snapshot(self) -> Option<RawSnapshotV1> {
+        self.snapshot
+    }
+}
+
+#[derive(Default)]
+struct SnapshotDecodeBudget {
+    max_events: usize,
+    max_body_bytes: usize,
+    event_count: usize,
+    decoded_event_count: usize,
+    body_bytes: usize,
+    decoded_body_bytes: usize,
+    exceeded: bool,
+    latest_user_interaction: Option<(u64, Option<TerminalState>)>,
+    has_unsettled_user_interaction: bool,
+}
+
 impl RawSnapshotV1 {
     pub fn domain(&self) -> &RawDomainKey {
         &self.domain
@@ -232,6 +293,65 @@ impl RawSnapshotV1 {
 
     pub fn fragment_count(&self) -> usize {
         self.fragments.len()
+    }
+
+    /// Count events across retained fragments without projecting their bodies.
+    pub fn retained_event_count(&self) -> usize {
+        self.fragments.iter().fold(0_usize, |total, fragment| {
+            total.saturating_add(fragment.events.len())
+        })
+    }
+
+    /// Count UTF-8 body bytes across retained fragments without returning text.
+    pub fn retained_body_bytes(&self) -> usize {
+        self.fragments.iter().fold(0_usize, |total, fragment| {
+            fragment
+                .events
+                .iter()
+                .fold(total, |total, event| total.saturating_add(event.body.len()))
+        })
+    }
+
+    /// Returns the latest user interaction's timestamp and terminal evidence.
+    /// `None` means the snapshot contains no user interaction; a missing terminal
+    /// value is evidence that the interaction was not durably settled.
+    pub fn latest_user_interaction(&self) -> Option<(u64, Option<TerminalState>)> {
+        let mut latest = None;
+        for event in self.fragments.iter().flat_map(|fragment| &fragment.events) {
+            if !matches!(event.role, EventRole::User | EventRole::UserHistory) {
+                continue;
+            }
+            if latest.is_none_or(|(received_ms, _)| event.received_ms >= received_ms) {
+                latest = Some((event.received_ms, event.terminal));
+            }
+        }
+        latest
+    }
+
+    /// Whether any retained user interaction lacks a durable terminal outcome.
+    /// This is independent of the display window and a newer completed turn does
+    /// not settle an earlier unresolved turn.
+    pub fn has_unsettled_user_interaction(&self) -> bool {
+        self.fragments
+            .iter()
+            .flat_map(|fragment| &fragment.events)
+            .any(|event| {
+                matches!(event.role, EventRole::User | EventRole::UserHistory)
+                    && matches!(
+                        event.terminal,
+                        None | Some(TerminalState::Unknown | TerminalState::Cancelled)
+                    )
+            })
+    }
+
+    /// Decode and validate a snapshot while materializing event bodies only
+    /// within the caller's bounded projection budget.
+    pub fn decode_bounded(
+        bytes: &[u8],
+        max_events: usize,
+        max_body_bytes: usize,
+    ) -> Result<RawSnapshotDecode, GatewayError> {
+        Self::decode_with_budget(bytes, max_events, max_body_bytes)
     }
 
     /// 按本文线格式编码；结构化内容相同则字节相同，超过总长上限失败。
@@ -264,6 +384,16 @@ impl RawSnapshotV1 {
     /// 校验枚举、标志、UTF-8、标识符与正文规则；随后执行与结构化导入
     /// 共享的语义/预算校验。坏档明确拒绝且不分配。
     pub fn decode(bytes: &[u8]) -> Result<Self, GatewayError> {
+        Self::decode_bounded(bytes, usize::MAX, usize::MAX)?
+            .snapshot
+            .ok_or(snapshot_error("unbounded snapshot decode exceeded budget"))
+    }
+
+    fn decode_with_budget(
+        bytes: &[u8],
+        max_events: usize,
+        max_body_bytes: usize,
+    ) -> Result<RawSnapshotDecode, GatewayError> {
         if bytes.len() > RAW_SNAPSHOT_MAX_TOTAL_BYTES {
             return Err(GatewayError::RawSnapshotInvalid(
                 "snapshot exceeds total byte budget",
@@ -321,8 +451,13 @@ impl RawSnapshotV1 {
         let highest_source_order = cursor.optional_u64()?;
         let fragment_count = cursor.u32()?;
         let mut fragments = Vec::new();
+        let mut budget = SnapshotDecodeBudget {
+            max_events,
+            max_body_bytes,
+            ..SnapshotDecodeBudget::default()
+        };
         for _ in 0..fragment_count {
-            fragments.push(decode_fragment(&mut cursor)?);
+            fragments.push(decode_fragment(&mut cursor, &mut budget)?);
         }
         if !cursor.is_empty() {
             return Err(GatewayError::RawSnapshotInvalid(
@@ -340,7 +475,18 @@ impl RawSnapshotV1 {
             fragments,
         };
         snapshot.validate_content()?;
-        Ok(snapshot)
+        let within_budget = !budget.exceeded;
+        let domain = snapshot.domain.clone();
+        Ok(RawSnapshotDecode {
+            snapshot: within_budget.then_some(snapshot),
+            domain,
+            event_count: budget.event_count,
+            decoded_event_count: budget.decoded_event_count,
+            body_bytes: budget.body_bytes,
+            decoded_body_bytes: budget.decoded_body_bytes,
+            latest_user_interaction: budget.latest_user_interaction,
+            has_unsettled_user_interaction: budget.has_unsettled_user_interaction,
+        })
     }
 
     /// 除提交时间外的规范内容 SHA-256 指纹：仅用于有界进程内重复判定，
@@ -839,7 +985,10 @@ fn decode_domain(cursor: &mut Cursor<'_>) -> Result<RawDomainKey, GatewayError> 
     })
 }
 
-fn decode_fragment(cursor: &mut Cursor<'_>) -> Result<SnapshotFragment, GatewayError> {
+fn decode_fragment(
+    cursor: &mut Cursor<'_>,
+    budget: &mut SnapshotDecodeBudget,
+) -> Result<SnapshotFragment, GatewayError> {
     let key = cursor.u64()?;
     let zone = match cursor.u8()? {
         0 => RetentionZone::Normal,
@@ -865,9 +1014,38 @@ fn decode_fragment(cursor: &mut Cursor<'_>) -> Result<SnapshotFragment, GatewayE
             7 => EventRole::Background,
             _ => return Err(snapshot_error("unknown event role")),
         };
-        let body = cursor.string()?;
-        validation::text(&body, RAW_SNAPSHOT_MAX_TOTAL_BYTES)
+        let body_length = usize::try_from(cursor.u32()?)
+            .map_err(|_| snapshot_error("length exceeds platform usize"))?;
+        let body_bytes = cursor.take(body_length)?;
+        let body_text = std::str::from_utf8(body_bytes)
+            .map_err(|_| snapshot_error("field is not valid UTF-8"))?;
+        validation::text(body_text, RAW_SNAPSHOT_MAX_TOTAL_BYTES)
             .map_err(|_| snapshot_error("event body is invalid"))?;
+        budget.event_count = budget
+            .event_count
+            .checked_add(1)
+            .ok_or(snapshot_error("event count overflow"))?;
+        budget.body_bytes = budget
+            .body_bytes
+            .checked_add(body_length)
+            .ok_or(snapshot_error("body byte count overflow"))?;
+        let body_fits = !budget.exceeded
+            && budget.event_count <= budget.max_events
+            && budget.body_bytes <= budget.max_body_bytes;
+        let body = if body_fits {
+            budget.decoded_event_count = budget
+                .decoded_event_count
+                .checked_add(1)
+                .ok_or(snapshot_error("decoded event count overflow"))?;
+            budget.decoded_body_bytes = budget
+                .decoded_body_bytes
+                .checked_add(body_length)
+                .ok_or(snapshot_error("decoded body byte count overflow"))?;
+            body_text.to_owned()
+        } else {
+            budget.exceeded = true;
+            String::new()
+        };
         let received_ms = cursor.u64()?;
         let parent_ordinal = cursor.u32()? as usize;
         if parent_ordinal >= ordinal {
@@ -885,6 +1063,18 @@ fn decode_fragment(cursor: &mut Cursor<'_>) -> Result<SnapshotFragment, GatewayE
             4 => Some(TerminalState::Unknown),
             _ => return Err(snapshot_error("unknown terminal state")),
         };
+        if matches!(role, EventRole::User | EventRole::UserHistory) {
+            if budget
+                .latest_user_interaction
+                .is_none_or(|(latest_ms, _)| received_ms >= latest_ms)
+            {
+                budget.latest_user_interaction = Some((received_ms, terminal));
+            }
+            budget.has_unsettled_user_interaction |= matches!(
+                terminal,
+                None | Some(TerminalState::Unknown | TerminalState::Cancelled)
+            );
+        }
         let acknowledgement = match cursor.u8()? {
             0 => None,
             1 => Some(BatchAcknowledgement::Confirmed),
@@ -1839,6 +2029,77 @@ mod tests {
             terminal: Some(TerminalState::Completed),
             acknowledgement: Some(BatchAcknowledgement::Confirmed),
         }
+    }
+
+    #[test]
+    fn older_unsettled_interaction_survives_newer_completed_interactions_and_bounded_decode() {
+        let mut events = Vec::new();
+        let mut unresolved = test_event(EventRole::User);
+        unresolved.body = String::from("synthetic earliest unresolved");
+        unresolved.received_ms = 5;
+        unresolved.terminal = None;
+        unresolved.acknowledgement = None;
+        unresolved.host_event_id = Some(String::from("host-0"));
+        events.push(unresolved);
+        for index in 1..=64_u64 {
+            let mut event = test_event(EventRole::User);
+            event.body = String::from("synthetic completed interaction");
+            event.received_ms = index + 5;
+            event.terminal = Some(TerminalState::Completed);
+            event.acknowledgement = None;
+            event.host_event_id = Some(format!("host-{index}"));
+            event.client_request_hint = Some(format!("client-{index}"));
+            events.push(event);
+        }
+        let snapshot = RawSnapshotV1 {
+            domain: test_domain("hint"),
+            committed_at_ms: 1_000,
+            authorization_revision: 1,
+            exhausted: false,
+            revoked_host_event_ids: Vec::new(),
+            revoked_fragment_keys: Vec::new(),
+            highest_source_order: None,
+            fragments: vec![SnapshotFragment {
+                key: 1,
+                zone: RetentionZone::Normal,
+                created_at_ms: 1,
+                normal_deadline_ms: 2_000,
+                hard_deadline_ms: 3_000,
+                final_deadline_ms: Some(3_000),
+                lifecycle_version: 0,
+                processed_through: 0,
+                events,
+            }],
+        };
+        let bytes = snapshot.encode().unwrap();
+        let decoded = RawSnapshotV1::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.latest_user_interaction(),
+            Some((69, Some(TerminalState::Completed)))
+        );
+        assert!(decoded.has_unsettled_user_interaction());
+
+        let bounded = RawSnapshotV1::decode_bounded(&bytes, 64, usize::MAX).unwrap();
+        assert_eq!(bounded.event_count(), 65);
+        assert_eq!(bounded.decoded_event_count(), 64);
+        assert_eq!(
+            bounded.decoded_body_bytes(),
+            "synthetic earliest unresolved".len() + 63 * "synthetic completed interaction".len()
+        );
+        assert_eq!(
+            bounded.latest_user_interaction(),
+            Some((69, Some(TerminalState::Completed)))
+        );
+        assert!(bounded.has_unsettled_user_interaction());
+        assert!(bounded.into_snapshot().is_none());
+
+        let retention = RawRetention::new(10_000, 10_000, 8, 256, 65_536).unwrap();
+        let swept = decoded.sweep_expired(1_001, &retention).unwrap();
+        assert!(swept.snapshot.has_unsettled_user_interaction());
+        let finally_expired = decoded.sweep_expired(3_000, &retention).unwrap();
+        assert_eq!(finally_expired.removed, 1);
+        assert!(!finally_expired.snapshot.has_unsettled_user_interaction());
+        assert!(decoded.has_unsettled_user_interaction());
     }
 
     #[test]

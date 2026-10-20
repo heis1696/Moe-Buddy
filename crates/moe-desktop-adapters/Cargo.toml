@@ -1,0 +1,23 @@
+[package]
+name = "moe-desktop-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+getrandom = "=0.4.3"
+moe-agent-runtime = { path = "../moe-agent-runtime" }
+moe-chat-app = { path = "../moe-chat-app" }
+moe-memory-core = { path = "../moe-memory-core" }
+moe-memory-local = { path = "../moe-memory-local" }
+moe-raw-local = { path = "../moe-raw-local" }
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls"] }
+serde_json = "=1.0.154"
+tokio = { version = "=1.53.2", default-features = false, features = ["rt", "net", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

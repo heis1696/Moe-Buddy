@@ -84,9 +84,9 @@ fn report_failure(cell: &FailureCell, error: AppError) {
 }
 
 /// 面板打开入参；控制器据此固定归属，普通修订不重置草稿。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PanelArgs {
-    pub companion: &'static str,
+    pub companion: String,
 }
 
 /// 聊天面板事件。
@@ -94,6 +94,8 @@ pub struct PanelArgs {
 pub enum ChatEvent {
     /// Refresh the view after a trusted asynchronous result.
     TransportRefresh,
+    /// Replace the selected logical session draft and refresh its trusted history.
+    SessionChanged { draft: String },
     /// 更新聊天草稿。
     DraftChanged(String),
     /// 以当前草稿发起一轮可信发送。
@@ -107,6 +109,10 @@ pub struct ChatModel {
     pub messages: Vec<ChatMessage>,
     pub status: ChatStatus,
     pub failure: Option<String>,
+    /// Turn identity whose staged projection was the last one loaded from the
+    /// trusted core. The view copies it into the display cache only on a real
+    /// render, which is the evidence the application uses to finish `publish`.
+    publication: Option<u64>,
 }
 
 impl ChatModel {
@@ -116,6 +122,7 @@ impl ChatModel {
             messages: Vec::new(),
             status: ChatStatus::Ready,
             failure: None,
+            publication: None,
         }
     }
 }
@@ -127,6 +134,8 @@ pub struct ChatDisplay {
     pub messages: Vec<ChatMessage>,
     pub status: ChatStatus,
     pub failure: Option<String>,
+    /// Last turn identity written by the real view render callback.
+    pub(crate) publication: Option<u64>,
 }
 
 impl ChatDisplay {
@@ -136,13 +145,14 @@ impl ChatDisplay {
             messages: Vec::new(),
             status: ChatStatus::Ready,
             failure: None,
+            publication: None,
         }
     }
 }
 
 /// 聊天面板控制器：草稿编辑与发送都必须经此处进入可信链路。
 pub struct ChatController {
-    companion: &'static str,
+    companion: String,
     core: Rc<RefCell<ChatCore>>,
     failures: FailureCell,
     model: ChatModel,
@@ -151,12 +161,12 @@ pub struct ChatController {
 
 impl ChatController {
     /// 控制器在工厂期固定的稳定归属；只读展示用途。
-    pub fn companion(&self) -> &'static str {
-        self.companion
+    pub fn companion(&self) -> &str {
+        &self.companion
     }
 
     pub(crate) fn new(
-        companion: &'static str,
+        companion: String,
         core: Rc<RefCell<ChatCore>>,
         failures: FailureCell,
     ) -> Self {
@@ -172,6 +182,14 @@ impl ChatController {
     fn handle(&mut self, event: ChatEvent) -> Result<(), PanelError> {
         match event {
             ChatEvent::TransportRefresh => self.refresh(),
+            ChatEvent::SessionChanged { draft } => {
+                if draft.len() > MAX_TEXT_BYTES {
+                    return Err(PanelError::rejected("chat-session", "input_too_large"));
+                }
+                self.model.draft = draft;
+                self.pending_draft = None;
+                self.refresh()
+            }
             ChatEvent::DraftChanged(text) => {
                 if text.len() > MAX_TEXT_BYTES {
                     return Err(PanelError::rejected("chat-draft", "input_too_large"));
@@ -203,6 +221,7 @@ impl ChatController {
                             .map_err(|_| PanelError::rejected("chat-refresh", "revoked"))?;
                         self.model.status = history.status;
                         self.model.failure = history.failure;
+                        self.model.publication = self.core.borrow().pending_publication();
                         if self.model.status == ChatStatus::Sending {
                             self.pending_draft = Some(draft);
                         }
@@ -210,6 +229,7 @@ impl ChatController {
                     }
                     Err(error) => {
                         self.model.draft = draft;
+                        self.model.publication = None;
                         let history = self
                             .core
                             .borrow()
@@ -250,7 +270,7 @@ impl UiController for ChatController {
         args: &PanelArgs,
         _navigation: &mut NavSink<'_>,
     ) -> Result<(), PanelError> {
-        self.companion = args.companion;
+        self.companion.clone_from(&args.companion);
         Ok(())
     }
 
@@ -263,6 +283,7 @@ impl UiController for ChatController {
         self.model.messages = history.messages;
         self.model.status = history.status;
         self.model.failure = history.failure;
+        self.model.publication = self.core.borrow().pending_publication();
         if self.model.status != ChatStatus::Sending
             && let Some(draft) = self.pending_draft.take()
             && self.model.status == ChatStatus::Failed
@@ -330,6 +351,7 @@ impl UiView for ChatView {
             messages: model.messages.clone(),
             status: model.status,
             failure: model.failure.clone(),
+            publication: model.publication,
         };
         Ok(())
     }
@@ -377,7 +399,7 @@ pub struct PresetsDisplay {
 
 /// 预设面板控制器：切换走真实 `PresetRegistry` 逐用途重绑。
 pub struct PresetsController {
-    companion: &'static str,
+    companion: String,
     core: Rc<RefCell<ChatCore>>,
     failures: FailureCell,
     model: PresetsModel,
@@ -385,12 +407,12 @@ pub struct PresetsController {
 
 impl PresetsController {
     /// 控制器在工厂期固定的稳定归属；只读展示用途。
-    pub fn companion(&self) -> &'static str {
-        self.companion
+    pub fn companion(&self) -> &str {
+        &self.companion
     }
 
     pub(crate) fn new(
-        companion: &'static str,
+        companion: String,
         core: Rc<RefCell<ChatCore>>,
         failures: FailureCell,
     ) -> Self {
@@ -441,7 +463,7 @@ impl UiController for PresetsController {
         args: &PanelArgs,
         _navigation: &mut NavSink<'_>,
     ) -> Result<(), PanelError> {
-        self.companion = args.companion;
+        self.companion.clone_from(&args.companion);
         Ok(())
     }
 
@@ -552,7 +574,7 @@ pub struct MemoryDisplay {
 
 /// 记忆面板控制器。
 pub struct MemoryController {
-    companion: &'static str,
+    companion: String,
     core: Rc<RefCell<ChatCore>>,
     failures: FailureCell,
     model: MemoryModel,
@@ -572,12 +594,12 @@ impl MemoryController {
         }
     }
     /// 控制器在工厂期固定的稳定归属；只读展示用途。
-    pub fn companion(&self) -> &'static str {
-        self.companion
+    pub fn companion(&self) -> &str {
+        &self.companion
     }
 
     pub(crate) fn new(
-        companion: &'static str,
+        companion: String,
         core: Rc<RefCell<ChatCore>>,
         failures: FailureCell,
     ) -> Self {
@@ -678,7 +700,7 @@ impl UiController for MemoryController {
         args: &PanelArgs,
         _navigation: &mut NavSink<'_>,
     ) -> Result<(), PanelError> {
-        self.companion = args.companion;
+        self.companion.clone_from(&args.companion);
         Ok(())
     }
 
@@ -770,7 +792,7 @@ pub struct DiagnosticsDisplay {
 
 /// 诊断面板控制器。
 pub struct DiagnosticsController {
-    companion: &'static str,
+    companion: String,
     core: Rc<RefCell<ChatCore>>,
     failures: FailureCell,
     model: DiagnosticsModel,
@@ -778,12 +800,12 @@ pub struct DiagnosticsController {
 
 impl DiagnosticsController {
     /// 控制器在工厂期固定的稳定归属；只读展示用途。
-    pub fn companion(&self) -> &'static str {
-        self.companion
+    pub fn companion(&self) -> &str {
+        &self.companion
     }
 
     pub(crate) fn new(
-        companion: &'static str,
+        companion: String,
         core: Rc<RefCell<ChatCore>>,
         failures: FailureCell,
     ) -> Self {
@@ -832,7 +854,7 @@ impl UiController for DiagnosticsController {
         args: &PanelArgs,
         _navigation: &mut NavSink<'_>,
     ) -> Result<(), PanelError> {
-        self.companion = args.companion;
+        self.companion.clone_from(&args.companion);
         Ok(())
     }
 

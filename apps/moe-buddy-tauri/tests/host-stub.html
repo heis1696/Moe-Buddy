@@ -1,0 +1,584 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Moe Buddy frontend DOM smoke (test-only host stub)</title>
+    <style>
+      #assertions {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      仅用于测试边界：伪造最小 Tauri internals，验证 Vue 页面在浏览器中的挂载与交互。
+      不是生产兜底，也不会被 index.html 或 Vite 构建载入。
+
+      本桩实现的是本轮冻结宿主合同：
+      - snapshot/dispatch/事件统一为 { snapshot, error }，snapshot/error 两字段必须同时存在；
+      - 读取与派发仅 main，来源拒绝只返回错误、不附聊天数据；
+      - 窗口命令含 show_pet/hide_pet，show/hide/pause 两窗可用，拖动仅 pet，退出仅 main；
+      - chat.failure 为字符串或 null，不再接受任意结构。
+    -->
+    <div id="app"></div>
+    <pre id="assertions">TEST_STATUS=FAIL (not finished)</pre>
+    <script>
+      (function () {
+        const params = new URLSearchParams(location.search);
+        const windowLabel = params.get('window') === 'pet' ? 'pet' : 'main';
+        const failMask = params.get('failMask') === '1';
+        const unknownStatus = params.get('unknown') === '1';
+        const sendTimeout = params.get('sendTimeout') === '1';
+        const state = {
+          revision: 1,
+          presentationRevision: 1,
+          mode: 'offline',
+          revoked: false,
+          closeConfirmation: false,
+          closeIntent: null,
+          managementDraft: { version: 0, dirty: false },
+          managementExit: null,
+          managementDiscardedVersion: null,
+          chat: {
+            draft: '',
+            messages: [{ role: 'assistant', text: '离线问候' }],
+            status: unknownStatus ? 'unknown' : 'ready',
+            failure: unknownStatus ? 'send_unknown' : null,
+          },
+        };
+        const calls = [];
+        const windowCommands = [];
+        const maskCalls = [];
+        const errors = [];
+        const handlers = new Map();
+        const listeners = new Map();
+        let nextCallbackId = 1;
+        let nextListenerId = 1;
+
+        function clone() {
+          return JSON.parse(JSON.stringify(state));
+        }
+
+        function bump() {
+          state.revision += 1;
+          state.presentationRevision += 1;
+        }
+
+        function envelope(error) {
+          return { snapshot: clone(), error: error ?? null };
+        }
+
+        function rejected(code, message) {
+          // 来源拒绝不返回聊天数据。
+          return { snapshot: null, error: { code, message, disposition: 'not_executed' } };
+        }
+
+        function emit(event, payload) {
+          for (const listener of Array.from(listeners.values())) {
+            if (listener.event !== event) continue;
+            const callback = handlers.get(listener.id);
+            if (typeof callback !== 'function') continue;
+            callback({ event, id: listener.id, payload });
+          }
+        }
+
+        function emitSnapshot() {
+          // 宿主只把 snapshot 事件定向发送 main。
+          if (windowLabel !== 'main') return;
+          emit('prototype://snapshot', envelope(null));
+        }
+
+        function dispatchCommand(payload) {
+          if (windowLabel !== 'main') {
+            return rejected('command_source', 'chat commands are main-window only');
+          }
+          switch (payload.kind) {
+            case 'set_draft':
+              state.chat.draft = payload.text;
+              bump();
+              break;
+            case 'send':
+              if (sendTimeout) {
+                // 模拟宿主执行超时：命令可能仍在队列中，不能假定未执行。
+                return envelope({
+                  code: 'host_timeout',
+                  message: 'host did not complete the command',
+                  disposition: 'unknown',
+                });
+              }
+              if (state.chat.status !== 'ready' && state.chat.status !== 'failed') {
+                state.chat.failure = 'send_unknown';
+                return envelope({
+                  code: 'send_unknown',
+                  message: 'new admission blocked by a quarantined interaction',
+                  disposition: 'not_executed',
+                });
+              }
+              state.chat.messages.push({ role: 'user', text: state.chat.draft });
+              state.chat.draft = '';
+              state.chat.messages.push({ role: 'assistant', text: '测试桩离线回复' });
+              state.chat.status = 'ready';
+              state.chat.failure = null;
+              bump();
+              break;
+            case 'hide_chat':
+              state.mode = 'pet';
+              bump();
+              break;
+            case 'close_chat':
+              state.closeConfirmation = true;
+              state.closeIntent = 'close_chat';
+              bump();
+              break;
+            case 'confirm_close':
+              state.closeConfirmation = false;
+              state.closeIntent = null;
+              if (payload.discard) state.chat.draft = '';
+              bump();
+              break;
+            case 'revoke':
+              state.revoked = true;
+              state.chat.draft = '';
+              state.chat.messages = [];
+              state.chat.status = 'ready';
+              state.chat.failure = null;
+              bump();
+              break;
+            default:
+              return envelope({
+                code: 'invalid_command',
+                message: 'unsupported chat command',
+                disposition: 'not_executed',
+              });
+          }
+          emitSnapshot();
+          return envelope(null);
+        }
+
+        window.addEventListener('error', (event) => {
+          errors.push(String(event.message || 'window error'));
+        });
+        window.addEventListener('unhandledrejection', (event) => {
+          errors.push(String(event.reason || 'unhandled rejection'));
+        });
+
+        window.isTauri = true;
+        window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+          unregisterListener(event, eventId) {
+            listeners.delete(eventId);
+          },
+        };
+        window.__TAURI_INTERNALS__ = {
+          metadata: { currentWindow: { label: windowLabel } },
+          transformCallback(callback) {
+            const id = nextCallbackId;
+            nextCallbackId += 1;
+            handlers.set(id, callback);
+            return id;
+          },
+          invoke(command, args) {
+            calls.push({ command, args });
+            if (command === 'plugin:event|listen') {
+              const id = args.handler;
+              listeners.set(id, { event: args.event, id });
+              return Promise.resolve(id);
+            }
+            if (command === 'plugin:event|unlisten') {
+              listeners.delete(args.eventId);
+              return Promise.resolve(null);
+            }
+            if (command === 'prototype_snapshot') {
+              if (windowLabel !== 'main') {
+                return Promise.resolve(
+                  rejected('command_source', 'chat snapshot is main-window only'),
+                );
+              }
+              return Promise.resolve({ snapshot: clone(), error: null });
+            }
+            if (command === 'prototype_dispatch') {
+              return Promise.resolve(dispatchCommand(args.command));
+            }
+            if (command === 'prototype_window') {
+              const allowed = {
+                show_chat: ['main', 'pet'],
+                hide_chat: ['main', 'pet'],
+                show_pet: ['main', 'pet'],
+                hide_pet: ['main', 'pet'],
+                toggle_pause: ['main', 'pet'],
+                start_dragging: ['pet'],
+                quit: ['main'],
+              };
+              const labels = allowed[args.command];
+              if (labels === undefined || !labels.includes(windowLabel)) {
+                return Promise.reject(new Error('window command rejected'));
+              }
+              windowCommands.push(args.command);
+              return Promise.resolve(null);
+            }
+            if (command === 'prototype_set_hit_mask') {
+              if (windowLabel !== 'pet') {
+                return Promise.reject(new Error('hit mask is pet-only'));
+              }
+              maskCalls.push({ width: args.width, height: args.height, alpha: args.alpha });
+              if (failMask) {
+                return Promise.reject(new Error('simulated alpha region install failure'));
+              }
+              return Promise.resolve(null);
+            }
+            if (command === 'prototype_frame') {
+              return Promise.resolve({ frameIndex: 2, paused: false });
+            }
+            return Promise.reject(new Error('unexpected command: ' + command));
+          },
+        };
+
+        window.__TEST__ = {
+          windowLabel,
+          failMask,
+          unknownStatus,
+          sendTimeout,
+          calls,
+          windowCommands,
+          maskCalls,
+          errors,
+          listeners,
+        };
+      })();
+    </script>
+    <script type="module">
+      import '/src/main.ts';
+
+      const results = [];
+      const test = window.__TEST__;
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+      function check(name, condition, detail) {
+        results.push({ name, ok: Boolean(condition), detail: detail ?? '' });
+      }
+
+      async function waitFor(predicate, timeout = 4000) {
+        const started = Date.now();
+        while (Date.now() - started < timeout) {
+          const value = predicate();
+          if (value) return value;
+          await sleep(20);
+        }
+        return null;
+      }
+
+      function buttons() {
+        return Array.from(document.querySelectorAll('button'));
+      }
+
+      function buttonWithText(text) {
+        return buttons().find((button) => button.textContent.trim() === text) ?? null;
+      }
+
+      function dispatchCount(kind) {
+        return test.calls.filter(
+          (call) => call.command === 'prototype_dispatch' && call.args.command.kind === kind,
+        ).length;
+      }
+
+      function sendCount() {
+        return dispatchCount('send');
+      }
+
+      function windowCommandCount(command) {
+        return test.windowCommands.filter((item) => item === command).length;
+      }
+
+      function setTextarea(textarea, value) {
+        textarea.value = value;
+        textarea.dispatchEvent(new InputEvent('input', { bubbles: true, data: value }));
+      }
+
+      async function runMain() {
+        const textarea = await waitFor(() => document.querySelector('#chat-input'));
+        check('main view mounts', textarea instanceof HTMLTextAreaElement);
+        check(
+          'offline status is explicit',
+          document.body.textContent.includes('离线验证') &&
+            document.body.textContent.includes('不连接真实模型'),
+        );
+        check('initial host message renders', document.body.textContent.includes('离线问候'));
+        check('no error banner on boot', document.querySelector('.error-banner') === null);
+
+        if (!(textarea instanceof HTMLTextAreaElement)) return;
+
+        if (test.unknownStatus) {
+          const unknownBefore = sendCount();
+          setTextarea(textarea, '未知状态草稿');
+          await waitFor(() => dispatchCount('set_draft') > 0);
+          textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+          await sleep(80);
+          check('unknown status blocks Enter send', sendCount() === unknownBefore);
+          check('unknown send button is disabled', buttonWithText('发送')?.disabled === true);
+          check(
+            'unknown blockade is explicit',
+            document.body.textContent.includes('结果未知') &&
+              document.body.textContent.includes('不要重复发送'),
+          );
+          check('unknown keeps composer editable', textarea.disabled === false);
+          return;
+        }
+
+        if (test.sendTimeout) {
+          setTextarea(textarea, '超时消息');
+          await waitFor(() => dispatchCount('set_draft') > 0);
+          const timeoutBefore = sendCount();
+          textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+          await waitFor(() => sendCount() === timeoutBefore + 1);
+          await waitFor(() => document.body.textContent.includes('不要重复操作'));
+          check(
+            'unconfirmed timeout is explicit and discourages resend',
+            document.body.textContent.includes('未确认') &&
+              document.body.textContent.includes('不要重复操作'),
+          );
+          await waitFor(() => buttonWithText('重新读取状态') !== null);
+          check('unconfirmed command locks send', buttonWithText('发送')?.disabled === true);
+          textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+          await sleep(80);
+          check('unconfirmed command does not resend', sendCount() === timeoutBefore + 1);
+          buttonWithText('重新读取状态')?.click();
+          await waitFor(() => buttonWithText('重新读取状态') === null);
+          await waitFor(() => buttonWithText('发送')?.disabled === false);
+          check(
+            're-reading host state unlocks send',
+            buttonWithText('发送')?.disabled === false,
+          );
+          return;
+        }
+
+        setTextarea(textarea, '你好');
+        await waitFor(() => dispatchCount('set_draft') > 0 && stateDraftSynced());
+        function stateDraftSynced() {
+          return test.calls.some(
+            (call) =>
+              call.command === 'prototype_dispatch' &&
+              call.args.command.kind === 'set_draft' &&
+              call.args.command.text === '你好',
+          );
+        }
+        check('draft syncs through dispatch', stateDraftSynced());
+
+        const beforeIme = sendCount();
+        textarea.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+        setTextarea(textarea, '你好世界');
+        textarea.dispatchEvent(
+          new InputEvent('input', { bubbles: true, data: '世界', isComposing: true }),
+        );
+        textarea.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'Enter',
+            bubbles: true,
+            isComposing: true,
+          }),
+        );
+        await sleep(80);
+        check('IME composing Enter does not send', sendCount() === beforeIme);
+
+        textarea.dispatchEvent(
+          new CompositionEvent('compositionend', { bubbles: true, data: '世界' }),
+        );
+        await sleep(40);
+        textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        await waitFor(() => sendCount() > beforeIme);
+        check('Enter after composition sends once', sendCount() === beforeIme + 1);
+        await waitFor(() => document.body.textContent.includes('你好世界'));
+        await waitFor(() => document.body.textContent.includes('测试桩离线回复'));
+        check('sent message and host reply render', document.body.textContent.includes('你好世界'));
+
+        const beforeShift = sendCount();
+        setTextarea(textarea, '换行测试');
+        await sleep(40);
+        textarea.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true }),
+        );
+        await sleep(60);
+        check('Shift+Enter does not send', sendCount() === beforeShift);
+
+        buttonWithText('关闭聊天')?.click();
+        await waitFor(() => document.querySelector('.dialog') !== null);
+        check('close chat asks for confirmation', document.querySelector('.dialog') !== null);
+        buttonWithText('取消')?.click();
+        await waitFor(() => document.querySelector('.dialog') === null);
+        check('close confirmation cancel dismisses dialog', document.querySelector('.dialog') === null);
+        buttonWithText('关闭聊天')?.click();
+        await waitFor(() => document.querySelector('.dialog') !== null);
+        buttonWithText('丢弃草稿并关闭')?.click();
+        await waitFor(() => document.querySelector('.dialog') === null);
+        check('close confirmation discard dismisses dialog', document.querySelector('.dialog') === null);
+
+        const hideWindowBefore = windowCommandCount('hide_chat');
+        const hideDispatchBefore = dispatchCount('hide_chat');
+        buttonWithText('显示宠物')?.click();
+        await waitFor(() => windowCommandCount('show_pet') > 0);
+        check('show pet calls show_pet window command', windowCommandCount('show_pet') === 1);
+        check(
+          'show pet does not hide chat or dispatch HideChat',
+          windowCommandCount('hide_chat') === hideWindowBefore &&
+            dispatchCount('hide_chat') === hideDispatchBefore,
+        );
+
+        buttonWithText('隐藏聊天')?.click();
+        await waitFor(() => windowCommandCount('hide_chat') === hideWindowBefore + 1);
+        check('hide chat is a separate window operation', windowCommandCount('hide_chat') === hideWindowBefore + 1);
+
+        const pauseButton = buttons().find((button) => /暂停|继续/.test(button.textContent));
+        pauseButton?.click();
+        await waitFor(() => windowCommandCount('toggle_pause') > 0);
+        check('pet pause entry reaches host', windowCommandCount('toggle_pause') === 1);
+
+        buttonWithText('撤回授权')?.click();
+        await waitFor(() => document.querySelector('.inline-confirm') !== null);
+        check('revoke asks for confirmation', document.querySelector('.inline-confirm') !== null);
+        buttonWithText('确认撤回')?.click();
+        await waitFor(() => document.body.textContent.includes('授权已撤回'));
+        check('revoke clears messages from view', !document.body.textContent.includes('你好世界'));
+        check('revoked composer is disabled', textarea.disabled);
+        check(
+          'revoked page has no re-authorize button',
+          !buttons().some((button) => button.textContent.trim() === '重新授权'),
+        );
+      }
+
+      function alphaAt(context, dpr, x, y) {
+        return context.getImageData(Math.round(x * dpr), Math.round(y * dpr), 1, 1).data[3];
+      }
+
+      async function runPet() {
+        const canvas = await waitFor(() => document.querySelector('canvas.pet-canvas'));
+        check('pet view mounts', canvas instanceof HTMLCanvasElement);
+        if (!(canvas instanceof HTMLCanvasElement)) return;
+
+        const dpr = Math.max(1, window.devicePixelRatio || 1);
+        const expectedWidth = Math.max(1, Math.round(window.innerWidth * dpr));
+        const expectedHeight = Math.max(1, Math.round(window.innerHeight * dpr));
+        check(
+          'canvas backing store follows DPR',
+          canvas.width === expectedWidth && canvas.height === expectedHeight,
+          `${canvas.width}x${canvas.height} vs ${expectedWidth}x${expectedHeight}`,
+        );
+
+        const context = canvas.getContext('2d');
+        const cssSize = Math.min(window.innerWidth, window.innerHeight);
+        const offsetX = (window.innerWidth - cssSize) / 2;
+        const offsetY = (window.innerHeight - cssSize) / 2;
+        const headX = (offsetX + cssSize * 0.5) * dpr;
+        const headY = (offsetY + cssSize * 0.42) * dpr;
+        const cornerAlpha = context.getImageData(0, 0, 1, 1).data[3];
+        const bodyAlpha = context.getImageData(Math.round(headX), Math.round(headY), 1, 1).data[3];
+        check('canvas corner is transparent', cornerAlpha === 0, String(cornerAlpha));
+        check('canvas body is opaque', bodyAlpha === 255, String(bodyAlpha));
+
+        await waitFor(() => document.querySelector('.sr-only')?.textContent.includes('第 3 帧'));
+        check(
+          'Rust-provided frame index is rendered',
+          document.querySelector('.sr-only')?.textContent.includes('第 3 帧'),
+          document.querySelector('.sr-only')?.textContent ?? '',
+        );
+
+        await waitFor(() => test.maskCalls.length > 0);
+        const mask = test.maskCalls[0];
+        check('hit mask is sent', mask !== undefined);
+        if (mask !== undefined) {
+          check(
+            'hit mask budget and shape',
+            mask.width <= 256 &&
+              mask.height <= 256 &&
+              mask.alpha.length === mask.width * mask.height &&
+              mask.alpha.every((value) => Number.isInteger(value) && value >= 0 && value <= 255),
+            `${mask.width}x${mask.height}`,
+          );
+          const centerIndex =
+            Math.floor(mask.height / 2) * mask.width + Math.floor(mask.width / 2);
+          check('hit mask covers pet body', mask.alpha[centerIndex] > 0, String(mask.alpha[centerIndex]));
+          check('hit mask leaves corner transparent', mask.alpha[0] === 0, String(mask.alpha[0]));
+        }
+
+        check(
+          'pet page background is transparent',
+          getComputedStyle(document.documentElement).backgroundColor === 'rgba(0, 0, 0, 0)' &&
+            getComputedStyle(document.body).backgroundColor === 'rgba(0, 0, 0, 0)',
+          `${getComputedStyle(document.documentElement).backgroundColor} / ${getComputedStyle(document.body).backgroundColor}`,
+        );
+
+        const stage = document.querySelector('.pet-stage');
+        if (stage !== null) {
+          const pointer = (type, x, y, pointerId) =>
+            stage.dispatchEvent(
+              new PointerEvent(type, {
+                bubbles: true,
+                button: 0,
+                pointerId,
+                screenX: x,
+                screenY: y,
+                clientX: x,
+                clientY: y,
+              }),
+            );
+          pointer('pointerdown', 10, 10, 1);
+          pointer('pointerup', 10, 10, 1);
+          await waitFor(() => windowCommandCount('show_chat') > 0);
+          check('click opens chat through host', windowCommandCount('show_chat') === 1);
+
+          pointer('pointerdown', 20, 20, 2);
+          pointer('pointermove', 80, 80, 2);
+          await sleep(60);
+          pointer('pointerup', 80, 80, 2);
+          check('drag is handed to host', windowCommandCount('start_dragging') === 1);
+        }
+
+        if (test.failMask) {
+          const errorBar = await waitFor(() => document.querySelector('.pet-error'));
+          check('mask failure is observable in pet window', errorBar !== null);
+          if (errorBar !== null) {
+            const rect = errorBar.getBoundingClientRect();
+            const centerY = rect.top + rect.height / 2;
+            const points = [
+              [rect.left + rect.width / 2, centerY],
+              [rect.left + 2, centerY],
+              [rect.right - 2, centerY],
+              [rect.left + rect.width / 2, rect.top + 2],
+              [rect.left + rect.width / 2, rect.bottom - 2],
+            ];
+            const visible = points.every((point) => alphaAt(context, dpr, point[0], point[1]) > 0);
+            check(
+              'pet error bar stays inside the alpha region',
+              visible,
+              points.map((point) => alphaAt(context, dpr, point[0], point[1])).join(','),
+            );
+          }
+        } else {
+          check('pet reports no protocol error', document.querySelector('.pet-error') === null);
+        }
+      }
+
+      try {
+        if (test.windowLabel === 'main') {
+          await runMain();
+        } else {
+          await runPet();
+        }
+      } catch (error) {
+        check('harness completed', false, String(error && error.stack ? error.stack : error));
+      }
+
+      const failed = results.filter((result) => !result.ok);
+      const passed = failed.length === 0 && test.errors.length === 0;
+      document.body.dataset.testStatus = passed ? 'pass' : 'fail';
+      document.getElementById('assertions').textContent =
+        'TEST_STATUS=' +
+        (passed ? 'PASS' : 'FAIL') +
+        '\n' +
+        results.map((result) => `${result.ok ? 'ok' : 'FAIL'} ${result.name} ${result.detail}`).join('\n') +
+        '\nRUNTIME_ERRORS=' +
+        JSON.stringify(test.errors) +
+        '\nWINDOW_COMMANDS=' +
+        JSON.stringify(test.windowCommands) +
+        '\nMASK_CALLS=' +
+        JSON.stringify(test.maskCalls.map((mask) => `${mask.width}x${mask.height}:${mask.alpha.length}`));
+    </script>
+  </body>
+</html>

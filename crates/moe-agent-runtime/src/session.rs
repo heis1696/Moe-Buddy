@@ -16,7 +16,7 @@ pub use lifecycle::{
 };
 pub use persistence::{
     RAW_SNAPSHOT_MAX_TOTAL_BYTES, RawDomainKey, RawHistoryGrant, RawImportReceipt,
-    RawSnapshotSweep, RawSnapshotV1, RestoredRawFragment,
+    RawSnapshotDecode, RawSnapshotSweep, RawSnapshotV1, RestoredRawFragment,
 };
 pub use types::*;
 

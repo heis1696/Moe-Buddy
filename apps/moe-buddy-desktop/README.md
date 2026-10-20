@@ -8,13 +8,16 @@
 
 第二步已接可配置 OpenAI-compatible Chat Completions：输入完整端点（含 `/chat/completions`）、模型、API Key 和人设，勾选发送许可后应用。许可覆盖人设、获准私密记忆和当前会话；没有许可不调用模型。HTTPS 或数值回环 HTTP，禁重定向、代理和自动重试；60 秒总超时、10 秒连接超时、128 KiB 响应上限。工作线程只持有不可变输入，主窗口不等待网络；未知结果不重发，迟到结果复验撤权、来源、版本与取消状态。
 
+每次线上请求由应用签发 `ExternalRequestTicket`，宿主把输入交给工作线程、只在窗口线程保留票据，轮询到结果后必须用同一票据调用 `complete_external`。重复、跨轮、跨实例或撤权后的回调在取走当前 pending 之前被拒绝，不会破坏正确在途请求，也不触发检查点或展示刷新；没有省略票据的完成路径。等待期间界面继续响应，`ChatApplication::chat_progress()` 可读到 `request_wait` 运行中；回复提交后若面板已隐藏/关闭，`publish` 节点以 `Failed` 收尾且 `published=false`，宿主显示 `display_failed`（已结算），重新打开面板即可读到已登记回复，不重发模型，也不倒改已终结流程。错误提示按 `ExecutionDisposition` 区分“未执行/已结束/结果未知”。
+
 数据保存在 `%LOCALAPPDATA%\MoeBuddy\daily`：`memory.v1` 复用 LocalMemory 权威日志，`chat/` 复用 RawLocalStore 原文格式，`settings.json` 仅含端点、模型和人设。API Key 与发送许可只在本次进程内，重启必须重新输入／确认。记忆持续保存，删除不代表日志物理擦除；聊天正常保留 30 天、回收 7 天，恢复不延长期限。恢复的历史只读展示，不恢复旧请求执行权，也不自动作为新会话模型输入。中断／未知历史保守阻止发送。坏档、占用和未完成提交保留现场，不以新空档覆盖。
 
 第三步已通过可控回环服务执行完整原生窗口链：首次配置、业务发送、版本化编辑记忆及下轮召回、关闭重启、认证失败、真实超时、撤权拒绝迟到结果和未知不重发；也验证设置保存／读取失败。异步明确失败恢复原草稿，等待期间的新草稿不被覆盖；HTTP 成功但没有有效正文仍按未知隔离。尚无真实服务端点／凭据验收，详见 [审核记录](../../docs/REVIEW.md)。
 
 **持续日用尚不通过**：未知／中断历史会持续禁发，目前没有保留旧记录另开会话的入口；外部回复按每轮 4096 字预留累计，65536 字应用预算下短输入约 15 轮即可达到上限，另有运行和原文硬容量，无自动轮转。不要删除存档或重发未知请求规避限制。恢复聊天只读、不自动接续模型上下文；新网络请求尚无完整诊断 run 事件。当前适合受控短会话验证，不承诺全天连续陪伴。
 
-`apps/moe-buddy-desktop` 是 `moe-chat-app` 的 Windows 原生桌面呈现宿主（U2 首个可用版）。
+`apps/moe-buddy-desktop` 是 `moe-chat-app` 的 Windows 原生桌面呈现宿主（U2 首个可用版）；
+持久化和网络传输由 `moe-desktop-adapters` 与 Tauri 共用。
 它拥有事件循环、注入的单调时钟与全部窗口绘制；聊天、预设、记忆、日志与授权的业务规则
 仍全部留在 `ChatApplication`，宿主只把窗口输入翻译为既有 `Action` 并渲染有界快照。
 未配置模型时仍明确使用离线演示；浏览器验证宿主已随结构整理移除，桌面宿主是当前唯一产品入口。
@@ -55,9 +58,12 @@ cargo run -p moe-buddy-desktop --locked --offline
 | `src/main.rs` | 入口；非 Windows 明确退出。 |
 | `src/theme.rs` | 纸白/苔绿颜色、字号与 8px 间距度量（纯数据，按 DPI 缩放）。 |
 | `src/presenter.rs` | 快照到界面模型的纯映射：状态文案、严重度、可用性、边栏内容、Enter 策略。 |
+| `crates/moe-desktop-adapters/src/transport.rs` | 两宿主共用的 OpenAI-compatible 单结果工作线程：严格端点、无重定向/代理/自动重试、有界响应；只接收不可变输入。 |
+| `crates/moe-desktop-adapters/src/storage.rs` | 两宿主共用的持久化适配：LocalMemory、RawLocalStore 与不含凭据的设置文件，支持默认与显式数据根。 |
 | `src/chatlog.rs` | 聊天历史的纯布局计算与滚动钳制/贴底逻辑（测量器由宿主注入）。 |
 | `src/layout.rs` | 导航、聊天、输入卡与管理面板的纯几何布局（含最小尺寸钳制）。 |
 | `src/host/mod.rs` | 窗口/控件编排、IME 安全的 Enter 拦截、动作分发与关闭确认流程。 |
+| `src/host/model_settings.rs` | 模型表单、请求票据保存/轮询与完成回调接线。 |
 | `src/host/paint.rs` | 全部自绘：信息栏、通知条、聊天气泡、空态占位、状态条、自绘按钮与列表行。 |
 
 `theme/presenter/chatlog/layout` 为纯 Rust；定向回归覆盖 Enter 策略、离线标记准确性、

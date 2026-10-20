@@ -1,0 +1,323 @@
+{
+  "snapshotFields": [
+    "revision",
+    "activeBuddyId",
+    "buddiesRevision",
+    "buddies",
+    "activeBuddyPersona",
+    "buddyCommit",
+    "activeSessionId",
+    "sessionsRevision",
+    "sessions",
+    "sessionIsolationAllowed",
+    "presentationRevision",
+    "mode",
+    "revoked",
+    "chat",
+    "closeConfirmation",
+    "closeIntent",
+    "managementDraft",
+    "managementExit",
+    "managementDiscardedVersion",
+    "chatDraft",
+    "activePreset",
+    "externalTransmissionAllowed",
+    "presets",
+    "memories",
+    "diagnostics",
+    "notice",
+    "modelSettings",
+    "persistenceEnabled"
+  ],
+  "errorFields": [
+    "code",
+    "message",
+    "disposition"
+  ],
+  "buddyCommitFields": [
+    "kind",
+    "fromBuddyId",
+    "fromRevision",
+    "toBuddyId",
+    "toRevision",
+    "managementVersion"
+  ],
+  "buddyCommitKinds": [
+    "create_buddy",
+    "switch_buddy",
+    "rename_buddy",
+    "configure_model",
+    "select_preset"
+  ],
+  "dispositions": [
+    "not_executed",
+    "settled",
+    "unknown"
+  ],
+  "closeIntents": [
+    "close_chat",
+    "quit_application"
+  ],
+  "frameFields": [
+    "resourceGeneration",
+    "playbackGeneration",
+    "presentationSequence",
+    "source",
+    "clipId",
+    "frameIndex",
+    "width",
+    "height",
+    "paused",
+    "faulted"
+  ],
+  "materialStateFields": [
+    "revision",
+    "resourceGeneration",
+    "playbackGeneration",
+    "source",
+    "pack",
+    "actions",
+    "actionId",
+    "status",
+    "loading",
+    "decodedBytes",
+    "frameCount",
+    "error"
+  ],
+  "materialPackFields": [
+    "id",
+    "label",
+    "version"
+  ],
+  "materialActionFields": [
+    "id",
+    "label"
+  ],
+  "materialErrorFields": [
+    "code",
+    "message"
+  ],
+  "materialSources": [
+    "builtin",
+    "package",
+    "empty"
+  ],
+  "materialStatuses": [
+    "playing",
+    "paused",
+    "stopped",
+    "faulted"
+  ],
+  "materialCommandTypes": [
+    "load",
+    "play",
+    "pause",
+    "resume",
+    "stop",
+    "unload",
+    "builtin"
+  ],
+  "materialCommandFields": [
+    "type",
+    "expectedResourceGeneration",
+    "expectedPlaybackGeneration"
+  ],
+  "materialCommandLoadFields": [
+    "type",
+    "path",
+    "expectedResourceGeneration",
+    "expectedPlaybackGeneration"
+  ],
+  "materialCommandPlayFields": [
+    "type",
+    "actionId",
+    "expectedResourceGeneration",
+    "expectedPlaybackGeneration"
+  ],
+  "materialReplyFields": [
+    "ok",
+    "state",
+    "error"
+  ],
+  "materialFrameTripleFields": [
+    "resourceGeneration",
+    "playbackGeneration",
+    "presentationSequence"
+  ],
+  "materialLimits": {
+    "idMaxBytes": 64,
+    "labelMaxScalars": 64,
+    "packMaxClips": 32,
+    "packMaxActions": 32,
+    "clipMaxFrames": 256,
+    "packageMaxFrames": 512,
+    "frameMaxDimension": 512,
+    "decodedMaxBytes": 67108864,
+    "binaryMaxBytes": 1048576,
+    "presentationBudgetBytes": 16777216,
+    "displayMaxDimension": 1024,
+    "maskMaxDimension": 256
+  },
+  "presetFields": [
+    "id",
+    "label",
+    "provider",
+    "model",
+    "endpoint"
+  ],
+  "memoryFields": [
+    "id",
+    "revision",
+    "text"
+  ],
+  "diagnosticFields": [
+    "sequence",
+    "run",
+    "event",
+    "status"
+  ],
+  "sessionFields": [
+    "id",
+    "label",
+    "archived",
+    "status"
+  ],
+  "modelSettingsFields": [
+    "endpoint",
+    "model",
+    "persona",
+    "allowTransmission",
+    "hasApiKey"
+  ],
+  "managementDraftFields": [
+    "version",
+    "dirty",
+    "kind"
+  ],
+  "managementDraftKinds": [
+    "none",
+    "general",
+    "buddy_create",
+    "buddy_rename"
+  ],
+  "managementExitFields": [
+    "version",
+    "intent"
+  ],
+  "chatDraftFields": [
+    "revision",
+    "discard",
+    "sessions"
+  ],
+  "chatDraftDiscardFields": [
+    "revision",
+    "sessionIds"
+  ],
+  "chatDraftSessionFields": [
+    "id",
+    "revision",
+    "discardedRevision"
+  ],
+  "panels": [
+    "presets",
+    "memory",
+    "diagnostics"
+  ],
+  "dispatchCommands": [
+    "create_buddy",
+    "switch_buddy",
+    "rename_buddy",
+    "new_session",
+    "switch_session",
+    "archive_session",
+    "set_draft",
+    "send",
+    "hide_chat",
+    "close_chat",
+    "confirm_close",
+    "confirm_management_discard",
+    "cancel_management_exit",
+    "revoke",
+    "open_panel",
+    "hide_panel",
+    "configure_model",
+    "select_preset",
+    "remember",
+    "search_memories",
+    "update_memory",
+    "delete_memory",
+    "refresh_memories",
+    "refresh_diagnostics"
+  ],
+  "hostCommands": [
+    "prototype_management_draft_state"
+  ],
+  "windowContextCommands": [
+    "show_chat",
+    "hide_chat",
+    "quit"
+  ],
+  "managementDraftStateFields": [
+    "context",
+    "dirty",
+    "kind",
+    "version"
+  ],
+  "buddySnapshotFields": [
+    "activeBuddyId",
+    "buddiesRevision",
+    "buddies"
+  ],
+  "buddyFields": [
+    "id",
+    "label",
+    "profileRevision",
+    "personaRevision",
+    "modelRevision"
+  ],
+  "buddyLimits": {
+    "idMaxBytes": 64,
+    "registryMax": 8,
+    "labelMaxScalars": 64,
+    "personaMaxChars": 4096
+  },
+  "dispatchContextFields": [
+    "expectedBuddyId",
+    "expectedBuddiesRevision"
+  ],
+  "buddyCommands": [
+    "create_buddy",
+    "switch_buddy",
+    "rename_buddy"
+  ],
+  "buddyCreateFields": [
+    "label",
+    "persona",
+    "expectedManagementDraftVersion"
+  ],
+  "buddySwitchFields": [
+    "id"
+  ],
+  "buddyRenameFields": [
+    "label",
+    "expectedManagementDraftVersion"
+  ],
+  "frameCount": 4,
+  "frameDurationMs": 200,
+  "clipDurationMs": 800,
+  "sessionSnapshotFields": [
+    "activeSessionId",
+    "sessionsRevision",
+    "sessions"
+  ],
+  "sessionStatuses": [
+    "ready",
+    "sending",
+    "failed",
+    "unknown"
+  ],
+  "sessionLimits": {
+    "idMaxBytes": 64,
+    "directoryMax": 64
+  }
+}

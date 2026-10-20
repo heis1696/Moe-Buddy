@@ -312,6 +312,7 @@ mod tests {
     use super::*;
     use moe_chat_app::{
         ChatMessage, ChatSnapshot, DiagnosticSnapshot, MemorySnapshot, PanelSnapshot,
+        SessionSnapshot,
     };
 
     fn panel(kind: PanelKind, visibility: PanelVisibility) -> PanelSnapshot {
@@ -328,8 +329,17 @@ mod tests {
     fn snapshot() -> AppSnapshot {
         AppSnapshot {
             revision: 1,
+            active_session_id: Some("session-1".to_owned()),
+            sessions_revision: 1,
+            session_isolation_allowed: false,
+            sessions: vec![SessionSnapshot {
+                id: "session-1".to_owned(),
+                label: "会话 1".to_owned(),
+                archived: false,
+                status: ChatStatus::Ready,
+            }],
             mode: "offline",
-            companion: "offline-companion",
+            companion: "offline-companion".to_owned(),
             active_preset: "offline-echo".to_owned(),
             external_transmission_allowed: false,
             revoked: false,

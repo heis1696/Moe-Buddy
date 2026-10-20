@@ -1,5 +1,11 @@
 /target/
+/apps/moe-buddy-tauri/dist/
+/apps/moe-buddy-tauri/src-tauri/gen/
 /scripts/__pycache__/
+/.agentdeck-worktrees/
+/.agentdeck-reports/
+/local-materials/
+/releases/
 *.log
 .env
 .env.*

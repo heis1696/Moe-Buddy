@@ -16,6 +16,271 @@ fn app() -> ChatApplication {
     ChatApplication::new(20_261_014).expect("nonzero process generation")
 }
 
+fn session_guard(snapshot: &AppSnapshot) -> (String, u64) {
+    (
+        snapshot
+            .active_session_id
+            .clone()
+            .expect("active logical session"),
+        snapshot.sessions_revision,
+    )
+}
+
+#[test]
+fn logical_sessions_keep_bounded_drafts_separate_and_archives_read_only() {
+    let mut app = app();
+    app.dispatch(Action::Open(PanelKind::Chat), 1).unwrap();
+    app.dispatch(Action::SetDraft("first session draft".into()), 2)
+        .unwrap();
+    let initial = app.snapshot();
+    let (expected_session_id, expected_sessions_revision) = session_guard(&initial);
+    app.dispatch(
+        Action::NewSession {
+            expected_session_id,
+            expected_sessions_revision,
+        },
+        3,
+    )
+    .unwrap();
+    let second_id = app
+        .snapshot()
+        .active_session_id
+        .expect("new active session");
+    app.dispatch(Action::SetDraft("second session draft".into()), 4)
+        .unwrap();
+
+    let current = app.snapshot();
+    let (expected_session_id, expected_sessions_revision) = session_guard(&current);
+    app.dispatch(
+        Action::SwitchSession {
+            id: String::from("session-1"),
+            expected_session_id,
+            expected_sessions_revision,
+        },
+        5,
+    )
+    .unwrap();
+    assert_eq!(app.snapshot().chat.draft, "first session draft");
+
+    let stale = app.snapshot();
+    let (expected_session_id, expected_sessions_revision) = session_guard(&stale);
+    let error = app
+        .dispatch(
+            Action::SetDraftGuarded {
+                text: String::from("stale edit"),
+                expected_session_id,
+                expected_sessions_revision: expected_sessions_revision - 1,
+            },
+            6,
+        )
+        .expect_err("stale directory revisions are rejected");
+    assert_eq!(error.public_code(), "stale_session_command");
+    assert_eq!(app.snapshot().chat.draft, "first session draft");
+
+    let current = app.snapshot();
+    let (expected_session_id, expected_sessions_revision) = session_guard(&current);
+    app.dispatch(
+        Action::SwitchSession {
+            id: second_id.clone(),
+            expected_session_id,
+            expected_sessions_revision,
+        },
+        7,
+    )
+    .unwrap();
+    assert_eq!(app.snapshot().chat.draft, "second session draft");
+
+    let current = app.snapshot();
+    let (expected_session_id, expected_sessions_revision) = session_guard(&current);
+    app.dispatch(
+        Action::ArchiveSession {
+            id: second_id.clone(),
+            expected_session_id: expected_session_id.clone(),
+            expected_sessions_revision,
+        },
+        8,
+    )
+    .unwrap();
+    let archived = app.snapshot();
+    assert_eq!(
+        archived.active_session_id.as_deref(),
+        Some(second_id.as_str())
+    );
+    assert!(
+        archived
+            .sessions
+            .iter()
+            .find(|session| session.id == second_id)
+            .unwrap()
+            .archived
+    );
+    assert_eq!(archived.chat.draft, "second session draft");
+    let error = app
+        .dispatch(
+            Action::SendGuarded {
+                expected_session_id: expected_session_id.clone(),
+                expected_sessions_revision: archived.sessions_revision,
+            },
+            9,
+        )
+        .expect_err("archived session cannot send");
+    assert_eq!(error.public_code(), "session_archived");
+    let error = app
+        .dispatch(
+            Action::SetDraftGuarded {
+                text: String::from("cannot edit"),
+                expected_session_id,
+                expected_sessions_revision: archived.sessions_revision,
+            },
+            10,
+        )
+        .expect_err("archived session is read-only");
+    assert_eq!(error.public_code(), "session_archived");
+    assert_eq!(app.snapshot().chat.draft, "second session draft");
+}
+
+#[test]
+fn lifecycle_changes_wait_for_the_existing_chat_close_confirmation() {
+    let mut app = app();
+    app.dispatch(Action::Open(PanelKind::Chat), 1).unwrap();
+    app.dispatch(Action::SetDraft("preserve this draft".into()), 2)
+        .unwrap();
+    app.dispatch(Action::Close(PanelKind::Chat), 3).unwrap();
+    let before = app.snapshot();
+    assert!(
+        before
+            .panels
+            .iter()
+            .any(|panel| { panel.kind == PanelKind::Chat && panel.confirmation })
+    );
+    let (expected_session_id, expected_sessions_revision) = session_guard(&before);
+    let error = app
+        .dispatch(
+            Action::NewSession {
+                expected_session_id,
+                expected_sessions_revision,
+            },
+            4,
+        )
+        .expect_err("close confirmation blocks lifecycle changes");
+    assert_eq!(error.public_code(), "close_confirmation_pending");
+    assert_eq!(app.snapshot().chat.draft, "preserve this draft");
+    assert_eq!(app.snapshot().sessions.len(), 1);
+}
+
+#[test]
+fn hidden_lifecycle_rejects_before_mutation_and_keeps_each_authoritative_draft() {
+    let mut app = app();
+    app.dispatch(Action::Open(PanelKind::Chat), 1).unwrap();
+    app.dispatch(Action::SetDraft("session A draft".into()), 2)
+        .unwrap();
+    let (expected_session_id, expected_sessions_revision) = session_guard(&app.snapshot());
+    app.dispatch(
+        Action::NewSession {
+            expected_session_id,
+            expected_sessions_revision,
+        },
+        3,
+    )
+    .unwrap();
+    app.dispatch(Action::SetDraft("session B draft".into()), 4)
+        .unwrap();
+    let before = app.snapshot();
+    let active_id = before.active_session_id.clone().unwrap();
+    let (expected_session_id, expected_sessions_revision) = session_guard(&before);
+
+    app.dispatch(Action::Hide(PanelKind::Chat), 5).unwrap();
+    for action in [
+        Action::NewSession {
+            expected_session_id: expected_session_id.clone(),
+            expected_sessions_revision,
+        },
+        Action::SwitchSession {
+            id: String::from("session-1"),
+            expected_session_id: expected_session_id.clone(),
+            expected_sessions_revision,
+        },
+        Action::ArchiveSession {
+            id: active_id.clone(),
+            expected_session_id: expected_session_id.clone(),
+            expected_sessions_revision,
+        },
+    ] {
+        let error = app
+            .dispatch(action, 6)
+            .expect_err("hidden chat rejects lifecycle mutation before commit");
+        assert_eq!(error.public_code(), "panel_not_visible");
+        assert_eq!(
+            error.execution_disposition(),
+            moe_chat_app::ExecutionDisposition::NotExecuted
+        );
+        let after = app.snapshot();
+        assert_eq!(after.active_session_id.as_deref(), Some(active_id.as_str()));
+        assert_eq!(after.sessions_revision, before.sessions_revision);
+        assert_eq!(after.sessions.len(), 2);
+        assert!(after.sessions.iter().all(|session| !session.archived));
+    }
+
+    app.dispatch(Action::Open(PanelKind::Chat), 7).unwrap();
+    assert_eq!(app.snapshot().chat.draft, "session B draft");
+    let (expected_session_id, expected_sessions_revision) = session_guard(&app.snapshot());
+    app.dispatch(
+        Action::SwitchSession {
+            id: String::from("session-1"),
+            expected_session_id,
+            expected_sessions_revision,
+        },
+        8,
+    )
+    .unwrap();
+    assert_eq!(app.snapshot().chat.draft, "session A draft");
+    let (expected_session_id, expected_sessions_revision) = session_guard(&app.snapshot());
+    app.dispatch(
+        Action::SwitchSession {
+            id: active_id,
+            expected_session_id,
+            expected_sessions_revision,
+        },
+        9,
+    )
+    .unwrap();
+    assert_eq!(app.snapshot().chat.draft, "session B draft");
+}
+
+#[test]
+fn volatile_rotation_backpressures_instead_of_dropping_authoritative_raw_history() {
+    let mut app = app();
+    app.dispatch(Action::Open(PanelKind::Chat), 1).unwrap();
+    app.dispatch(Action::SetDraft("preserve raw history".into()), 2)
+        .unwrap();
+    app.dispatch(Action::Send, 3).unwrap();
+    let before = app.snapshot();
+    let (expected_session_id, expected_sessions_revision) = session_guard(&before);
+    let error = app
+        .dispatch(
+            Action::NewSession {
+                expected_session_id,
+                expected_sessions_revision,
+            },
+            4,
+        )
+        .expect_err("volatile rotation cannot discard the raw runtime ledger");
+    assert_eq!(error.public_code(), "conversation_full");
+    assert_eq!(
+        error.execution_disposition(),
+        moe_chat_app::ExecutionDisposition::NotExecuted
+    );
+    let after = app.snapshot();
+    assert_eq!(after.active_session_id, before.active_session_id);
+    assert_eq!(after.sessions_revision, before.sessions_revision);
+    assert_eq!(after.sessions.len(), 1);
+    assert_eq!(after.chat.messages.len(), before.chat.messages.len());
+    for (actual, expected) in after.chat.messages.iter().zip(&before.chat.messages) {
+        assert_eq!(actual.role, expected.role);
+        assert_eq!(actual.text, expected.text);
+    }
+}
+
 #[test]
 fn preset_catalog_is_owned_by_the_registered_view_and_cleared_on_unmount() {
     let mut app = app();
@@ -541,4 +806,395 @@ fn clock_regression_fails_without_automatic_retry() {
     let snapshot = app.snapshot();
     assert_eq!(snapshot.chat.status, ChatStatus::Ready);
     assert_eq!(snapshot.chat.messages.len(), 4);
+}
+
+#[test]
+fn chat_close_discard_emits_versioned_receipt_and_keeps_other_session_drafts() {
+    let mut app = app();
+    app.dispatch(Action::Open(PanelKind::Chat), 1).unwrap();
+    app.dispatch(Action::SetDraft(String::from("first session draft")), 2)
+        .unwrap();
+    let initial = app.snapshot();
+    let (expected_session_id, expected_sessions_revision) = session_guard(&initial);
+    app.dispatch(
+        Action::NewSession {
+            expected_session_id,
+            expected_sessions_revision,
+        },
+        3,
+    )
+    .unwrap();
+    app.dispatch(Action::SetDraft(String::from("second session draft")), 4)
+        .unwrap();
+    let before = app.chat_draft_snapshot();
+    assert!(
+        before.discard.is_none(),
+        "ordinary edits, snapshots and re-reads are not discard receipts"
+    );
+
+    // 取消关闭确认：不产生回执，正文保留。
+    app.dispatch(Action::Close(PanelKind::Chat), 5).unwrap();
+    assert_eq!(app.snapshot().chat.draft, "second session draft");
+    app.dispatch(
+        Action::ConfirmClose {
+            panel: PanelKind::Chat,
+            discard: false,
+        },
+        6,
+    )
+    .unwrap();
+    assert_eq!(app.snapshot().chat.draft, "second session draft");
+    assert!(app.chat_draft_snapshot().discard.is_none());
+
+    // 明确丢弃：回执绑定当前会话与丢弃后的草稿集合修订，且不含正文。
+    app.dispatch(Action::Close(PanelKind::Chat), 7).unwrap();
+    app.dispatch(
+        Action::ConfirmClose {
+            panel: PanelKind::Chat,
+            discard: true,
+        },
+        8,
+    )
+    .unwrap();
+    let discarded_session = app
+        .snapshot()
+        .active_session_id
+        .expect("discarding keeps the logical selection");
+    let after = app.chat_draft_snapshot();
+    let receipt = after
+        .discard
+        .as_ref()
+        .expect("confirmed chat close emits a receipt");
+    assert_eq!(receipt.revision, after.revision);
+    assert!(receipt.revision > before.revision);
+    assert_eq!(receipt.session_ids, vec![discarded_session]);
+    assert!(app.snapshot().chat.draft.is_empty());
+
+    // 其他会话草稿不被连带清理：重开并切回仍能读到。
+    app.dispatch(Action::Open(PanelKind::Chat), 9).unwrap();
+    assert!(app.snapshot().chat.draft.is_empty());
+    let current = app.snapshot();
+    let (expected_session_id, expected_sessions_revision) = session_guard(&current);
+    app.dispatch(
+        Action::SwitchSession {
+            id: String::from("session-1"),
+            expected_session_id,
+            expected_sessions_revision,
+        },
+        10,
+    )
+    .unwrap();
+    assert_eq!(app.snapshot().chat.draft, "first session draft");
+}
+
+#[test]
+fn chat_draft_discard_receipt_is_historical_after_new_edits_and_stale_confirms() {
+    let mut app = app();
+    app.dispatch(Action::Open(PanelKind::Chat), 1).unwrap();
+    app.dispatch(Action::SetDraft(String::from("old text")), 2)
+        .unwrap();
+    app.dispatch(Action::Close(PanelKind::Chat), 3).unwrap();
+    app.dispatch(
+        Action::ConfirmClose {
+            panel: PanelKind::Chat,
+            discard: true,
+        },
+        4,
+    )
+    .unwrap();
+    let first = app
+        .chat_draft_snapshot()
+        .discard
+        .expect("first discard receipt");
+    let first_revision = first.revision;
+
+    // 丢弃后重新编辑：当前修订前进，旧回执保留但不再匹配当前修订。
+    app.dispatch(Action::Open(PanelKind::Chat), 5).unwrap();
+    app.dispatch(Action::SetDraft(String::from("new text")), 6)
+        .unwrap();
+    let edited = app.chat_draft_snapshot();
+    assert!(edited.revision > first_revision);
+    assert_eq!(
+        edited.discard.as_ref().map(|discard| discard.revision),
+        Some(first_revision),
+        "an old receipt stays readable but cannot clear newer edits"
+    );
+
+    // 关闭确认签发后草稿又被编辑，确认必须陈旧且不产生新回执。
+    app.dispatch(Action::Close(PanelKind::Chat), 7).unwrap();
+    app.dispatch(Action::SetDraft(String::from("edited during confirm")), 8)
+        .unwrap();
+    let error = app
+        .dispatch(
+            Action::ConfirmClose {
+                panel: PanelKind::Chat,
+                discard: true,
+            },
+            9,
+        )
+        .expect_err("a draft edit after the close request invalidates the confirmation");
+    assert_eq!(error.public_code(), "confirm_stale");
+    assert_eq!(app.snapshot().chat.draft, "edited during confirm");
+    assert_eq!(
+        app.chat_draft_snapshot()
+            .discard
+            .map(|discard| discard.revision),
+        Some(first_revision),
+        "a rejected confirmation must not write a discard receipt"
+    );
+
+    // 重新确认丢弃才产生一条新版本回执。
+    app.dispatch(Action::Close(PanelKind::Chat), 10).unwrap();
+    app.dispatch(
+        Action::ConfirmClose {
+            panel: PanelKind::Chat,
+            discard: true,
+        },
+        11,
+    )
+    .unwrap();
+    let second = app.chat_draft_snapshot();
+    let receipt = second.discard.expect("second discard receipt");
+    assert_eq!(receipt.revision, second.revision);
+    assert!(receipt.revision > first_revision);
+}
+
+#[test]
+fn quit_discard_receipt_covers_every_session_and_folds_a_preceding_close() {
+    let mut app = app();
+    app.dispatch(Action::Open(PanelKind::Chat), 1).unwrap();
+    app.dispatch(Action::SetDraft(String::from("first session draft")), 2)
+        .unwrap();
+    let first = app.snapshot();
+    let (expected_session_id, expected_sessions_revision) = session_guard(&first);
+    app.dispatch(
+        Action::NewSession {
+            expected_session_id,
+            expected_sessions_revision,
+        },
+        3,
+    )
+    .unwrap();
+    let second_id = app
+        .snapshot()
+        .active_session_id
+        .expect("second active session");
+    app.dispatch(Action::SetDraft(String::from("second session draft")), 4)
+        .unwrap();
+
+    let revision = app.chat_draft_set_revision();
+    app.discard_all_chat_drafts(revision)
+        .expect("matching set revision discards every draft");
+    assert!(!app.has_unsubmitted_chat_drafts());
+    let all = app.chat_draft_snapshot();
+    let receipt = all.discard.expect("quit discard receipt");
+    assert_eq!(receipt.revision, all.revision);
+    assert_eq!(
+        receipt.session_ids,
+        vec![String::from("session-1"), second_id.clone()]
+    );
+    for id in [String::from("session-1"), second_id.clone()] {
+        let entry = all
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .expect("quit watermark for every discarded session");
+        assert_eq!(entry.revision, all.revision);
+        assert_eq!(entry.discarded_revision, Some(all.revision));
+    }
+
+    // 陈旧版本不得再次丢弃或覆盖已有回执。
+    let error = app
+        .discard_all_chat_drafts(revision)
+        .expect_err("stale quit discard revision");
+    assert_eq!(error.public_code(), "confirm_stale");
+    assert_eq!(
+        app.chat_draft_snapshot()
+            .discard
+            .map(|discard| discard.revision),
+        Some(all.revision)
+    );
+
+    // Quit 先经聊天关闭确认丢弃当前会话时，整应用回执仍须包含该会话。
+    let mut folded = ChatApplication::new(20_261_014).expect("nonzero process generation");
+    folded.dispatch(Action::Open(PanelKind::Chat), 1).unwrap();
+    folded
+        .dispatch(Action::SetDraft(String::from("only session draft")), 2)
+        .unwrap();
+    folded.dispatch(Action::Close(PanelKind::Chat), 3).unwrap();
+    folded
+        .dispatch(
+            Action::ConfirmClose {
+                panel: PanelKind::Chat,
+                discard: true,
+            },
+            4,
+        )
+        .unwrap();
+    let active = folded.snapshot().active_session_id.expect("active session");
+    let revision = folded.chat_draft_set_revision();
+    folded
+        .discard_all_chat_drafts(revision)
+        .expect("quit appends its own discard set");
+    let quit = folded.chat_draft_snapshot();
+    let receipt = quit.discard.expect("quit receipt after chat close");
+    assert_eq!(receipt.revision, quit.revision);
+    assert_eq!(receipt.session_ids, vec![active]);
+}
+
+#[test]
+fn per_session_draft_watermarks_survive_other_session_edits_and_missed_discards() {
+    let mut app = app();
+    app.dispatch(Action::Open(PanelKind::Chat), 1).unwrap();
+    let first_id = app
+        .snapshot()
+        .active_session_id
+        .expect("initial logical session");
+    app.dispatch(Action::SetDraft(String::from("A draft")), 2)
+        .unwrap();
+
+    // A is explicitly discarded at a known per-session revision.
+    app.dispatch(Action::Close(PanelKind::Chat), 3).unwrap();
+    app.dispatch(
+        Action::ConfirmClose {
+            panel: PanelKind::Chat,
+            discard: true,
+        },
+        4,
+    )
+    .unwrap();
+    let after_first = app.chat_draft_snapshot();
+    let first_discard = after_first.discard.as_ref().expect("close discard receipt");
+    let first_entry = after_first
+        .sessions
+        .iter()
+        .find(|session| session.id == first_id)
+        .expect("discarded session has a watermark");
+    assert_eq!(first_entry.revision, first_discard.revision);
+    assert_eq!(first_entry.discarded_revision, Some(first_discard.revision));
+
+    // A later edit in another session advances only that session's watermark.
+    app.dispatch(Action::Open(PanelKind::Chat), 5).unwrap();
+    let current = app.snapshot();
+    let (expected_session_id, expected_sessions_revision) = session_guard(&current);
+    app.dispatch(
+        Action::NewSession {
+            expected_session_id,
+            expected_sessions_revision,
+        },
+        6,
+    )
+    .unwrap();
+    let second_id = app
+        .snapshot()
+        .active_session_id
+        .expect("second logical session");
+    app.dispatch(Action::SetDraft(String::from("B draft")), 7)
+        .unwrap();
+    let unrelated_edit = app.chat_draft_snapshot();
+    let untouched = unrelated_edit
+        .sessions
+        .iter()
+        .find(|session| session.id == first_id)
+        .expect("A entry stays readable");
+    assert_eq!(
+        (untouched.revision, untouched.discarded_revision),
+        (first_discard.revision, Some(first_discard.revision)),
+        "an edit of B must not invalidate A's discard watermark"
+    );
+    let edited_b = unrelated_edit
+        .sessions
+        .iter()
+        .find(|session| session.id == second_id)
+        .expect("B entry");
+    assert!(edited_b.revision > first_discard.revision);
+    assert_eq!(edited_b.discarded_revision, None);
+
+    // Discard B too. A host that missed A's intermediate event can still read
+    // both per-session watermarks from the final snapshot.
+    app.dispatch(Action::Close(PanelKind::Chat), 8).unwrap();
+    app.dispatch(
+        Action::ConfirmClose {
+            panel: PanelKind::Chat,
+            discard: true,
+        },
+        9,
+    )
+    .unwrap();
+    let both = app.chat_draft_snapshot();
+    let second_discard = both.discard.as_ref().expect("B discard receipt");
+    assert_eq!(second_discard.session_ids, vec![second_id.clone()]);
+    let first_after = both
+        .sessions
+        .iter()
+        .find(|session| session.id == first_id)
+        .expect("A watermark after B discard");
+    let second_after = both
+        .sessions
+        .iter()
+        .find(|session| session.id == second_id)
+        .expect("B watermark after discard");
+    assert_eq!(
+        (first_after.revision, first_after.discarded_revision),
+        (first_discard.revision, Some(first_discard.revision))
+    );
+    assert_eq!(
+        (second_after.revision, second_after.discarded_revision),
+        (second_discard.revision, Some(second_discard.revision))
+    );
+
+    // A later accepted edit keeps the historical discard watermark readable
+    // while moving the session's latest-change revision past it.
+    app.dispatch(Action::Open(PanelKind::Chat), 10).unwrap();
+    let current = app.snapshot();
+    let (expected_session_id, expected_sessions_revision) = session_guard(&current);
+    app.dispatch(
+        Action::SwitchSession {
+            id: first_id.clone(),
+            expected_session_id,
+            expected_sessions_revision,
+        },
+        11,
+    )
+    .unwrap();
+    app.dispatch(Action::SetDraft(String::from("A newer draft")), 12)
+        .unwrap();
+    let newer = app.chat_draft_snapshot();
+    let edited_first = newer
+        .sessions
+        .iter()
+        .find(|session| session.id == first_id)
+        .expect("A entry after newer edit");
+    assert!(edited_first.revision > first_discard.revision);
+    assert_eq!(
+        edited_first.discarded_revision,
+        Some(first_discard.revision),
+        "history stays readable without matching the newer edit"
+    );
+
+    app.dispatch(Action::Revoke, 13).unwrap();
+    let revoked = app.chat_draft_snapshot();
+    assert!(revoked.discard.is_none());
+    assert!(
+        revoked.sessions.is_empty(),
+        "revocation must clear per-session draft watermarks"
+    );
+}
+
+#[test]
+fn hiding_and_reopening_never_creates_a_discard_receipt() {
+    let mut app = app();
+    app.dispatch(Action::Open(PanelKind::Chat), 1).unwrap();
+    app.dispatch(Action::SetDraft(String::from("hidden draft")), 2)
+        .unwrap();
+    app.dispatch(Action::Hide(PanelKind::Chat), 3).unwrap();
+    assert!(
+        app.snapshot().chat.draft.is_empty(),
+        "hidden view clears display only"
+    );
+    assert!(app.chat_draft_snapshot().discard.is_none());
+    app.dispatch(Action::Open(PanelKind::Chat), 4).unwrap();
+    let reopened = app.snapshot();
+    assert_eq!(reopened.chat.draft, "hidden draft");
+    assert!(app.chat_draft_snapshot().discard.is_none());
 }

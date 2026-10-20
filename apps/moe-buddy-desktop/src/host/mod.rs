@@ -269,6 +269,7 @@ struct DesktopState {
     model_key: String,
     initial_settings: Option<moe_chat_app::ModelSettings>,
     model_worker: Option<std::sync::mpsc::Receiver<crate::transport::Reply>>,
+    model_ticket: Option<moe_chat_app::ExternalRequestTicket>,
     clock: Instant,
     epoch_ms: u64,
     /// 本窗口的随机实例代际，登记于 `WINDOW_INSTANCES`；存活复验的锚点。
@@ -415,6 +416,7 @@ pub fn run() -> Result<(), String> {
         model_key: String::new(),
         initial_settings: crate::storage::load_settings()?,
         model_worker: None,
+        model_ticket: None,
         clock: Instant::now(),
         epoch_ms,
         instance: window_instance_id,
@@ -1290,8 +1292,13 @@ fn act(state: &mut DesktopState, action: Action) {
 }
 
 fn set_error(state: &mut DesktopState, error: &AppError) {
+    let prefix = match error.execution_disposition() {
+        moe_chat_app::ExecutionDisposition::NotExecuted => "操作未执行：",
+        moe_chat_app::ExecutionDisposition::Settled => "操作已结束：",
+        moe_chat_app::ExecutionDisposition::Unknown => "操作结果未知：",
+    };
     state.view.error = Some((
-        format!("操作未执行：{}", error.public_message()),
+        format!("{prefix}{}", error.public_message()),
         Severity::Error,
     ));
 }

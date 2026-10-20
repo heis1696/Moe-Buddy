@@ -49,6 +49,9 @@ impl TempRoot {
 impl Drop for TempRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+        if let Ok(gate) = crate::retirement_gate_path(&self.0) {
+            let _ = fs::remove_file(gate);
+        }
     }
 }
 
@@ -354,6 +357,315 @@ fn create_checkpoint_reopen_and_raw_payload_are_exact() {
 }
 
 #[test]
+fn read_projection_is_read_only_and_explicit_maintenance_publishes_expiry() {
+    let temp = TempRoot::new();
+    let mut writer = seeded_context();
+    let created_at = START_MS + 200_000;
+    let (store, _) = writer.create(temp.path(), created_at);
+    drop(store);
+    let original = current_bytes(temp.path());
+
+    let mut reader = make_context(
+        created_at + 1,
+        LONG_NORMAL_MS,
+        LONG_RECYCLE_MS,
+        false,
+        false,
+        "owner",
+    );
+    let mut store = open_existing(&mut reader, temp.path(), created_at + 1);
+    let revision = store.revision();
+    let retention = reader.retention;
+    let projected = store
+        .read_projection(reader.access(created_at + 1), &retention, revision)
+        .unwrap();
+    assert_eq!(projected.import.fragments.len(), 1);
+    assert_eq!(current_bytes(temp.path()), original);
+
+    let normal_deadline = START_MS + LONG_NORMAL_MS;
+    let revision = store.revision();
+    let maintained = store
+        .maintain_retention(reader.access(normal_deadline), &retention, revision)
+        .unwrap();
+    assert_eq!(maintained.transferred, 1);
+    assert_eq!(maintained.checkpoint.unwrap().revision, 2);
+    assert_ne!(current_bytes(temp.path()), original);
+    drop(store);
+}
+
+#[test]
+fn retention_preview_reports_unresolved_control_and_exact_transfer_frame_size() {
+    let temp = TempRoot::new();
+    let mut writer = make_context(
+        START_MS,
+        LONG_NORMAL_MS,
+        LONG_RECYCLE_MS,
+        true,
+        false,
+        "owner",
+    );
+    let (store, _) = writer.create(temp.path(), START_MS);
+    drop(store);
+    let original = current_bytes(temp.path());
+
+    let normal_ms = 100;
+    let mut strict = make_context(START_MS + normal_ms, normal_ms, 20, false, false, "owner");
+    let mut store = open_existing(&mut strict, temp.path(), START_MS + normal_ms);
+    let revision = store.revision();
+    let retention = strict.retention;
+    let preview = store
+        .preview_retention(strict.access(START_MS + normal_ms), &retention, revision)
+        .unwrap();
+
+    assert!(preview.changed);
+    assert_eq!(preview.retained_fragments, 1);
+    assert_eq!(preview.candidate_frame_bytes as usize, original.len() + 8);
+    assert_eq!(
+        preview.latest_user_interaction,
+        Some((START_MS, None)),
+        "the unresolved interaction survives a projection that will enter recycle"
+    );
+    assert_eq!(current_bytes(temp.path()), original, "preview is read-only");
+}
+
+#[test]
+fn bounded_projection_stops_body_materialization_and_reuses_its_frame_plan() {
+    let temp = TempRoot::new();
+    let mut writer = seeded_context();
+    let created_at = START_MS + 200_000;
+    let (store, _) = writer.create(temp.path(), created_at);
+    drop(store);
+    let frame_len = current_bytes(temp.path()).len() as u64;
+
+    let mut reader = make_context(
+        created_at + 1,
+        LONG_NORMAL_MS,
+        LONG_RECYCLE_MS,
+        false,
+        false,
+        "owner",
+    );
+    let mut store = open_existing(&mut reader, temp.path(), created_at + 1);
+    let revision = store.revision();
+    let retention = reader.retention;
+    let over_budget = store
+        .prepare_projection(
+            reader.access(created_at + 1),
+            &retention,
+            revision,
+            frame_len,
+            1,
+            usize::MAX,
+        )
+        .unwrap();
+    assert!(!over_budget.within_projection_budget());
+    assert_eq!(over_budget.frame_bytes_read(), frame_len);
+    assert_eq!(over_budget.decoded_event_count(), 1);
+    assert!(over_budget.decoded_body_bytes() <= BODY.len());
+    assert_eq!(current_bytes(temp.path()).len() as u64, frame_len);
+
+    let body_over_budget = store
+        .prepare_projection(
+            reader.access(created_at + 1),
+            &retention,
+            revision,
+            frame_len,
+            128,
+            BODY.len(),
+        )
+        .unwrap();
+    assert!(!body_over_budget.within_projection_budget());
+    assert_eq!(body_over_budget.decoded_event_count(), 1);
+    assert_eq!(body_over_budget.decoded_body_bytes(), BODY.len());
+
+    let plan = store
+        .prepare_projection(
+            reader.access(created_at + 1),
+            &retention,
+            revision,
+            frame_len,
+            128,
+            8_192,
+        )
+        .unwrap();
+    assert!(plan.within_projection_budget());
+    assert_eq!(plan.frame_bytes_read(), frame_len);
+    let receipt = store
+        .read_projection_prepared(reader.access(created_at + 1), plan)
+        .unwrap();
+    assert_eq!(receipt.import.fragments.len(), 1);
+    assert_eq!(current_bytes(temp.path()).len() as u64, frame_len);
+}
+
+#[test]
+fn cold_projection_open_counts_its_only_frame_read_and_checks_budget_before_decode() {
+    let temp = TempRoot::new();
+    let mut writer = seeded_context();
+    let now = START_MS + 200_000;
+    let (store, _) = writer.create(temp.path(), now);
+    drop(store);
+    let frame = current_bytes(temp.path());
+    let frame_len = frame.len() as u64;
+    let mut reader = make_context(
+        now + 1,
+        LONG_NORMAL_MS,
+        LONG_RECYCLE_MS,
+        false,
+        false,
+        "owner",
+    );
+    let retention = reader.retention;
+
+    // A corrupt over-budget file must be rejected without its first decode.
+    fs::write(temp.path().join("raw-local.v1"), vec![0; frame.len()]).unwrap();
+    crate::FRAME_BYTES_READ.with(|count| count.set(0));
+    assert!(matches!(
+        RawLocalStore::open_projection(
+            temp.path(),
+            reader.access(now + 1),
+            &retention,
+            frame_len - 1,
+            128,
+            8_192,
+        ),
+        Err(RawLocalError::CapacityExceeded)
+    ));
+    assert_eq!(crate::FRAME_BYTES_READ.with(|count| count.get()), 0);
+    fs::write(temp.path().join("raw-local.v1"), &frame).unwrap();
+
+    let (mut store, limited) = RawLocalStore::open_projection(
+        temp.path(),
+        reader.access(now + 1),
+        &retention,
+        frame_len,
+        1,
+        8_192,
+    )
+    .unwrap();
+    assert!(!limited.within_projection_budget());
+    assert_eq!(limited.decoded_event_count(), 1);
+    assert_eq!(crate::FRAME_BYTES_READ.with(|count| count.get()), frame_len);
+    drop(limited);
+    // The cold open is a read-only baseline, not permission to overwrite it.
+    let revision = store.revision();
+    assert!(matches!(
+        store.checkpoint(reader.access(now + 1), revision),
+        Err(RawLocalError::BaselineNotRestored)
+    ));
+    drop(store);
+
+    crate::FRAME_BYTES_READ.with(|count| count.set(0));
+    let (mut store, plan) = RawLocalStore::open_projection(
+        temp.path(),
+        reader.access(now + 1),
+        &retention,
+        frame_len,
+        128,
+        8_192,
+    )
+    .unwrap();
+    assert!(plan.within_projection_budget());
+    assert_eq!(plan.frame_bytes_read(), frame_len);
+    assert_eq!(plan.decoded_event_count(), 2);
+    let imported = store
+        .read_projection_prepared(reader.access(now + 1), plan)
+        .unwrap();
+    assert_eq!(imported.import.fragments.len(), 1);
+    assert_eq!(
+        crate::FRAME_BYTES_READ.with(|count| count.get()),
+        frame_len,
+        "opening and projecting a cold segment must share one bounded frame read"
+    );
+}
+
+#[test]
+fn retirement_continuation_rechecks_the_original_domain_and_authorization_revision() {
+    let temp = TempRoot::new();
+    let mut owner = make_context(
+        START_MS,
+        LONG_NORMAL_MS,
+        LONG_RECYCLE_MS,
+        false,
+        false,
+        "owner",
+    );
+    let (mut store, _) = owner.create(temp.path(), START_MS);
+    let retention = owner.retention;
+    let revision = store.revision();
+    let receipt = store
+        .verify_retirable(owner.access(START_MS + 1), &retention, revision)
+        .unwrap();
+    store
+        .remove_retired_payload(owner.access(START_MS + 1), &retention, receipt)
+        .unwrap();
+    drop(store);
+    let gate_path = crate::retirement_gate_path(temp.path()).unwrap();
+    let gate_before = fs::read(&gate_path).unwrap();
+
+    let mut unrelated = make_context(
+        START_MS + 2,
+        LONG_NORMAL_MS,
+        LONG_RECYCLE_MS,
+        false,
+        false,
+        "other-owner",
+    );
+    assert!(matches!(
+        RawLocalStore::lock_retirement(temp.path(), unrelated.access(START_MS + 2), receipt, true,),
+        Err(RawLocalError::DomainMismatch)
+    ));
+
+    let mut changed = make_context(
+        START_MS + 2,
+        LONG_NORMAL_MS,
+        LONG_RECYCLE_MS,
+        false,
+        false,
+        "owner",
+    );
+    changed
+        .ingress
+        .bind_stable_credential_revision(changed.request.credential(), ATTRIBUTION, 2)
+        .unwrap();
+    assert!(matches!(
+        RawLocalStore::lock_retirement(temp.path(), changed.access(START_MS + 2), receipt, true,),
+        Err(RawLocalError::Gateway(GatewayError::Revoked))
+    ));
+    assert_eq!(fs::read(&gate_path).unwrap(), gate_before);
+    assert!(temp.path().join("raw-local.lock").exists());
+
+    let mut fresh = make_context(
+        START_MS + 2,
+        LONG_NORMAL_MS,
+        LONG_RECYCLE_MS,
+        false,
+        false,
+        "owner",
+    );
+    let domain = RawDomainKey::from_request(&fresh.ingress, &fresh.request).unwrap();
+    assert_eq!(
+        RawLocalStore::retirement_gate_size(&domain).unwrap(),
+        gate_before.len() as u64
+    );
+    let mut guard =
+        RawLocalStore::lock_retirement(temp.path(), fresh.access(START_MS + 2), receipt, true)
+            .unwrap();
+    guard.remove_lock_file().unwrap();
+    guard.mark_lock_removed().unwrap();
+    drop(guard);
+    assert!(matches!(
+        RawLocalStore::lock_retirement(temp.path(), unrelated.access(START_MS + 3), receipt, false,),
+        Err(RawLocalError::DomainMismatch)
+    ));
+    let mut guard =
+        RawLocalStore::lock_retirement(temp.path(), fresh.access(START_MS + 3), receipt, false)
+            .unwrap();
+    guard.remove_segment_directory().unwrap();
+    drop(guard);
+    assert!(!temp.path().exists());
+}
+
+#[test]
 fn process_cold_starts_reauthorize_recover_and_deduplicate() {
     let temp = TempRoot::new();
     let mut parent = seeded_context();
@@ -480,6 +792,134 @@ fn cross_process_file_lock_rejects_second_writer() {
     );
     drop(store);
     assert!(temp.path().join("raw-local.lock").exists());
+}
+
+#[test]
+fn retirement_uses_the_segment_lock_and_prevents_lock_file_recreation() {
+    let temp = TempRoot::new();
+    let mut context = make_context(
+        START_MS,
+        LONG_NORMAL_MS,
+        LONG_RECYCLE_MS,
+        false,
+        false,
+        "owner",
+    );
+    let (mut store, _) = context.create(temp.path(), START_MS);
+    let retention = context.retention;
+    let revision = store.revision();
+    let receipt = store
+        .verify_retirable(context.access(START_MS + 1), &retention, revision)
+        .unwrap();
+
+    assert!(matches!(
+        RawLocalStore::open_for_retirement(
+            temp.path(),
+            context.access(START_MS + 1),
+            receipt.revision,
+            receipt.committed_at_ms,
+        ),
+        Err(RawLocalError::Busy)
+    ));
+
+    store
+        .remove_retired_payload(context.access(START_MS + 1), &retention, receipt)
+        .unwrap();
+    assert_eq!(
+        RawLocalStore::inspect_retirement(temp.path())
+            .unwrap()
+            .unwrap()
+            .stage,
+        crate::RawRetirementStage::PayloadRemoved
+    );
+    drop(store);
+
+    assert!(matches!(
+        try_open(
+            &mut context,
+            temp.path(),
+            OpenMode::OpenExisting,
+            START_MS + 2
+        ),
+        Err(RawLocalError::Retiring)
+    ));
+    assert!(matches!(
+        try_open(&mut context, temp.path(), OpenMode::CreateNew, START_MS + 2),
+        Err(RawLocalError::Retiring)
+    ));
+    assert!(!temp.path().join("raw-local.v1").exists());
+    assert!(temp.path().join("raw-local.lock").exists());
+
+    let mut guard =
+        RawLocalStore::lock_retirement(temp.path(), context.access(START_MS + 2), receipt, true)
+            .unwrap();
+    guard.remove_lock_file().unwrap();
+    guard.mark_lock_removed().unwrap();
+    guard.remove_segment_directory().unwrap();
+    drop(guard);
+    assert!(!temp.path().exists());
+    assert_eq!(
+        RawLocalStore::inspect_retirement(temp.path())
+            .unwrap()
+            .unwrap()
+            .stage,
+        crate::RawRetirementStage::DirectoryRemoved
+    );
+    assert!(matches!(
+        try_open(&mut context, temp.path(), OpenMode::CreateNew, START_MS + 3),
+        Err(RawLocalError::Retiring)
+    ));
+    assert!(!temp.path().exists());
+}
+
+#[test]
+fn checkpoint_replaces_the_current_frame_while_holding_the_real_segment_lock() {
+    let temp = TempRoot::new();
+    let mut context = make_context(
+        START_MS,
+        LONG_NORMAL_MS,
+        LONG_RECYCLE_MS,
+        false,
+        false,
+        "owner",
+    );
+    let (mut store, created) = context.create(temp.path(), START_MS);
+    let first = current_bytes(temp.path());
+    let registered = context
+        .runtime
+        .register_user(
+            SessionAccess::new(&context.ingress, &context.request, START_MS + 1),
+            UserEvent::new(UserEventKind::New),
+        )
+        .unwrap();
+    context
+        .runtime
+        .finish_interaction(
+            SessionAccess::new(&context.ingress, &context.request, START_MS + 2),
+            &registered.interaction,
+            TerminalState::Completed,
+            Some("synthetic replacement body"),
+        )
+        .unwrap();
+    let replacement = checkpoint(&mut context, &mut store, created.revision, START_MS + 3).unwrap();
+    let second = current_bytes(temp.path());
+    assert_ne!(first, second);
+    assert!(!temp.path().join("raw-local.pending").exists());
+    assert_eq!(replacement.revision, created.revision + 1);
+    assert!(matches!(
+        try_open(
+            &mut context,
+            temp.path(),
+            OpenMode::OpenExisting,
+            START_MS + 4
+        ),
+        Err(RawLocalError::Busy)
+    ));
+    drop(store);
+
+    let reopened = open_existing(&mut context, temp.path(), START_MS + 4);
+    assert_eq!(reopened.revision(), replacement.revision);
+    assert_eq!(current_bytes(temp.path()), second);
 }
 
 #[test]

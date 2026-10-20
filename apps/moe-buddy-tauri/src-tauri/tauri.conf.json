@@ -1,0 +1,20 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Moe Buddy Prototype",
+  "version": "0.1.0",
+  "identifier": "dev.moebuddy.prototype",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:; connect-src ipc: http://ipc.localhost"
+    },
+    "windows": [
+      { "label": "main", "title": "Moe Buddy", "width": 960, "height": 720, "visible": true, "resizable": true },
+      { "label": "pet", "title": "Moe Buddy Pet", "width": 320, "height": 320, "visible": true, "decorations": false, "transparent": true, "alwaysOnTop": true, "skipTaskbar": true, "shadow": false }
+    ]
+  },
+  "bundle": { "active": false, "icon": [] }
+}

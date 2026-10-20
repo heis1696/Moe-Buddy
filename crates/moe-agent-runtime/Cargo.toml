@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 moe-memory-core = { path = "../moe-memory-core" }
+moe-workflow-core = { path = "../moe-workflow-core" }
 sha2 = { version = "0.11.0", default-features = false }
 
 [dev-dependencies]

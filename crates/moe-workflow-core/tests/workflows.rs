@@ -1,4 +1,4 @@
-use moe_agent_runtime::{
+use moe_workflow_core::{
     MAX_WORKFLOW_STEPS, WorkflowDefinition, WorkflowError, WorkflowOutcome, WorkflowRuntime,
     WorkflowStatus, WorkflowStep, WorkflowStepProgress, WorkflowStepStatus,
 };
@@ -405,6 +405,51 @@ fn instances_advance_independently() {
     assert_eq!(
         runtime.progress(&stalled).unwrap().status,
         WorkflowStatus::Failed
+    );
+}
+
+#[test]
+fn unrelated_pipeline_can_progress_while_another_instance_waits() {
+    let document_pipeline = WorkflowDefinition::new(
+        "document-pipeline",
+        1,
+        vec![
+            WorkflowStep::new("extract", &[]),
+            WorkflowStep::new("index", &["extract"]),
+            WorkflowStep::new("publish", &["index"]),
+        ],
+    )
+    .unwrap();
+    let mut runtime = WorkflowRuntime::new(2).unwrap();
+    let waiting = runtime.start(&chain("offline-agent", 1)).unwrap();
+    let pipeline = runtime.start(&document_pipeline).unwrap();
+    let waiting_ticket = runtime.begin(&waiting, "prepare").unwrap();
+    assert_eq!(
+        runtime.progress(&waiting).unwrap().status,
+        WorkflowStatus::Running
+    );
+
+    for step in ["extract", "index", "publish"] {
+        let ticket = runtime.begin(&pipeline, step).unwrap();
+        runtime
+            .complete(&ticket, WorkflowOutcome::Succeeded)
+            .unwrap();
+    }
+
+    assert_eq!(
+        runtime.progress(&pipeline).unwrap().status,
+        WorkflowStatus::Succeeded
+    );
+    assert_eq!(
+        runtime.progress(&waiting).unwrap().status,
+        WorkflowStatus::Running
+    );
+    runtime
+        .complete(&waiting_ticket, WorkflowOutcome::Succeeded)
+        .unwrap();
+    assert_eq!(
+        runtime.progress(&waiting).unwrap().next_step,
+        Some("process")
     );
 }
 

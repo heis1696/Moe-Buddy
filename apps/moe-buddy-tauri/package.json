@@ -1,0 +1,25 @@
+{
+  "name": "moe-buddy-tauri-frontend",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Moe Buddy Windows-first Tauri 2 + Vue 3 + TypeScript offline prototype frontend",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "node scripts/test.mjs",
+    "smoke:native": "node tests/native-smoke.mjs",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.4",
+    "vue": "3.5.44"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.3",
+    "@vitejs/plugin-vue": "6.0.10",
+    "typescript": "5.9.3",
+    "vite": "8.3.4",
+    "vue-tsc": "3.3.13"
+  }
+}

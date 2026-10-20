@@ -5,11 +5,18 @@ use std::time::Duration;
 use moe_agent_runtime::{EventRole, ExternalInput, ModelFailure, ModelOutcome};
 use serde_json::{Value, json};
 
+/// A single terminal result from the host-only model transport.
 pub struct Reply {
+    /// Model outcome admitted by the chat application when paired with its ticket.
     pub outcome: ModelOutcome,
+    /// Fixed safe status text for the host presentation layer.
     pub message: &'static str,
 }
 
+/// Start one no-retry request on a worker thread.
+///
+/// Only immutable input and the current process credential leave the host owner
+/// thread. The caller must retain and later return the matching request ticket.
 pub fn start(input: ExternalInput, key: String) -> std::io::Result<Receiver<Reply>> {
     let (sender, receiver) = sync_channel(1);
     std::thread::Builder::new()
@@ -133,10 +140,11 @@ async fn request(input: ExternalInput, key: String) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use moe_chat_app::{Action, ChatApplication, ModelSettings, PanelKind};
+    use moe_agent_runtime::WorkflowStatus;
+    use moe_chat_app::{Action, ChatApplication, ExecutionDisposition, ModelSettings, PanelKind};
     use std::io::{Read, Write};
 
-    fn exchange(status: &str, body: &str) -> Reply {
+    fn server(status: &str, body: &str) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let response = format!(
@@ -177,7 +185,11 @@ mod tests {
             }
             stream.write_all(response.as_bytes()).unwrap();
         });
-        let mut app = ChatApplication::new(98).unwrap();
+        (address, server)
+    }
+
+    fn configured_app(address: std::net::SocketAddr, generation: u64) -> ChatApplication {
+        let mut app = ChatApplication::new(generation).unwrap();
         app.dispatch(Action::Open(PanelKind::Chat), 0).unwrap();
         app.configure_model(&ModelSettings {
             endpoint: format!("http://{address}/v1/chat/completions"),
@@ -189,11 +201,15 @@ mod tests {
         app.dispatch(Action::SetDraft("synthetic question".into()), 1)
             .unwrap();
         app.dispatch(Action::Send, 2).unwrap();
-        let receiver = start(
-            app.take_external_request().unwrap(),
-            "synthetic-test-key".into(),
-        )
-        .unwrap();
+        app
+    }
+
+    fn exchange(status: &str, body: &str) -> Reply {
+        let (address, server) = server(status, body);
+        let mut app = configured_app(address, 98);
+        let request = app.take_external_request().expect("prepared request");
+        let (input, _ticket) = request.into_parts();
+        let receiver = start(input, "synthetic-test-key".into()).unwrap();
         let reply = receiver.recv_timeout(Duration::from_secs(8)).unwrap();
         server.join().unwrap();
         reply
@@ -231,5 +247,60 @@ mod tests {
                 ModelOutcome::Unknown
             ));
         }
+    }
+
+    #[test]
+    fn loopback_roundtrip_advances_every_phase_and_rejects_duplicate_ticket() {
+        let (address, server) = server(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":"synthetic reply"}}]}"#,
+        );
+        let mut app = configured_app(address, 97);
+        assert_eq!(
+            app.snapshot().chat.status,
+            moe_chat_app::ChatStatus::Sending
+        );
+        let waiting = app.chat_progress().expect("waiting progress");
+        assert_eq!(waiting.status, WorkflowStatus::Running);
+        assert_eq!(
+            waiting
+                .steps
+                .iter()
+                .find(|step| step.id == "request_wait")
+                .map(|step| step.status),
+            Some(moe_agent_runtime::WorkflowStepStatus::Running)
+        );
+
+        let request = app.take_external_request().expect("prepared request");
+        let (input, ticket) = request.into_parts();
+        let duplicate = ticket.clone();
+        let receiver = start(input, "synthetic-test-key".into()).unwrap();
+        let reply = receiver.recv_timeout(Duration::from_secs(8)).unwrap();
+        server.join().unwrap();
+        assert!(matches!(reply.outcome, ModelOutcome::Text { .. }));
+        app.complete_external(ticket, reply.outcome, 3).unwrap();
+
+        let snapshot = app.snapshot();
+        assert_eq!(snapshot.chat.status, moe_chat_app::ChatStatus::Ready);
+        assert_eq!(snapshot.chat.messages.len(), 2);
+        assert_eq!(snapshot.chat.messages[1].text, "synthetic reply");
+        let progress = app.chat_progress().expect("final progress");
+        assert_eq!(progress.status, WorkflowStatus::Succeeded);
+        assert!(progress.committed && progress.published);
+        assert_eq!(
+            app.last_parsed_reply().unwrap().display_text(),
+            "synthetic reply"
+        );
+
+        let error = app
+            .complete_external(duplicate, ModelOutcome::Unknown, 4)
+            .expect_err("duplicate callback is rejected");
+        assert_eq!(error.public_code(), "no_request");
+        assert_eq!(
+            error.execution_disposition(),
+            ExecutionDisposition::NotExecuted
+        );
+        assert_eq!(app.snapshot().chat.messages.len(), 2);
+        assert!(app.take_external_request().is_none());
     }
 }

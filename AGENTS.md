@@ -16,12 +16,15 @@ Moe Buddy 是以独立陪伴 Agent 为目标的 Rust Cargo workspace，围绕稳
 | `crates/moe-memory-core` | 纯记忆契约、授权、治理、检索收口与上下文规则。 |
 | `crates/moe-memory-local` | 记忆持久化门面、日志与恢复适配。 |
 | `crates/moe-memory-search` | 记忆系统内的索引、混合召回及 Embedding/rerank 适配。 |
-| `crates/moe-agent-runtime` | API 预设、可信入口、会话暂存/回收、离线 Agent、程序流程执行、动画编排与纯内存诊断日志。 |
+| `crates/moe-workflow-core` | 零依赖通用流程定义、前置约束、受控执行票据与进度；不执行业务节点。 |
+| `crates/moe-agent-runtime` | API 预设、可信入口、会话暂存/回收、Agent、离线流程包装、动画编排与纯内存诊断日志；兼容重导出流程内核接口。 |
 | `crates/moe-raw-local` | 会话原文文件、快照与恢复适配。 |
 | `crates/moe-cli-hooks` | 固定 CLI Hooks 协议的输入输出适配。 |
 | `crates/moe-ui-core` | 纯 UI 管理、类型化控制器/视图组合、逻辑面板生命周期与有界驱动；不选择 GUI 或接管业务权限。 |
-| `crates/moe-chat-app` | 单伙伴文字聊天的纯受信应用组合；复用记忆、预设、Agent 流程、诊断和 UI 管理，独立于传输与渲染。 |
+| `crates/moe-chat-app` | 单伙伴文字聊天的纯受信应用组合；定义线上/离线七阶段，复用记忆、预设、Agent、诊断和 UI 门面，独立于传输与渲染。 |
+| `crates/moe-desktop-adapters` | 两个桌面宿主共用的模型 HTTP、本地记忆/原文及配置 I/O 适配；复用既有权威服务，不定义业务权限。 |
 | `apps/moe-buddy-desktop` | Windows 原生桌面宿主：窗口、绘制、网络与文件 I/O 适配，直接承载 `moe-chat-app`，不接管业务规则。 |
+| `apps/moe-buddy-tauri` | Tauri 2 / Vue / TypeScript 桌面宿主：受控聊天、记忆/预设/诊断入口、本地恢复和宠物窗口；复用 Rust 应用、共享 I/O 适配与动画内核。 |
 
 ## 诊断日志接入
 

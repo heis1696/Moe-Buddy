@@ -1,12 +1,16 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
-$files = @(
-    Get-Item -LiteralPath (Join-Path $root 'AGENTS.md'), (Join-Path $root 'README.md')
-    Get-ChildItem -LiteralPath (Join-Path $root 'docs') -File -Filter '*.md'
-    Get-ChildItem -LiteralPath (Join-Path $root 'crates') -Recurse -File -Filter 'README.md'
-    Get-ChildItem -LiteralPath (Join-Path $root 'apps') -Recurse -File -Filter 'README.md'
-)
+# Use repository-owned files so installed frontend packages and generated output
+# do not become project documentation. Include new, untracked source documents.
+$repoFiles = @(git -C $root ls-files --cached --others --exclude-standard)
+if ($LASTEXITCODE -ne 0) { throw 'Unable to enumerate repository documentation.' }
+$files = @($repoFiles | Where-Object {
+    $_ -match '^(?:AGENTS\.md|README\.md|docs/[^/]+\.md|(?:crates|apps)/.+/README\.md)$'
+} | Sort-Object -Unique | ForEach-Object {
+    $docPath = Join-Path $root $_
+    if (Test-Path -LiteralPath $docPath -PathType Leaf) { Get-Item -LiteralPath $docPath }
+})
 $issues = [System.Collections.Generic.List[string]]::new()
 foreach ($file in $files) {
     try {

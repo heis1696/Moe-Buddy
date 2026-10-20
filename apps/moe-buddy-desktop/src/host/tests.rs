@@ -145,9 +145,11 @@ fn asynchronous_auth_failure_restores_input_and_error_severity() {
             .dispatch(Action::SetDraft("retry this question".into()), 1)
             .unwrap();
         state.app.dispatch(Action::Send, 2).unwrap();
-        state.app.take_external_request().unwrap();
+        let request = state.app.take_external_request().unwrap();
+        let (_input, ticket) = request.into_parts();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         state.model_worker = Some(receiver);
+        state.model_ticket = Some(ticket);
         sender
             .send(crate::transport::Reply {
                 outcome: moe_agent_runtime::ModelOutcome::Failed(
@@ -300,6 +302,7 @@ fn make_window_with(confirm: ConfirmDialog) -> TestWindow {
         model_key: String::new(),
         initial_settings: None,
         model_worker: None,
+        model_ticket: None,
         clock: Instant::now(),
         epoch_ms: 0,
         instance: window_instance_id,

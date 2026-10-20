@@ -6,9 +6,9 @@
 mod chatlog;
 mod layout;
 mod presenter;
-mod storage;
 mod theme;
-mod transport;
+
+use moe_desktop_adapters::{storage, transport};
 
 #[cfg(windows)]
 mod host;

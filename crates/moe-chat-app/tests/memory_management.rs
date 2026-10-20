@@ -1,4 +1,4 @@
-use moe_chat_app::{Action, ChatApplication, PanelKind};
+use moe_chat_app::{Action, ChatApplication, ExecutionDisposition, PanelKind};
 
 #[test]
 fn edit_search_delete_and_next_turn_use_authoritative_memory() {
@@ -21,16 +21,20 @@ fn edit_search_delete_and_next_turn_use_authoritative_memory() {
         4,
     )
     .unwrap();
-    assert!(
-        app.dispatch(
+    let stale_update = app
+        .dispatch(
             Action::UpdateMemory {
                 id: note.id.clone(),
                 revision: note.revision,
-                text: "过期修改".into()
+                text: "过期修改".into(),
             },
-            5
+            5,
         )
-        .is_err()
+        .expect_err("stale revision is rejected");
+    assert_eq!(
+        stale_update.execution_disposition(),
+        ExecutionDisposition::Settled,
+        "the memory service returned an authoritative rejection"
     );
     app.dispatch(Action::SearchMemories("绿茶".into()), 6)
         .unwrap();
@@ -100,4 +104,45 @@ fn memory_commands_recheck_visibility_and_revocation() {
         .is_err()
     );
     assert!(app.snapshot().memories.is_empty());
+}
+
+#[test]
+fn many_memory_operations_rotate_diagnostics_and_bound_issued_note_ids() {
+    let mut app = ChatApplication::new(903).unwrap();
+    app.dispatch(Action::Open(PanelKind::Memory), 0).unwrap();
+    app.dispatch(Action::Remember("synthetic note 0".into()), 1)
+        .unwrap();
+    let first = app.snapshot().memories[0].clone();
+
+    for sequence in 1..110 {
+        app.dispatch(
+            Action::Remember(format!("synthetic note {sequence}")),
+            sequence + 1,
+        )
+        .unwrap();
+    }
+    let stale = app
+        .dispatch(
+            Action::UpdateMemory {
+                id: first.id,
+                revision: first.revision,
+                text: String::from("must be refused after token eviction"),
+            },
+            112,
+        )
+        .unwrap_err();
+    assert_eq!(stale.public_code(), "memory_not_found");
+    assert_eq!(
+        stale.execution_disposition(),
+        ExecutionDisposition::NotExecuted
+    );
+
+    app.dispatch(Action::Open(PanelKind::Diagnostics), 113)
+        .unwrap();
+    app.dispatch(Action::RefreshDiagnostics, 114).unwrap();
+    assert!(
+        app.snapshot()
+            .notice
+            .is_some_and(|notice| notice.contains("历史缺口"))
+    );
 }
