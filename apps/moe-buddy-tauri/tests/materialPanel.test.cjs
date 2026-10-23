@@ -23,6 +23,7 @@ function component() {
 
   const contextHolder = vue.ref({ expectedBuddyId: 'buddy-a', expectedBuddiesRevision: 7 });
   const blockedHolder = vue.ref(null);
+  const pageHiddenHolder = vue.ref(false);
   let materialHandler = () => {};
   let dragHandler = () => {};
   const stateRequests = [];
@@ -60,6 +61,9 @@ function component() {
       },
       get blockedReason() {
         return blockedHolder.value;
+      },
+      get pageHidden() {
+        return pageHiddenHolder.value;
       },
     }),
     require(name) {
@@ -104,6 +108,9 @@ function component() {
     },
     setBlocked(reason) {
       blockedHolder.value = reason;
+    },
+    setPageHidden(value) {
+      pageHiddenHolder.value = value;
     },
     async mount() {
       for (const callback of mounted) callback();
@@ -531,6 +538,29 @@ test('真实素材组件：宿主阻断时明确提示且不派发，不读取�
     assert.equal(instance.commandCalls.length, 0);
     assert.equal(instance.api.notice.value, '关闭/退出确认处理中，暂不能变更素材。');
     assert.equal(instance.api.notice.value.includes('C:'), false);
+  } finally {
+    instance.unmount();
+  }
+});
+
+test('真实素材组件：所属页面隐藏时忽略全部拖放信号，恢复可见后才接受投放', async () => {
+  const instance = await mountedWithState();
+  try {
+    instance.setPageHidden(true);
+    instance.emitDrag({ type: 'enter', paths: ['C:\\packs\\hidden'] });
+    assert.equal(instance.api.dragActive.value, false, '隐藏页不得进入拖拽高亮');
+    instance.emitDrag({ type: 'drop', paths: ['C:\\packs\\hidden'] });
+    await flush();
+    assert.equal(instance.commandCalls.length, 0, '隐藏页不接受拖放加载');
+    assert.equal(instance.api.notice.value, null, '隐藏页的拖放不产生任何提示');
+
+    instance.setPageHidden(false);
+    instance.emitDrag({ type: 'enter', paths: ['C:\\packs\\visible'] });
+    assert.equal(instance.api.dragActive.value, true, '恢复可见后拖拽高亮恢复');
+    instance.emitDrag({ type: 'drop', paths: ['C:\\packs\\visible'] });
+    await flush();
+    assert.equal(instance.commandCalls.length, 1, '恢复可见后正常接受一次投放');
+    assert.equal(instance.commandCalls[0].command.path, 'C:\\packs\\visible');
   } finally {
     instance.unmount();
   }

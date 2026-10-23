@@ -1450,7 +1450,11 @@ impl<P: HostPort> HostWorker<P> {
             .as_ref()
             .is_some_and(BuddyStorage::registry_is_unknown)
         {
-            return (!self.last_known_context_matches(context))
+            let snapshot = self.latest_snapshot();
+            let revoked_context_matches = snapshot.revoked
+                && context.expected_buddy_id.is_empty()
+                && context.expected_buddies_revision == snapshot.buddies_revision;
+            return (!(self.last_known_context_matches(context) || revoked_context_matches))
                 .then(|| failure("buddy_context_stale", "退出处置上下文已变化"));
         }
         self.window_context_failure(context)
@@ -1614,9 +1618,24 @@ impl<P: HostPort> HostWorker<P> {
                 self.host_notice = Some("授权已撤回；模型设置与本次凭据已清除".into());
                 let mut snapshot = self.latest_snapshot();
                 snapshot.revoked = true;
+                snapshot.active_buddy_id = None;
+                snapshot.buddies.clear();
+                snapshot.active_buddy_persona = None;
                 snapshot.buddy_commit = None;
+                snapshot.active_session_id = None;
+                snapshot.sessions.clear();
+                snapshot.session_isolation_allowed = false;
+                snapshot.chat.draft.clear();
+                snapshot.chat.messages.clear();
+                snapshot.chat_draft.discard = None;
+                snapshot.chat_draft.sessions.clear();
+                snapshot.active_preset.clear();
+                snapshot.presets.clear();
+                snapshot.memories.clear();
+                snapshot.diagnostics.clear();
                 snapshot.model_settings = None;
                 snapshot.external_transmission_allowed = false;
+                snapshot.persistence_enabled = false;
                 self.decorate_management_snapshot(&mut snapshot);
                 self.publish_snapshot(&snapshot);
             }
@@ -7020,14 +7039,87 @@ mod tests {
         });
         assert_eq!(failed.error.as_ref().unwrap().disposition, "unknown");
 
+        let blocked = host.dispatch(ChatCommand::OpenPanel {
+            panel: "diagnostics".into(),
+        });
+        assert_eq!(blocked.error.as_ref().unwrap().disposition, "unknown");
+        assert_eq!(
+            blocked.error.as_ref().unwrap().code,
+            "buddy_storage_unknown"
+        );
+
         let revoked = host.dispatch(ChatCommand::Revoke);
         assert!(revoked.error.is_none());
         let snapshot = host.snapshot();
         assert!(snapshot.revoked);
+        assert!(snapshot.active_buddy_id.is_none());
+        assert!(snapshot.buddies.is_empty());
+        assert!(snapshot.active_buddy_persona.is_none());
+        assert!(snapshot.active_session_id.is_none());
+        assert!(snapshot.sessions.is_empty());
+        assert!(!snapshot.session_isolation_allowed);
+        assert!(snapshot.chat.draft.is_empty());
+        assert!(snapshot.chat.messages.is_empty());
+        assert!(snapshot.chat_draft.discard.is_none());
+        assert!(snapshot.chat_draft.sessions.is_empty());
+        assert!(snapshot.active_preset.is_empty());
+        assert!(snapshot.presets.is_empty());
+        assert!(snapshot.memories.is_empty());
+        assert!(snapshot.diagnostics.is_empty());
         assert!(snapshot.model_settings.is_none());
         assert!(!snapshot.external_transmission_allowed);
         assert!(snapshot.buddy_commit.is_none());
         assert!(host.worker.model_key.is_none());
+        let reread = host.read_snapshot();
+        assert!(reread.error.is_none());
+        let reread = reread.snapshot.unwrap();
+        assert!(reread.revoked);
+        assert!(reread.active_buddy_id.is_none());
+        assert!(reread.sessions.is_empty());
+        assert!(reread.chat.messages.is_empty());
+        assert!(reread.chat_draft.sessions.is_empty());
+        assert_eq!(reread.presentation_revision, snapshot.presentation_revision);
+        let published = host
+            .port
+            .state
+            .lock()
+            .unwrap()
+            .snapshots
+            .last()
+            .cloned()
+            .unwrap();
+        assert!(published.revoked);
+        assert!(published.active_buddy_id.is_none());
+        assert!(published.sessions.is_empty());
+        assert!(published.chat.messages.is_empty());
+
+        for rejected in [
+            BuddyContext {
+                expected_buddy_id: String::new(),
+                expected_buddies_revision: snapshot.buddies_revision - 1,
+            },
+            BuddyContext {
+                expected_buddy_id: "another-buddy".into(),
+                expected_buddies_revision: snapshot.buddies_revision,
+            },
+        ] {
+            assert!(host.worker.exit_context_failure(&rejected).is_some());
+        }
+        assert!(
+            host.worker
+                .exit_context_failure(&BuddyContext {
+                    expected_buddy_id: String::new(),
+                    expected_buddies_revision: snapshot.buddies_revision,
+                })
+                .is_none()
+        );
+
+        host.request_exit(ExitIntent::QuitApplication).unwrap();
+        assert!(host.worker.should_shutdown());
+        assert!(host.port.errors().is_empty());
+        let code = host.worker.shutdown().expect("quit code");
+        host.worker.request_event_loop_exit(code);
+        assert_eq!(host.port.exit_code(), Some(0));
     }
 
     #[test]

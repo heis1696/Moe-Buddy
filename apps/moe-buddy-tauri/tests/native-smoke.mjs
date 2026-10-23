@@ -99,6 +99,13 @@ const DOM_HELPERS = `(() => {
       const disabled = node.disabled === true;
       return { present: true, visible, disabled, operable: visible && !disabled };
     },
+    pageVisible(page) {
+      const node = document.querySelector('[data-page-view="' + page + '"]');
+      return !!node && !!(node.offsetWidth || node.offsetHeight || node.getClientRects().length);
+    },
+    currentPage() {
+      return document.querySelector('[data-page][aria-current="page"]')?.dataset.page ?? null;
+    },
     buttonPart(text, scope) {
       const root = scope || document;
       return Array.from(root.querySelectorAll('button'))
@@ -119,10 +126,11 @@ const DOM_HELPERS = `(() => {
         .find((node) => this.norm(node.textContent) === text) || null;
     },
     panel() {
-      return document.querySelector('.panel-shell');
+      return Array.from(document.querySelectorAll('.panel-shell'))
+        .find((node) => !!(node.offsetWidth || node.offsetHeight || node.getClientRects().length)) || null;
     },
     panelText() {
-      return document.querySelector('.panel-shell')?.innerText || '';
+      return this.panel()?.innerText || '';
     },
     chatText() {
       return document.querySelector('.messages')?.innerText || '';
@@ -198,6 +206,8 @@ const DOM_HELPERS = `(() => {
       return this.norm(document.querySelector('.session-chip.active .session-name')?.textContent || '');
     },
     sessionAction(text) {
+      if (text === '新建会话') return document.querySelector('button[aria-label="新建会话"]');
+      if (text === '归档当前会话') return this.button('归档会话', document.querySelector('.conversation-head'));
       const bar = document.querySelector('.session-actions');
       return bar ? this.button(text, bar) : null;
     },
@@ -230,8 +240,9 @@ const DOM_HELPERS = `(() => {
     },
     buddyChip(label) {
       const wanted = this.norm(label);
-      return Array.from(document.querySelectorAll('.buddy-chip'))
-        .find((node) => this.norm(node.querySelector('.buddy-name')?.textContent) === wanted) || null;
+      const card = Array.from(document.querySelectorAll('.buddy-chip'))
+        .find((node) => this.norm(node.querySelector('.buddy-name')?.textContent) === wanted);
+      return card ? this.button('选择伙伴', card) || this.button('当前伙伴', card) : null;
     },
     activeBuddyLabel() {
       return this.norm(document.querySelector('.buddy-chip.active .buddy-name')?.textContent || '');
@@ -279,7 +290,7 @@ function itemButton(text, itemText) {
 
 /** 允许调用方传入 CSS 选择器字符串或 JS 表达式；字符串选择器统一转成 DOM 查询。 */
 function resolveElement(expression) {
-  if (expression.startsWith('#') || expression.startsWith('.')) {
+  if (expression.startsWith('#') || expression.startsWith('.') || expression.startsWith('[')) {
     return `document.querySelector(${JSON.stringify(expression)})`;
   }
   return expression;
@@ -288,27 +299,38 @@ function resolveElement(expression) {
 class CdpClient {
   static async connect(port, titleNeedle) {
     const deadline = Date.now() + 30_000;
-    let target;
+    const wantedWindow = /宠物/.test(titleNeedle) ? 'pet' : 'main';
+    const failures = [];
     while (Date.now() < deadline) {
       try {
         const targets = await fetch(`http://127.0.0.1:${port}/json/list`).then((response) =>
           response.json(),
         );
-        target = targets.find((entry) => entry.title === titleNeedle)
-          ?? targets.find((entry) => entry.title.includes(titleNeedle));
-        if (target !== undefined) break;
+        for (const target of targets.filter((entry) => entry.type === 'page' && entry.title.includes('Moe Buddy'))) {
+          let socket;
+          try {
+            socket = new WebSocket(target.webSocketDebuggerUrl);
+            await new Promise((resolve, reject) => {
+              const timer = setTimeout(() => reject(new Error('CDP websocket connection timed out')), 1_500);
+              socket.onopen = () => { clearTimeout(timer); resolve(); };
+              socket.onerror = () => { clearTimeout(timer); reject(new Error('CDP websocket failed')); };
+              socket.onclose = () => { clearTimeout(timer); reject(new Error('CDP websocket closed while connecting')); };
+            });
+            const cdp = new CdpClient(socket);
+            const correctWindow = await cdp.evaluate(`document.documentElement.dataset.window === ${JSON.stringify(wantedWindow)}${wantedWindow === 'main' ? " && document.querySelector('.main-view') !== null" : ''}`);
+            if (correctWindow === true) return cdp;
+            cdp.close();
+          } catch (error) {
+            socket?.close();
+            failures.push(`${target.title} ${target.url}: ${error.message}`);
+          }
+        }
       } catch {
         // WebView2 尚未完成启动。
       }
       await sleep(250);
     }
-    if (target === undefined) throw new Error(`WebView2 CDP target not found: ${titleNeedle}`);
-    const socket = new WebSocket(target.webSocketDebuggerUrl);
-    await new Promise((resolve, reject) => {
-      socket.onopen = resolve;
-      socket.onerror = () => reject(new Error('CDP websocket failed'));
-    });
-    return new CdpClient(socket);
+    throw new Error(`WebView2 ${wantedWindow} target not found by DOM window identity; candidates=${failures.slice(-8).join(' | ')}`);
   }
 
   constructor(socket) {
@@ -317,9 +339,14 @@ class CdpClient {
     this.pending = new Map();
     this.closed = false;
     socket.onmessage = (event) => {
-      const message = JSON.parse(event.data);
+      let message;
+      try { message = JSON.parse(event.data); } catch (error) {
+        this.failAll(new Error(`invalid CDP response: ${error.message}`));
+        return;
+      }
       const handler = this.pending.get(message.id);
       if (handler !== undefined) {
+        clearTimeout(handler.timer);
         this.pending.delete(message.id);
         if (message.error !== undefined) {
           handler.reject(new Error(`CDP ${message.error.message ?? 'command failed'}`));
@@ -330,19 +357,30 @@ class CdpClient {
     };
     socket.onclose = () => {
       this.closed = true;
-      for (const handler of this.pending.values()) {
-        handler.reject(new Error('CDP websocket closed'));
-      }
-      this.pending.clear();
+      this.failAll(new Error('CDP websocket closed'));
     };
+    socket.onerror = () => this.failAll(new Error('CDP websocket error'));
+  }
+
+  failAll(error) {
+    for (const handler of this.pending.values()) {
+      clearTimeout(handler.timer);
+      handler.reject(error);
+    }
+    this.pending.clear();
   }
 
   send(method, params) {
     if (this.closed) return Promise.reject(new Error('CDP websocket closed'));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.socket.send(JSON.stringify({ id, method, params }));
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`CDP request timed out: ${method}`));
+      }, 10_000);
+      this.pending.set(id, { resolve, reject, timer });
+      try { this.socket.send(JSON.stringify({ id, method, params })); }
+      catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
     });
   }
 
@@ -383,7 +421,7 @@ class CdpClient {
   async clickElement(expression) {
     const target = resolveElement(expression);
     await this.waitFor(
-      `(() => { const element = ${target}; return element !== null && element.disabled !== true; })()`,
+      `(() => { const element = ${target}; return element !== null && element.disabled !== true && !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length); })()`,
       5_000,
       'click target enabled',
     );
@@ -424,7 +462,7 @@ class CdpClient {
   async typeInto(expression, text) {
     const target = resolveElement(expression);
     await this.waitFor(
-      `(() => { const element = ${target}; return element !== null && element.disabled !== true; })()`,
+      `(() => { const element = ${target}; return element !== null && element.disabled !== true && !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length); })()`,
       5_000,
       'input target enabled',
     );
@@ -454,7 +492,7 @@ class CdpClient {
 
 function waitForExit(child, timeoutMs = 20_000) {
   return new Promise((resolve, reject) => {
-    if (child.exitCode !== null) {
+    if (child.exitCode !== null || child.signalCode !== null) {
       resolve({ code: child.exitCode, signal: child.signalCode });
       return;
     }
@@ -466,6 +504,10 @@ function waitForExit(child, timeoutMs = 20_000) {
       resolve({ code, signal });
     });
   });
+}
+
+function childAlive(child) {
+  return child.exitCode === null && child.signalCode === null;
 }
 
 async function setupDom(cdp) {
@@ -566,7 +608,7 @@ async function closeInstance(instance, reason = 'failure-cleanup') {
     instance.cleanupError = 'host process never spawned';
     return false;
   }
-  if (instance.child.exitCode !== null) {
+  if (!childAlive(instance.child)) {
     return false;
   }
 
@@ -594,10 +636,15 @@ async function closeInstance(instance, reason = 'failure-cleanup') {
     }
   }
   // 身份核对期间进程可能已自然退出；不能把自然退出记成清理杀进程。
-  if (instance.child.exitCode !== null) {
+  if (!childAlive(instance.child)) {
     return false;
   }
 
+  if (!identityVerified) {
+    instance.cleanupReason = reason;
+    instance.cleanupError = 'refused forced cleanup because PID, executable path, or synthetic data-dir did not match';
+    return false;
+  }
   instance.cleanupReason = reason;
   instance.child.kill();
   instance.cleanupKilled = true;
@@ -782,7 +829,7 @@ async function mainWindowVisible(instance) {
 async function waitForMainVisible(instance, visible, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (instance.child.exitCode !== null) return false;
+    if (!childAlive(instance.child)) return false;
     try {
       if ((await mainWindowVisible(instance)) === visible) return true;
     } catch {
@@ -822,7 +869,7 @@ async function invokeWindowWithContext(instance, command) {
 }
 
 async function recoverMain(instance) {
-  if (instance.child.exitCode !== null) return;
+  if (!childAlive(instance.child)) return;
   try {
     if ((await cdpDialogPresent(instance))) {
       await clickDialogCancel(instance.cdp).catch(() => {});
@@ -870,7 +917,7 @@ async function quitNormally(instance) {
   await clickQuitApplication(instance);
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
-    if (instance.child.exitCode !== null) {
+    if (!childAlive(instance.child)) {
       return { code: instance.child.exitCode, signal: instance.child.signalCode };
     }
     if (await cdpDialogPresent(instance)) {
@@ -903,7 +950,7 @@ async function quitWithOptionalConfirm(instance, { componentUnmounted = false } 
   const dialogs = [];
   let confirmed = false;
   while (Date.now() < deadline) {
-    if (instance.child.exitCode !== null) break;
+    if (!childAlive(instance.child)) break;
     if (await cdpDialogPresent(instance)) {
       const dialog = await dialogText(instance.cdp);
       const label = await clickDialogConfirm(instance.cdp);
@@ -1042,12 +1089,44 @@ async function check(id, description, run, options = {}) {
 
 async function openPanel(instance, label) {
   const { cdp } = instance;
+  const page = ({ '模型与预设': 'model', '记忆': 'memory', '诊断': 'diagnostics' })[label];
+  if (page !== undefined) {
+    await navigatePage(cdp, page);
+    const panelName = ({ model: '模型设置', memory: '记忆', diagnostics: '运行诊断' })[page];
+    const panelVisible = await cdp.evaluate(`__smoke.panel()?.getAttribute('aria-label') === ${JSON.stringify(panelName)}`);
+    if (panelVisible !== true) {
+      await cdp.clickElement(`.sidebar .nav-item[data-page="${page}"]`);
+      await cdp.waitFor(
+        `__smoke.panel()?.getAttribute('aria-label') === ${JSON.stringify(panelName)}`,
+        8_000,
+        `${label} panel reopened from sidebar`,
+      );
+    }
+    return;
+  }
   await cdp.clickElement(B(label));
   await cdp.waitFor(
     `__smoke.panel() !== null && __smoke.panelText().includes(${JSON.stringify(label)})`,
     8_000,
     `${label} panel`,
   );
+}
+
+async function navigatePage(cdp, page) {
+  await cdp.clickElement(`.sidebar .nav-item[data-page="${page}"]`);
+  await cdp.waitFor(
+    `(__smoke.currentPage() === ${JSON.stringify(page)} && __smoke.pageVisible(${JSON.stringify(page)})) || __smoke.dialog() !== null`,
+    8_000,
+    `${page} page and navigation synchronized`,
+  );
+  const state = await cdp.evaluate(`({page:__smoke.currentPage(),visible:__smoke.pageVisible(${JSON.stringify(page)}),dialog:__smoke.dialogText()})`);
+  if (state.dialog) throw new CheckFailure(`navigation to ${page} is blocked by confirmation`, state);
+  ensure(state.page === page && state.visible, `navigation did not reach ${page}`, state);
+}
+
+async function typeChat(cdp, text) {
+  if (await cdp.evaluate(`__smoke.currentPage() !== 'chat'`) === true) await navigatePage(cdp, 'chat');
+  await cdp.typeInto('#chat-input', text);
 }
 
 async function scenarioIpcBoundary(instance) {
@@ -1078,6 +1157,7 @@ async function scenarioIpcBoundary(instance) {
 
 async function scenarioModelAndChat(instance, model) {
   const { cdp } = instance;
+  await navigatePage(cdp, 'model');
 
   await check('ui.model-config-applied', '通过 DOM 表单完成端点/模型/人设/密钥配置并清空密码框', async () => {
     await openPanel(instance, '模型与预设');
@@ -1160,7 +1240,7 @@ async function scenarioModelAndChat(instance, model) {
 
   await check('net.no-transmission-without-consent', '未获发送许可时点击发送不产生网络请求', async () => {
     const before = model.state.requests;
-    await cdp.typeInto('#chat-input', 'permission denial must stay local');
+    await typeChat(cdp, 'permission denial must stay local');
     await cdp.waitFor(`!${B('发送')}.disabled`, 3_000, 'send button enabled');
     await cdp.clickElement(B('发送'));
     await cdp.waitFor(`__smoke.alerts().includes('发送消息')`, 8_000, 'denial alert');
@@ -1183,6 +1263,7 @@ async function scenarioModelAndChat(instance, model) {
   });
 
   await check('net.consent-granted-retains-process-key', '通过真实复选框授予发送许可并用进程密钥应用', async () => {
+    await openPanel(instance, '模型与预设');
     await cdp.waitFor(`__smoke.allowTransmissionCheckbox() !== null`, 3_000, 'consent checkbox');
     const wasChecked = await cdp.evaluate(`__smoke.allowTransmissionCheckbox().checked`);
     if (!wasChecked) await cdp.clickElement(`__smoke.allowTransmissionCheckbox()`);
@@ -1209,7 +1290,7 @@ async function scenarioModelAndChat(instance, model) {
 
   await check('chat.loopback-send-and-reply-displayed', '点击发送后显示回环回复，模型请求参数完整', async () => {
     const before = model.state.requests;
-    await cdp.typeInto('#chat-input', 'synthetic smoke prompt');
+    await typeChat(cdp, 'synthetic smoke prompt');
     await cdp.waitFor(`!${B('发送')}.disabled`, 3_000, 'send button enabled after draft');
     await cdp.clickElement(B('发送'));
     await cdp.waitFor(
@@ -1271,18 +1352,19 @@ async function scenarioModelAndChat(instance, model) {
 
 async function scenarioMemoryAndDiagnostics(instance, model) {
   const { cdp } = instance;
+  await navigatePage(cdp, 'memory');
 
   await check('memory.remember-visible', '通过记忆面板新增一条私密记忆并显示', async () => {
     await openPanel(instance, '记忆');
-    await cdp.waitFor(`${C('新增私密记忆')} !== null`, 5_000, 'remember textarea');
-    await cdp.typeInto(C('新增私密记忆'), 'synthetic restore keepsake');
+    await cdp.waitFor(`document.querySelector('.remember-form textarea') !== null`, 5_000, 'remember textarea');
+    await cdp.typeInto('.remember-form textarea', 'synthetic restore keepsake');
     await cdp.clickElement(B('记住'));
     await cdp.waitFor(
       `__smoke.panelText().includes('synthetic restore keepsake')`,
       10_000,
       'keepsake memory rendered',
     );
-    await cdp.typeInto(C('新增私密记忆'), 'synthetic blue tea');
+    await cdp.typeInto('.remember-form textarea', 'synthetic blue tea');
     await cdp.clickElement(B('记住'));
     await cdp.waitFor(
       `__smoke.panelText().includes('synthetic blue tea')`,
@@ -1337,9 +1419,10 @@ async function scenarioMemoryAndDiagnostics(instance, model) {
   });
 
   await check('memory.updated-note-recalled-in-next-request', '界面修改的记忆在下一轮获准请求中使用最新版本', async () => {
+    await navigatePage(cdp, 'chat');
     const before = model.state.requests;
     const messagesBefore = (await readSnapshot(cdp)).chat.messages.length;
-    await cdp.typeInto("document.querySelector('#chat-input')", 'synthetic smoke prompt tea');
+    await typeChat(cdp, 'synthetic smoke prompt tea');
     await cdp.clickElement(B('发送'));
     await waitForSnapshot(
       cdp,
@@ -1362,6 +1445,7 @@ async function scenarioMemoryAndDiagnostics(instance, model) {
   });
 
   await check('memory.confirmed-delete-visible', '确认删除需要二次点击并更新列表', async () => {
+    await navigatePage(cdp, 'memory');
     await cdp.clickElement(itemButton('删除', 'synthetic green tea'));
     await cdp.waitFor(
       `__smoke.button('确认删除', __smoke.memoryItem('synthetic green tea')) !== null`,
@@ -1401,8 +1485,6 @@ async function scenarioMemoryAndDiagnostics(instance, model) {
   });
 
   await check('diagnostics.entry-refreshes', '诊断入口打开并通过按钮刷新有界列表', async () => {
-    await cdp.clickElement(B('关闭面板'));
-    await cdp.waitFor(`__smoke.panel() === null`, 5_000, 'memory panel closed');
     await openPanel(instance, '诊断');
     await cdp.clickElement(B('刷新诊断'));
     await cdp.waitFor(
@@ -1417,7 +1499,7 @@ async function scenarioMemoryAndDiagnostics(instance, model) {
     if (snapshot.diagnostics.length > 0) {
       ensure(rendered > 0, 'diagnostics list did not render authorized events');
     } else {
-      ensure((await panelText(cdp)).includes('暂无诊断事件'), 'empty diagnostics state missing');
+      ensure((await panelText(cdp)).includes('还没有可展示的诊断事件'), 'empty diagnostics state missing');
     }
     ensure(!(await cdp.evaluate(`__smoke.alerts()`)).includes('诊断'), 'diagnostics refresh surfaced an alert');
     return { diagnostics: snapshot.diagnostics.length, rendered };
@@ -1426,6 +1508,7 @@ async function scenarioMemoryAndDiagnostics(instance, model) {
 
 async function scenarioMemoryConflict(instance) {
   const { cdp } = instance;
+  await navigatePage(cdp, 'memory');
 
   await check('memory.conflict-explicit-not-executed-and-recoverable', '真实版本冲突应明确未执行、零覆盖、保留草稿并可刷新重编辑', async () => {
     await openPanel(instance, '记忆');
@@ -1699,7 +1782,7 @@ async function scenarioRestore(instance, model) {
 
   await check('restore.transmission-consent-not-restored', '重启后发送仍被拒绝且不产生新网络请求', async () => {
     const before = model.state.requests;
-    await cdp.typeInto('#chat-input', 'post restart denial probe');
+    await typeChat(cdp, 'post restart denial probe');
     await cdp.waitFor(`!${B('发送')}.disabled`, 3_000, 'send enabled after restart');
     await cdp.clickElement(B('发送'));
     await cdp.waitFor(`__smoke.alerts().includes('发送消息')`, 8_000, 'restart denial alert');
@@ -1708,7 +1791,7 @@ async function scenarioRestore(instance, model) {
     const snapshot = await readSnapshot(cdp);
     ensure(snapshot.externalTransmissionAllowed === false, 'consent restored in host snapshot');
     ensure(snapshot.chat.status !== 'sending', 'restart send entered sending state');
-    await cdp.typeInto('#chat-input', '');
+    await typeChat(cdp, '');
     await waitForSnapshot(cdp, (state) => state.chat.draft === '', 5_000, 'cleared chat draft');
     const closeHint = await cdp.evaluate(`__smoke.button('关闭提示') !== null`);
     if (closeHint) await cdp.clickElement(B('关闭提示'));
@@ -1718,6 +1801,7 @@ async function scenarioRestore(instance, model) {
 
 async function scenarioManagementDraftExit(instance) {
   const { cdp } = instance;
+  await navigatePage(cdp, 'memory');
   const draft = 'synthetic unsaved management draft';
 
   async function enterDraft() {
@@ -1742,17 +1826,18 @@ async function scenarioManagementDraftExit(instance) {
     return (await cdp.evaluate(`${C('新增私密记忆')}?.value ?? null`)) === draft;
   }
 
-  await check('exit.close-unsaved-draft-cancel', '未保存管理草稿在点击关闭聊天时要求确认，取消保留草稿', async () => {
+  await check('exit.close-unsaved-draft-cancel', '未保存管理草稿通过真实窗口关闭入口要求确认，取消保留草稿', async () => {
     await enterDraft();
-    await cdp.clickElement(B('关闭聊天'));
+    const posted = await postNativeClose(instance);
+    ensure(posted.ok === true, `native window close not delivered: ${JSON.stringify(posted)}`);
     let title;
     try {
       title = await waitForDialog(cdp, 5_000);
-    } catch (error) {
+    } catch {
       const visible = await mainWindowVisible(instance).catch(() => null);
       await recoverMain(instance);
       throw new CheckFailure(
-        'clicking close with an unsaved management draft did not show a confirmation',
+        'native close with an unsaved management draft did not show a confirmation',
         { dialog: false, mainVisible: visible },
       );
     }
@@ -1765,10 +1850,11 @@ async function scenarioManagementDraftExit(instance) {
     return { dialog: title, canceled: true, draftRetained: true };
   });
 
-  await check('exit.close-unsaved-draft-confirm', '未保存管理草稿确认丢弃后关闭聊天并清除草稿', async () => {
+  await check('exit.close-unsaved-draft-confirm', '真实窗口关闭确认丢弃管理草稿、隐藏主窗并保留进程', async () => {
     if (instance.child.exitCode !== null) throw new CheckFailure('process already exited before close confirm');
     await enterDraft();
-    await cdp.clickElement(B('关闭聊天'));
+    const posted = await postNativeClose(instance);
+    ensure(posted.ok === true, `native window close not delivered: ${JSON.stringify(posted)}`);
     let title;
     try {
       title = await waitForDialog(cdp, 5_000);
@@ -1776,22 +1862,17 @@ async function scenarioManagementDraftExit(instance) {
       const visible = await mainWindowVisible(instance).catch(() => null);
       await recoverMain(instance);
       throw new CheckFailure(
-        'clicking close with an unsaved management draft did not offer discard confirmation',
+        'native close with an unsaved management draft did not offer discard confirmation',
         { dialog: false, mainVisible: visible },
       );
     }
-    // 关闭聊天只处理当前会话草稿：确认文案必须是当前会话范围，不承诺丢弃其他会话。
-    ensure(
-      /当前会话草稿/.test(title) && !/所有会话草稿/.test(title),
-      `close confirmation does not scope the discard to the current session: ${title}`,
-      { dialog: title },
-    );
+    ensure(/管理面板|未保存|关闭/.test(title), `unexpected native close confirmation: ${title}`);
     await ensureDialogOperable(instance);
     const confirmLabel = await clickDialogConfirm(cdp);
     await cdp.waitFor(`__smoke.dialog() === null`, 5_000, 'dialog closed after close confirm');
     const hidden = await waitForMainVisible(instance, false, 5_000);
-    ensure(hidden, 'main window did not hide after confirmed close');
-    ensure(instance.child.exitCode === null, 'close confirm exited the whole process');
+    ensure(hidden, 'main window did not hide after confirmed native close');
+    ensure(instance.child.exitCode === null, 'native close confirmation exited the whole process');
     await recoverMain(instance);
     ensure(await waitForMainVisible(instance, true), 'main window did not reopen after close confirm');
     const cleared = await cdp.evaluate(`(async () => {
@@ -1802,7 +1883,7 @@ async function scenarioManagementDraftExit(instance) {
       }
       return __smoke.control('新增私密记忆')?.value ?? null;
     })()`);
-    ensure(cleared === '', `confirmed discard did not clear management draft: ${JSON.stringify(cleared)}`);
+    ensure(cleared === '', `confirmed native close did not clear management draft: ${JSON.stringify(cleared)}`);
     const management = await readSnapshot(cdp);
     ensure(management.managementDraft.dirty === false, 'host management dirty status stayed set after discard receipt');
     return {
@@ -1937,7 +2018,7 @@ async function scenarioManagementDraftExit(instance) {
 async function configureModelViaDom(instance, { endpoint, model, persona, apiKey, allowTransmission = false }) {
   const { cdp } = instance;
   if ((await cdp.evaluate(`__smoke.panel() !== null`)) !== true
-    || !(await cdp.evaluate(`__smoke.panelText().includes('模型与预设')`))) {
+    || !(await cdp.evaluate(`__smoke.panel()?.getAttribute('aria-label') === '模型设置'`))) {
     await openPanel(instance, '模型与预设');
   }
   await cdp.typeInto(C('端点'), endpoint);
@@ -1968,14 +2049,20 @@ async function configureModelViaDom(instance, { endpoint, model, persona, apiKey
  * `discardEdits` 的清理路径才点“放弃并离开”。
  */
 async function closePanelIfOpen(cdp, { discardEdits = false } = {}) {
-  if ((await cdp.evaluate(`__smoke.panel() !== null`)) !== true) {
+  const page = await cdp.evaluate(`document.querySelector('[data-page][aria-current="page"]')?.dataset.page ?? null`);
+  if (!['memory', 'model', 'diagnostics'].includes(page)) {
     return { closed: false, discarded: false };
   }
-  await cdp.clickElement(B('关闭面板'));
+  await cdp.clickElement('.sidebar .nav-item[data-page="chat"]');
+  await cdp.waitFor(
+    `__smoke.currentPage() === 'chat' || __smoke.dialog() !== null`,
+    8_000,
+    'chat navigation or management leave confirmation',
+  );
   const deadline = Date.now() + 5_000;
   let discarded = false;
   while (Date.now() < deadline) {
-    if ((await cdp.evaluate(`__smoke.panel() === null`)) === true) {
+    if ((await cdp.evaluate(`__smoke.currentPage() === 'chat'`)) === true) {
       return { closed: true, discarded };
     }
     if ((await cdp.evaluate(`__smoke.dialog() !== null`)) === true) {
@@ -2036,7 +2123,7 @@ async function dismissAlerts(cdp) {
 
 /** 通过真实输入框清空草稿，并等待宿主确认草稿基线为空。 */
 async function clearChatDraft(cdp, label = 'chat draft cleared') {
-  await cdp.typeInto('#chat-input', '');
+  await typeChat(cdp, '');
   await waitForSnapshot(cdp, (state) => state.chat.draft === '', 5_000, label);
 }
 
@@ -2077,11 +2164,17 @@ function sessionLabelFromSnapshot(snapshot, sessionId) {
 }
 
 async function clickSessionChip(cdp, label) {
+  if (await cdp.evaluate(`__smoke.currentPage() !== 'chat'`) === true) await navigatePage(cdp, 'chat');
   await cdp.clickElement(`__smoke.sessionChip(${JSON.stringify(label)})`);
 }
 
+async function selectBuddy(cdp, label) {
+  if (await cdp.evaluate(`__smoke.currentPage() !== 'buddies'`) === true) await navigatePage(cdp, 'buddies');
+  await cdp.clickElement(`__smoke.buddyChip(${JSON.stringify(label)})`);
+}
+
 async function sendChatViaDom(cdp, text) {
-  await cdp.typeInto('#chat-input', text);
+  await typeChat(cdp, text);
   await cdp.waitFor(
     `__smoke.chatInput()?.value === ${JSON.stringify(text)}`,
     5_000,
@@ -2176,11 +2269,10 @@ async function strictFrontendReady(cdp, timeoutMs = 8_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const ready = await cdp.evaluate(
-      `document.querySelector('.chat-shell') !== null || document.querySelector('.center-state') !== null`,
+      `document.querySelectorAll('.sidebar .nav-item[data-page]').length === 6
+        && document.querySelector('[data-page-view="chat"]') !== null`,
     );
-    if (ready === true) {
-      return cdp.evaluate(`document.querySelector('.chat-shell') !== null`);
-    }
+    if (ready === true) return true;
     await sleep(100);
   }
   return false;
@@ -2203,6 +2295,7 @@ function buddyLabelFromSnapshot(snapshot, buddyId) {
 /** B 伙伴注册表、创建/切换/改名与两个伙伴的隔离真窗验收。 */
 async function scenarioBuddyLifecycle(instance, model) {
   const { cdp } = instance;
+  await navigatePage(cdp, 'buddies');
   const contract = await hostContractReadback(cdp);
   if (!contract.buddySupported) {
     RUN.pending.push({
@@ -2239,6 +2332,11 @@ async function scenarioBuddyLifecycle(instance, model) {
         activeBuddyId: snapshot.activeBuddyId,
         buddies: snapshot.buddies,
       });
+      await cdp.waitFor(
+        `__smoke.buddyChips().length === ${snapshot.buddies.length}`,
+        5_000,
+        'restart buddy controls rendered from the restored host registry',
+      );
       const chips = await cdp.evaluate(`__smoke.buddyChips()`);
       ensure(chips.length === snapshot.buddies.length, 'buddy chips do not match host registry', {
         chips,
@@ -2295,6 +2393,7 @@ async function scenarioBuddyLifecycle(instance, model) {
       '真实 DOM 管理编辑同步携带种类、完整伙伴上下文与精确提交版本（同 ID 修订竞态由组件探针覆盖）',
       async () => {
         try {
+          await navigatePage(cdp, 'buddies');
           await installIpcObserver(cdp);
           await clearIpcCalls(cdp);
           const before = await readSnapshot(cdp);
@@ -2634,6 +2733,7 @@ async function scenarioBuddyLifecycle(instance, model) {
     });
 
     await check('presentation.pet-close-and-restore', '原生关闭宠物后主窗真实按钮恢复宠物，伙伴与聊天状态不变', async () => {
+      await navigatePage(cdp, 'appearance');
       const before = await readSnapshot(cdp);
       const closed = await runNative(instance, [
         '-Action', 'close-window', '-RootPid', String(instance.pid), '-WindowTitle', 'Moe Buddy Pet',
@@ -2660,6 +2760,7 @@ async function scenarioBuddyLifecycle(instance, model) {
     });
 
     await check('buddy.create-isolated', '真实 DOM 创建伙伴后选择新伙伴，且不继承消息、草稿、配置或凭据', async () => {
+      await navigatePage(cdp, 'buddies');
       await installIpcObserver(cdp);
       await clearIpcCalls(cdp);
       const before = await readSnapshot(cdp);
@@ -2784,7 +2885,7 @@ async function scenarioBuddyLifecycle(instance, model) {
       const sessionIdB = (await readSnapshot(cdp)).activeSessionId;
 
       // 切回伙伴 A：A 自己的消息仍在，B 的正文不出现。
-      await cdp.clickElement(`__smoke.buddyChip(${JSON.stringify(buddyALabel)})`);
+        await selectBuddy(cdp, buddyALabel);
       await waitForSnapshot(cdp, (state) => state.activeBuddyId === buddyAId, 15_000, 'back to buddy A');
       const backA = await readSnapshot(cdp);
       const aText = await cdp.evaluate(`__smoke.messagesText()`);
@@ -2796,9 +2897,9 @@ async function scenarioBuddyLifecycle(instance, model) {
 
       // 同一局部会话 ID/标签也不共享草稿：只比较界面正文与宿主草稿，不按名称推断身份。
       const draftA = 'buddy A 的隔离草稿';
-      await cdp.typeInto('#chat-input', draftA);
+      await typeChat(cdp, draftA);
       await waitForSnapshot(cdp, (state) => state.chat.draft === draftA, 10_000, 'buddy A draft synced');
-      await cdp.clickElement(`__smoke.buddyChip(${JSON.stringify(buddyBLabel)})`);
+        await selectBuddy(cdp, buddyBLabel);
       await waitForSnapshot(cdp, (state) => state.activeBuddyId === buddyBId, 15_000, 'back to buddy B');
       const backB = await readSnapshot(cdp);
       ensure(backB.activeSessionId === sessionIdB, 'buddy B session selection was replaced', {
@@ -2818,7 +2919,7 @@ async function scenarioBuddyLifecycle(instance, model) {
 
       // A→B→A：草稿与消息按伙伴恢复，目录修订不得回到旧值。
       const revisionBefore = backB.buddiesRevision;
-      await cdp.clickElement(`__smoke.buddyChip(${JSON.stringify(buddyALabel)})`);
+        await selectBuddy(cdp, buddyALabel);
       const backA2 = await waitForSnapshot(
         cdp,
         (state) => state.activeBuddyId === buddyAId && state.chat.draft === draftA,
@@ -2854,8 +2955,8 @@ async function scenarioBuddyLifecycle(instance, model) {
       const memoryA = 'buddy A private memory';
       const memoryB = 'buddy B private memory';
       await openPanel(instance, '记忆');
-      await cdp.waitFor(`${C('新增私密记忆')} !== null`, 5_000, 'buddy A memory composer');
-      await cdp.typeInto(C('新增私密记忆'), memoryA);
+      await cdp.waitFor(`document.querySelector('.remember-form textarea') !== null`, 5_000, 'buddy A memory composer');
+      await cdp.typeInto('.remember-form textarea', memoryA);
       await cdp.clickElement(B('记住'));
       await cdp.waitFor(
         `__smoke.panelText().includes(${JSON.stringify(memoryA)})`,
@@ -2866,7 +2967,7 @@ async function scenarioBuddyLifecycle(instance, model) {
       ensure(aSnap.memories.some((memory) => memory.text === memoryA), 'buddy A memory missing from host');
       await closePanelIfOpen(cdp);
 
-      await cdp.clickElement(`__smoke.buddyChip(${JSON.stringify(buddyBLabel)})`);
+        await selectBuddy(cdp, buddyBLabel);
       await waitForSnapshot(cdp, (state) => state.activeBuddyId === buddyBId, 15_000, 'buddy B for memory isolation');
       await openPanel(instance, '记忆');
       await cdp.clickElement(B('刷新列表'));
@@ -2896,7 +2997,7 @@ async function scenarioBuddyLifecycle(instance, model) {
       );
       await closePanelIfOpen(cdp);
 
-      await cdp.clickElement(`__smoke.buddyChip(${JSON.stringify(buddyALabel)})`);
+        await selectBuddy(cdp, buddyALabel);
       await waitForSnapshot(cdp, (state) => state.activeBuddyId === buddyAId, 15_000, 'buddy A restored for memory isolation');
       await openPanel(instance, '记忆');
       await cdp.clickElement(B('刷新列表'));
@@ -2924,6 +3025,7 @@ async function scenarioBuddyLifecycle(instance, model) {
     });
 
     await check('buddy.rename-profile-only', '真实 DOM 改名只推进档案版本，实例 ID、人设与模型版本保持', async () => {
+      await navigatePage(cdp, 'buddies');
       const before = await readSnapshot(cdp);
       const activeBefore = buddyRevisionsOf(before, before.activeBuddyId);
       const newLabel = `${buddyLabelFromSnapshot(before, before.activeBuddyId)}-改名`;
@@ -3018,9 +3120,7 @@ async function scenarioBuddyLifecycle(instance, model) {
         ensure(currentId !== null, 'no active buddy before the whole-application Quit check');
         const otherId = currentId === buddyAId ? buddyBId : buddyAId;
         await clearChatDraft(cdp, 'active buddy draft cleared');
-        await cdp.clickElement(
-          `__smoke.buddyChip(${JSON.stringify(buddyLabelFromSnapshot(before, otherId))})`,
-        );
+        await selectBuddy(cdp, buddyLabelFromSnapshot(before, otherId));
         const other = await waitForSnapshot(
           cdp,
           (state) => state.activeBuddyId === otherId,
@@ -3029,16 +3129,14 @@ async function scenarioBuddyLifecycle(instance, model) {
         );
         await clearChatDraft(cdp, 'other buddy prior draft cleared');
         const draft = '跨伙伴退出保护草稿';
-        await cdp.typeInto('#chat-input', draft);
+        await typeChat(cdp, draft);
         await waitForSnapshot(
           cdp,
           (state) => state.chat.draft === draft,
           10_000,
           'other buddy draft synced',
         );
-        await cdp.clickElement(
-          `__smoke.buddyChip(${JSON.stringify(buddyLabelFromSnapshot(other, currentId))})`,
-        );
+        await selectBuddy(cdp, buddyLabelFromSnapshot(other, currentId));
         await waitForSnapshot(
           cdp,
           (state) => state.activeBuddyId === currentId,
@@ -3105,7 +3203,7 @@ async function scenarioBuddyRestart(instance, outcome) {
       const otherId = snapshot.activeBuddyId === outcome.buddyAId
         ? outcome.buddyBId
         : outcome.buddyAId;
-      await cdp.clickElement(`__smoke.buddyChip(${JSON.stringify(buddyLabelFromSnapshot(snapshot, otherId))})`);
+      await selectBuddy(cdp, buddyLabelFromSnapshot(snapshot, otherId));
       const other = await waitForSnapshot(cdp, (state) => state.activeBuddyId === otherId, 15_000, 'other buddy selected after restart');
       const text = await cdp.evaluate(`__smoke.messagesText()`);
       ensure(text.length >= 0, 'messages text unavailable');
@@ -3234,7 +3332,7 @@ async function scenarioSessionLifecycle(instance, model) {
     await waitForSnapshot(cdp, (state) => state.activeSessionId === sessionA, 10_000, 'back to A');
 
     const draftA = 'A 的会话草稿';
-    await cdp.typeInto('#chat-input', draftA);
+    await typeChat(cdp, draftA);
     await waitForSnapshot(cdp, (state) => state.chat.draft === draftA, 10_000, 'A draft synced');
 
     await clickSessionChip(cdp, labelB);
@@ -3264,22 +3362,34 @@ async function scenarioSessionLifecycle(instance, model) {
     ensure(other !== undefined, 'no second session available for the failed switch');
     const otherLabel = other.label.trim().length > 0 ? other.label : other.id;
 
-    // 超过宿主 8 KiB 命令载荷的草稿会让真实 set_draft 失败（input_budget），从而取消切换；
-    // 这不是放宽解析，而是用真实边界验证失败分支的保稿与不串会话。
+    // 等待真实超预算提示落定，避免横幅出现时改变会话按钮的点击坐标。
     const oversized = 'x'.repeat(9_000);
     try {
-      await cdp.typeInto('#chat-input', oversized);
+      await typeChat(cdp, oversized);
       await cdp.waitFor(
         `__smoke.chatInput()?.value.length === ${oversized.length}`,
         10_000,
         'oversized draft typed',
       );
+      await cdp.waitFor(
+        `__smoke.alerts().includes('input_too_large')`,
+        10_000,
+        'oversized draft input_budget failure settled',
+      );
       await clickSessionChip(cdp, otherLabel);
       // 取消提示是 role="alert" 的错误横幅（不是 role="status" 的告警行）。
       await cdp.waitFor(
-        `__smoke.alerts().includes('草稿尚未同步') && __smoke.alerts().includes('已取消')`,
+        `__smoke.alerts().includes('本次会话操作已取消') && __smoke.alerts().includes('草稿已保留')`,
         10_000,
         'failed draft sync cancels switch',
+      );
+      const switchAlert = await cdp.evaluate(`__smoke.alerts()`);
+      ensure(
+        switchAlert.includes('草稿尚未同步到桌面宿主')
+          && switchAlert.includes('本次会话操作已取消')
+          && switchAlert.includes('草稿已保留'),
+        'failed draft sync alert did not report cancellation and retained draft',
+        { switchAlert },
       );
       const after = await readSnapshot(cdp);
       const input = await cdp.evaluate(`__smoke.chatInput()?.value ?? ''`);
@@ -3341,12 +3451,12 @@ async function scenarioSessionLifecycle(instance, model) {
       await clickSessionChip(cdp, otherLabel);
       await waitForSnapshot(cdp, (state) => state.activeSessionId === other.id, 10_000, 'other session active');
       const otherDraft = 'B 保留草稿';
-      await cdp.typeInto('#chat-input', otherDraft);
+      await typeChat(cdp, otherDraft);
       await waitForSnapshot(cdp, (state) => state.chat.draft === otherDraft, 10_000, 'other session draft synced');
       await clickSessionChip(cdp, activeLabel);
       await waitForSnapshot(cdp, (state) => state.activeSessionId === activeId, 10_000, 'back to discard target');
       const targetDraft = 'A 待丢弃草稿';
-      await cdp.typeInto('#chat-input', targetDraft);
+      await typeChat(cdp, targetDraft);
       await waitForSnapshot(cdp, (state) => state.chat.draft === targetDraft, 10_000, 'target draft synced');
       const beforeDiscard = await readSnapshot(cdp);
       const revisionBefore = beforeDiscard.chatDraft.revision;
@@ -3355,6 +3465,7 @@ async function scenarioSessionLifecycle(instance, model) {
       });
 
       // 真实按钮关闭并确认丢弃（只承诺当前会话草稿）。
+      await navigatePage(cdp, 'chat');
       await cdp.clickElement(B('关闭聊天'));
       const dialog = await waitForDialog(cdp, 5_000);
       ensure(/当前会话草稿/.test(dialog) && !/所有会话草稿/.test(dialog), `close dialog does not scope the discard: ${dialog}`, {
@@ -3449,8 +3560,9 @@ async function scenarioSessionLifecycle(instance, model) {
 
       // A 真实按钮显式丢弃，拿到带 A 会话水位的权威快照。
       const targetDraft = 'A 跨会话丢弃草稿';
-      await cdp.typeInto('#chat-input', targetDraft);
+      await typeChat(cdp, targetDraft);
       await waitForSnapshot(cdp, (state) => state.chat.draft === targetDraft, 10_000, 'cross-session target draft synced');
+      await navigatePage(cdp, 'chat');
       await cdp.clickElement(B('关闭聊天'));
       await waitForDialog(cdp, 5_000);
       await ensureDialogOperable(instance);
@@ -3479,7 +3591,7 @@ async function scenarioSessionLifecycle(instance, model) {
       await clickSessionChip(cdp, otherLabel);
       await waitForSnapshot(cdp, (state) => state.activeSessionId === other.id, 10_000, 'other session active after discard');
       const otherDraft = 'B 推进全局修订';
-      await cdp.typeInto('#chat-input', otherDraft);
+      await typeChat(cdp, otherDraft);
       await waitForSnapshot(cdp, (state) => state.chat.draft === otherDraft, 10_000, 'other session draft synced after discard');
       const afterOther = await readSnapshot(cdp);
       const aAfterOther = entryOf(afterOther, activeId);
@@ -3649,7 +3761,7 @@ async function scenarioSessionLifecycle(instance, model) {
     ensure(model.state.requests - requestsBefore === 1, 'unknown request was retried');
 
     const oldDraft = 'A 未知会话旧草稿';
-    await cdp.typeInto('#chat-input', oldDraft);
+    await typeChat(cdp, oldDraft);
     await cdp.waitFor(`__smoke.chatInput()?.value === ${JSON.stringify(oldDraft)}`, 5_000, 'old draft typed');
     const requestsBeforeCreate = model.state.requests;
     const sessionsBefore = unknown.sessionsRevision;
@@ -3780,14 +3892,13 @@ async function scenarioSessionStorageUnknown(instance, model) {
 
       const before = await readSnapshot(cdp);
       ensure(before.sessionIsolationAllowed === false, 'host granted isolation despite a storage unknown');
-      ensure((await cdp.evaluate(`${B('新建会话')}?.disabled`)) === true, 'new session stayed enabled under storage unknown');
-      const title = await cdp.evaluate(`${B('新建会话')}?.title ?? ''`);
+      ensure((await cdp.evaluate(`__smoke.sessionAction('新建会话')?.disabled`)) === true, 'new session stayed enabled under storage unknown');
+      const title = await cdp.evaluate(`__smoke.sessionAction('新建会话')?.title ?? ''`);
       ensure(
         title.includes('未确认') || title.includes('全局') || title.includes('不能解除'),
         `new session title does not explain the global unknown: ${title}`,
       );
       const beforeRevision = before.sessionsRevision;
-      await cdp.evaluate(`${B('新建会话')}?.click()`);
       await sleep(1_000);
       const after = await readSnapshot(cdp);
       ensure(after.activeSessionId === before.activeSessionId, 'storage unknown was bypassed by a new session');
@@ -4039,6 +4150,7 @@ async function scenarioPublishFailure(instance, model) {
       ensure(alertsBeforeReread.includes('未确认'), 'publish failure was not reported as unknown', evidence);
       ensure(!alertsBeforeReread.includes('未执行'), 'publish failure falsely claimed the configuration was not executed', evidence);
       ensure(afterReread.unknownLock === true, 'successful snapshot reread silently cleared the unknown command lock', evidence);
+      ensure(await cdp.evaluate(`__smoke.currentPage() === 'chat'`), 'reread left a management page without its business panel');
       ensure(afterReread.send.disabled === true, 'send unlocked after an unknown publish result', evidence);
       // Apply 可能因面板关闭而隐藏，也可能仍存在但禁用；两者都不是可操作。
       ensure(afterReread.apply.operable === false, 'model apply became operable after an unknown publish result', evidence);
@@ -4060,6 +4172,24 @@ async function scenarioPublishFailure(instance, model) {
         evidence,
       );
       return evidence;
+    });
+
+    await check('unknown.global-revoke-reachable', '注册表 Unknown 拒绝诊断导航后，全局撤权按钮仍可取消并确认', async () => {
+      ensure(blockerReady && await cdp.evaluate('__smoke.unknownLock()'), 'registry Unknown prerequisite missing');
+      await navigatePage(cdp, 'buddies');
+      await cdp.clickElement('.sidebar .nav-item[data-page="diagnostics"]');
+      await cdp.waitFor(`__smoke.alerts().includes('buddy_storage_unknown')`, 5_000, 'rejected diagnostics navigation');
+      ensure(await cdp.evaluate(`__smoke.currentPage() === 'buddies'`), 'failed diagnostics open changed the page');
+      await cdp.clickElement('[data-testid="revoke-authorization"]');
+      await cdp.waitFor(`document.querySelector('[aria-label="撤回授权确认"]') !== null`, 5_000, 'global revocation confirmation');
+      await cdp.clickElement(`__smoke.button('取消', document.querySelector('[aria-label="撤回授权确认"]'))`);
+      ensure((await readSnapshot(cdp)).revoked === false, 'cancel unexpectedly revoked the active buddy');
+      await cdp.clickElement('[data-testid="revoke-authorization"]');
+      await cdp.clickElement(`__smoke.button('确认撤回', document.querySelector('[aria-label="撤回授权确认"]'))`);
+      const revoked = await waitForSnapshot(cdp, (state) => state.revoked === true, 5_000, 'registry Unknown revocation');
+      ensure(revoked.chat.messages.length === 0 && revoked.chat.draft === '', 'revocation retained chat data');
+      await cdp.waitFor(`__smoke.currentPage() === 'chat'`, 5_000, 'revocation returned the Vue page to chat');
+      return { rejectedPage: 'diagnostics', cancelRetainedAuthorization: true, revoked: revoked.revoked };
     });
 
     await check('unknown.publish-failure-cleanup-restores-original', '按原文件证据清理 Publish 故障并核对合成根恢复', async () => {
@@ -4595,6 +4725,7 @@ async function rejectPackageKeepsOldPlayback(instance, packageDir, label, defect
  */
 async function scenarioMaterial(instance, fixtureRoot) {
   const { cdp } = instance;
+  await navigatePage(cdp, 'appearance');
   const failedChecks = [];
   const materialCheck = async (id, description, run) => {
     const ok = await check(id, description, run);
@@ -5603,7 +5734,7 @@ async function main() {
     await scenarioModelAndChat(current, model);
     await scenarioMemoryAndDiagnostics(current, model);
     const businessExitOk = await check('exit.normal-quit', '无未保存草稿时正常退出码为 0', async () => {
-      await current.cdp.typeInto('#chat-input', '');
+          await typeChat(current.cdp, '');
       await waitForSnapshot(
         current.cdp,
         (state) => state.chat.draft === '',
@@ -5774,7 +5905,7 @@ async function main() {
         async () => {
           const initial = await readSnapshot(current.cdp);
           const draftA = '退出保护的非活动会话草稿';
-          await current.cdp.typeInto('#chat-input', draftA);
+          await typeChat(current.cdp, draftA);
           await waitForSnapshot(
             current.cdp,
             (state) => state.chat.draft === draftA,
@@ -6014,11 +6145,11 @@ async function main() {
     (instance, index, list) => list.findIndex((other) => other.pid === instance.pid) === index,
   );
   const stillAlive = createdInstances.filter(
-    (instance) => instance.pid !== undefined && instance.child.exitCode === null,
+    (instance) => instance.pid !== undefined && childAlive(instance.child),
   );
   report.cleanup = {
     launched: createdInstances.length,
-    exited: createdInstances.filter((instance) => instance.child.exitCode !== null).length,
+    exited: createdInstances.filter((instance) => !childAlive(instance.child)).length,
     killed: createdInstances.filter((instance) => instance.cleanupKilled === true).length,
     identityMismatches: createdInstances
       .filter((instance) => instance.cleanupIdentityMismatch === true)

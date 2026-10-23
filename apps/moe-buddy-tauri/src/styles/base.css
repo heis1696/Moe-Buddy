@@ -1,22 +1,25 @@
 :root {
   color-scheme: light;
   font-family:
-    'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', 'Noto Sans SC', system-ui, sans-serif;
-  font-size: 15px;
-  line-height: 1.5;
+    'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', 'Noto Sans SC', system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
   color: var(--ink);
   background: var(--paper);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  --paper: #f7f6f2;
+  /* 主窗 UI 重设计视觉基准：暖白底、灰绿侧栏、深绿主色（见 docs/AGENT-MEMORY-PLAN.md）。 */
+  --paper: #f8f9f5;
   --paper-raised: #fffefa;
-  --moss: #386653;
-  --moss-deep: #2d5443;
-  --moss-soft: #ecefe8;
-  --ink: #262f2b;
-  --muted: #68736c;
-  --line: #dce2da;
-  --danger: #9b4a3c;
+  --surface: #ffffff;
+  --sidebar: #f0f3ec;
+  --moss: #3e6951;
+  --moss-deep: #305640;
+  --moss-soft: #e4eddf;
+  --ink: #29372f;
+  --muted: #748075;
+  --line: #e3e8df;
+  --danger: #a25043;
   --danger-soft: #f7ebe6;
   --warn: #8a6a33;
   --warn-soft: #f3eddc;
@@ -24,6 +27,11 @@
 
 * {
   box-sizing: border-box;
+}
+
+/* 页面切换使用 hidden 属性；任何组件样式都不得让隐藏页重新可见。 */
+[hidden] {
+  display: none !important;
 }
 
 html,

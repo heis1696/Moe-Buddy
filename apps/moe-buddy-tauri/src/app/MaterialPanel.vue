@@ -35,6 +35,11 @@ const props = defineProps<{
   context: BuddyExpectation;
   /** 连接、撤权、关闭确认等外部阻断；为空才允许发起素材命令。 */
   blockedReason: string | null;
+  /**
+   * 所属页面是否处于隐藏状态。隐藏时素材区域不可见也不可命中：
+   * 拖放信号一律忽略，不提示、不进入拖拽高亮，更不接受投放。
+   */
+  pageHidden?: boolean;
 }>();
 
 const STATUS_LABELS: Readonly<Record<MaterialStatus, string>> = {
@@ -289,6 +294,11 @@ function dropPositionInside(position: DragDropSignal['position']): boolean {
 }
 
 function handleDragSignal(signal: DragDropSignal): void {
+  if (props.pageHidden === true) {
+    // 页面隐藏时素材区域不在屏幕上：任何拖放信号都不产生提示或加载。
+    dragActive.value = false;
+    return;
+  }
   if (signal.type === 'leave') {
     dragActive.value = false;
     return;
@@ -450,25 +460,21 @@ onBeforeUnmount(() => {
 <style scoped>
 .material-panel {
   display: grid;
-  gap: 8px;
-  padding: 10px 12px;
-  margin: 8px 0;
-  background: rgba(246, 241, 229, 0.82);
-  border: 1px dashed rgba(84, 121, 100, 0.45);
-  border-radius: 10px;
+  gap: 12px;
 }
 
 .material-drop {
-  padding: 10px 12px;
+  padding: 25px 18px;
   text-align: center;
-  border: 1px dashed rgba(84, 121, 100, 0.55);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.55);
+  border: 1px dashed #a9b99a;
+  border-radius: 12px;
+  background: #f7f9f3;
+  transition: background 0.16s, border-color 0.16s;
 }
 
 .material-drop.active {
-  border-color: #547964;
-  background: rgba(214, 235, 220, 0.72);
+  border-color: #718962;
+  background: #eaf1e0;
 }
 
 .material-drop.disabled {
@@ -476,22 +482,24 @@ onBeforeUnmount(() => {
 }
 
 .material-drop-title {
-  margin: 0 0 4px;
+  margin: 0 0 5px;
   font-weight: 600;
-  color: #2f473c;
+  font-size: 12px;
+  color: var(--ink);
 }
 
 .material-drop-hint {
   margin: 0;
-  font-size: 12px;
-  line-height: 1.5;
-  color: #5e6f66;
+  font-size: 10px;
+  line-height: 1.7;
+  color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .material-readout {
   display: grid;
-  gap: 2px;
-  font-size: 13px;
+  gap: 3px;
+  font-size: 12px;
 }
 
 .material-pack {
@@ -502,30 +510,59 @@ onBeforeUnmount(() => {
 
 .material-readout .muted {
   margin: 0;
-  color: #5e6f66;
+  color: var(--muted);
 }
 
 .material-warn {
   margin: 0;
-  color: #7a3d32;
+  color: var(--danger);
   overflow-wrap: anywhere;
 }
 
 .material-controls {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 7px;
   align-items: end;
+}
+
+.material-controls button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 6px 11px;
+  font-size: 11px;
+  font-weight: 600;
+  min-height: 34px;
+}
+
+.material-controls button:hover {
+  background: #f0f4ed;
+  border-color: #cdd9c8;
+}
+
+.material-refresh {
+  color: var(--muted);
 }
 
 .material-action {
   display: grid;
-  gap: 2px;
+  gap: 5px;
   font-size: 12px;
-  color: #3e5349;
+  font-weight: 600;
+  color: var(--ink);
 }
 
 .material-action select {
   min-width: 8rem;
+  font-weight: 400;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 8px 10px;
+  color: var(--ink);
 }
 </style>

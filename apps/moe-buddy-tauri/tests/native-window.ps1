@@ -1,10 +1,12 @@
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet('windows', 'tray-command', 'tray-handle', 'window-handle', 'close-window', 'process-info')]
+  [ValidateSet('windows', 'tray-command', 'tray-handle', 'window-handle', 'close-window', 'process-info', 'resize-window')]
   [string]$Action,
   [Parameter(Mandatory = $true)]
   [int]$RootPid,
   [int]$MenuId,
+  [int]$Width,
+  [int]$Height,
   [string]$WindowTitle = 'Moe Buddy'
 )
 
@@ -21,6 +23,7 @@ public static class MoeNativeWindow {
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll", SetLastError = true)] public static extern bool PostMessageW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
   [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SendMessageW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll", SetLastError = true)] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
 }
 "@
 
@@ -113,6 +116,25 @@ try {
       # WM_CLOSE 走真实原生关窗事件；不绕过宿主 CloseRequested 协调。
       $posted = [MoeNativeWindow]::PostMessageW([IntPtr]$handle.ToInt64(), 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
       @{ ok = [bool]$posted; handle = $handle.ToInt64() } | ConvertTo-Json -Compress
+    }
+    'resize-window' {
+      if ($Width -lt 320 -or $Height -lt 240) {
+        @{ ok = $false; error = 'requested window size is below minimum'; width = $Width; height = $Height } | ConvertTo-Json -Compress
+        exit 1
+      }
+      $handle = Get-MainWindow
+      if ($null -eq $handle -or $handle -eq [IntPtr]::Zero) {
+        @{ ok = $false; error = 'main window not found'; pid = $RootPid; title = $WindowTitle } | ConvertTo-Json -Compress
+        exit 1
+      }
+      # SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE; the smoke reads innerWidth afterward.
+      $flags = 0x0002 -bor 0x0004 -bor 0x0010
+      $resized = [MoeNativeWindow]::SetWindowPos([IntPtr]$handle.ToInt64(), [IntPtr]::Zero, 0, 0, $Width, $Height, [uint32]$flags)
+      if (-not $resized) {
+        @{ ok = $false; error = 'SetWindowPos failed'; pid = $RootPid; handle = $handle.ToInt64(); width = $Width; height = $Height } | ConvertTo-Json -Compress
+        exit 1
+      }
+      @{ ok = $true; pid = $RootPid; handle = $handle.ToInt64(); requestedWidth = $Width; requestedHeight = $Height } | ConvertTo-Json -Compress
     }
     'tray-handle' {
       $tray = Get-TrayWindow

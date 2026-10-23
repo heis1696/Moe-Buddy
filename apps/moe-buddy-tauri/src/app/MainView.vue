@@ -74,7 +74,6 @@ import {
   hidePanelCommand,
   newSessionCommand,
   openPanelCommand,
-  PANELS,
   refreshDiagnosticsCommand,
   refreshMemoriesCommand,
   rememberCommand,
@@ -150,14 +149,64 @@ import {
 } from '../platform/tauri';
 
 const PANEL_LABELS: Readonly<Record<PanelName, string>> = {
-  presets: '模型与预设',
+  presets: '模型设置',
   memory: '记忆',
-  diagnostics: '诊断',
+  diagnostics: '运行诊断',
 };
 
 function panelLabel(panel: PanelName): string {
   return PANEL_LABELS[panel];
 }
+
+/**
+ * 六个固定页面是纯前端呈现状态，不新增业务 panel 或 IPC 类型。
+ * 记忆/模型/诊断三页各自复用一个既有业务面板；页面切换必须等 Hide/Open
+ * 成功回执后才提交，取消、失败或未知都保持原页面与原草稿。
+ */
+type PageId = 'chat' | 'buddies' | 'appearance' | 'memory' | 'model' | 'diagnostics';
+
+interface PageMeta {
+  /** 页面显示名（面包屑、离开确认文案）。 */
+  name: string;
+  /** 页面主标题（h1，兼作焦点目标）。 */
+  title: string;
+  /** 侧栏导航文案；与样稿一致用产品名，不牺牲表达迁就旧脚本文案。 */
+  nav: string;
+}
+
+const PAGES: Readonly<Record<PageId, PageMeta>> = {
+  chat: { name: '聊天', title: '聊聊今天', nav: '聊天' },
+  buddies: { name: '伙伴', title: '陪伴，各有模样', nav: '伙伴' },
+  appearance: { name: '外观与动作', title: '换一种可爱', nav: '外观与动作' },
+  memory: { name: '记忆', title: '记住那些小事', nav: '记忆' },
+  model: { name: '模型设置', title: '让对话开始', nav: '模型设置' },
+  diagnostics: { name: '运行诊断', title: '看看运行情况', nav: '运行诊断' },
+};
+
+/** 页面与既有业务面板的唯一对应；纯呈现页为 null。 */
+const PAGE_PANELS: Readonly<Record<PageId, PanelTarget | null>> = {
+  chat: null,
+  buddies: null,
+  appearance: null,
+  memory: 'memory',
+  model: 'presets',
+  diagnostics: 'diagnostics',
+};
+
+const NAV_GROUPS: ReadonlyArray<{ label: string; pages: readonly PageId[] }> = [
+  { label: '日常陪伴', pages: ['chat', 'buddies', 'appearance'] },
+  { label: '管理与设置', pages: ['memory', 'model', 'diagnostics'] },
+];
+
+/** 各页面导航图标的本地 SVG symbol 后缀。 */
+const PAGE_ICONS: Readonly<Record<PageId, string>> = {
+  chat: 'chat',
+  buddies: 'buddy',
+  appearance: 'sparkle',
+  memory: 'memory',
+  model: 'sliders',
+  diagnostics: 'pulse',
+};
 
 const snapshots = new RevisionOrderedSnapshots();
 const snapshot = ref<PrototypeSnapshot | null>(null);
@@ -208,6 +257,13 @@ const panelBusy = ref(false);
 const panelNotice = ref<string | null>(null);
 const pendingPanelLeave = ref<PanelTarget | null>(null);
 const panelGuard = new PanelSwitchGuard();
+/** 已提交的当前页面；只有面板 Hide/Open 成功回执后才会推进。 */
+const activePage = ref<PageId>('chat');
+/** 页面切换在途：等待成功回执期间忽略新的导航，连续点击不得串页。 */
+const pageNavigating = ref(false);
+/** 导航触发的面板离开确认必须记住目标页面；取消时一并丢弃。 */
+const pendingLeavePage = ref<PageId | null>(null);
+const pendingLeaveLabel = ref<string | null>(null);
 let managementDraftSync = createManagementDraftSync();
 /** 管理同步状态变化时推进，让依赖它的只读界面重新求值。 */
 const managementSyncRevision = ref(0);
@@ -243,7 +299,6 @@ const activeBuddyId = computed(() => buddyCatalog.value?.activeBuddyId ?? null);
 const hasActiveBuddyContext = computed(
   () => activeBuddyId.value !== null && isSafeBuddyId(activeBuddyId.value),
 );
-const activeBuddyRevisions = computed(() => buddyRevisionText(activeBuddy.value));
 /**
  * 素材命令在发起时捕获当前完整 B context；这里只做只读投影，不消费
  * buddyCommit、不清管理稿，也不解除任何 Unknown。
@@ -294,6 +349,11 @@ const interactionLocked = computed(
     closeConfirmation.value ||
     managementExitConfirmation.value !== null ||
     revokeArmed.value,
+);
+// 注册表 Unknown 仍允许撤权；入口不能依赖管理面板打开成功或普通业务许可。
+const canRequestRevoke = computed(
+  () => connectionState.value === 'ready' && snapshot.value !== null &&
+    !revoked.value && !interactionLocked.value && !panelBusy.value,
 );
 const canCompose = computed(
   () =>
@@ -585,13 +645,15 @@ const panelDirty = computed(() => {
   if (activePanel.value === 'memory') return memoryPanelDirty.value;
   return false;
 });
-const activePanelLabel = computed(() =>
-  activePanel.value === null ? '' : panelLabel(activePanel.value),
-);
 const pendingLeaveDescription = computed(() => {
   if (pendingPanelLeave.value === null) return '';
-  if (pendingPanelLeave.value === 'close') return '关闭当前面板会丢弃未保存的修改。';
-  return `切换到「${panelLabel(pendingPanelLeave.value)}」会丢弃未保存的修改。`;
+  if (pendingPanelLeave.value === 'close') {
+    const label = pendingLeaveLabel.value;
+    return label === null
+      ? '关闭当前面板会丢弃未保存的修改。'
+      : `切换到「${label}」会丢弃未保存的修改。`;
+  }
+  return `切换到「${pendingLeaveLabel.value ?? panelLabel(pendingPanelLeave.value)}」会丢弃未保存的修改。`;
 });
 const memoryEditStale = computed(() => memoryEditSuperseded(memoryEdit.value, memories.value));
 
@@ -941,7 +1003,10 @@ function adoptBuddyScope(previousSnapshot: PrototypeSnapshot | null): void {
   draft.value = '';
   // 面板与管理编辑属于旧伙伴：直接结束，不把未保存内容或 API Key 带入新伙伴。
   activePanel.value = null;
+  if (PAGE_PANELS[activePage.value] !== null) activePage.value = 'chat';
   pendingPanelLeave.value = null;
+  pendingLeavePage.value = null;
+  pendingLeaveLabel.value = null;
   panelGuard.cancel();
   panelNotice.value = null;
   resetPanelMemoryState();
@@ -1127,7 +1192,10 @@ function discardPanelDrafts(): void {
 
 function resetSensitiveForRevoke(): void {
   activePanel.value = null;
+  activePage.value = 'chat';
   pendingPanelLeave.value = null;
+  pendingLeavePage.value = null;
+  pendingLeaveLabel.value = null;
   panelGuard.cancel();
   panelNotice.value = null;
   resetPanelMemoryState();
@@ -1857,6 +1925,10 @@ async function resolveManagementExit(discard: boolean): Promise<void> {
   }
 }
 
+function requestRevoke(): void {
+  if (canRequestRevoke.value) revokeArmed.value = true;
+}
+
 async function confirmRevoke(): Promise<void> {
   if (busy.value) return;
   const capturedBuddy = buddyExpectationOf(snapshots.current);
@@ -1895,30 +1967,111 @@ async function confirmRevoke(): Promise<void> {
   }
 }
 
-function requestPanel(target: PanelTarget): void {
-  if (!panelActionsAllowed.value || panelBusy.value) return;
-  if (target !== 'close' && target === activePanel.value) return;
-  if (target === 'close' && activePanel.value === null) return;
-  if (!panelGuard.request(target, activePanel.value !== null && panelDirty.value)) {
+/**
+ * 页面导航的前置说明；为 null 才允许发起。面板页需要 Hide/Open IPC，
+ * 纯呈现页在没有面板切换时可直接前往，不受面板许可影响。
+ */
+function pageNavBlockReason(page: PageId): string | null {
+  if (page === activePage.value && PAGE_PANELS[page] === activePanel.value) return null;
+  if (pageNavigating.value || panelBusy.value) {
+    return '上一次页面切换尚未完成，请等待当前导航结束。';
+  }
+  if (closeConfirmation.value || managementExitConfirmation.value !== null || revokeArmed.value) {
+    return '关闭/退出确认处理中，暂不能切换页面。';
+  }
+  const targetPanel = PAGE_PANELS[page];
+  const opensPanel = targetPanel !== null && activePanel.value !== targetPanel;
+  const leavesPanel = activePanel.value !== null && activePanel.value !== targetPanel;
+  if ((opensPanel || leavesPanel) && !panelActionsAllowed.value) {
+    if (revoked.value) return '授权已撤回，没有可用的管理面板。';
+    if (connectionState.value !== 'ready' || snapshot.value === null) {
+      return '尚未连接桌面宿主，暂不能切换管理页面。';
+    }
+    return '桌面宿主确认未完成，暂不能打开或关闭管理面板。';
+  }
+  return null;
+}
+
+/**
+ * 提交页面选择：涉及面板时等待 Hide/Open 成功回执，成功才切换；
+ * 管理稿未保存时先经离开确认，取消不丢稿也不换页。
+ */
+function requestPage(target: PageId): void {
+  if (target === activePage.value && PAGE_PANELS[target] === activePanel.value) return;
+  if (pageNavBlockReason(target) !== null) return;
+  const targetPanel = PAGE_PANELS[target];
+  const leavingDirty =
+    activePanel.value !== null && activePanel.value !== targetPanel && panelDirty.value;
+  if (!panelGuard.request(targetPanel ?? 'close', leavingDirty)) {
     pendingPanelLeave.value = panelGuard.pending;
+    pendingLeavePage.value = target;
+    pendingLeaveLabel.value = PAGES[target].name;
     return;
   }
-  void performPanelAction(target);
+  void performPageTransition(target);
 }
 
 function cancelPanelLeave(): void {
   panelGuard.cancel();
   pendingPanelLeave.value = null;
+  pendingLeavePage.value = null;
+  pendingLeaveLabel.value = null;
 }
 
 function confirmPanelLeave(): void {
   const target = panelGuard.confirm();
+  const page = pendingLeavePage.value;
   pendingPanelLeave.value = null;
+  pendingLeavePage.value = null;
+  pendingLeaveLabel.value = null;
   if (target === null) return;
+  if (page !== null) {
+    void performPageTransition(page);
+    return;
+  }
   void performPanelAction(target);
 }
 
-async function performPanelAction(target: PanelTarget): Promise<void> {
+/**
+ * 页面切换 = 必要的面板 Hide/Open 序列。整串成功才提交目标页面；
+ * Hide 成功但 Open 失败时面板已关闭，回退到聊天首页，错误横幅跨页可见。
+ */
+async function performPageTransition(target: PageId): Promise<void> {
+  pageNavigating.value = true;
+  try {
+    const targetPanel = PAGE_PANELS[target];
+    // 没有业务面板需要切换时只改变呈现；不清错误、不处理未知结果或模拟回执。
+    const ok = activePanel.value === null && targetPanel === null
+      ? true
+      : await performPanelAction(targetPanel ?? 'close');
+    if (disposed) return;
+    if (ok) {
+      activePage.value = target;
+      void nextTick(() => focusPageHeading(target));
+      if (target === 'chat') scrollToBottom();
+      return;
+    }
+    if (PAGE_PANELS[activePage.value] !== null && activePanel.value === null) {
+      activePage.value = 'chat';
+    }
+  } finally {
+    pageNavigating.value = false;
+  }
+}
+
+/** 切页后把焦点移到页面标题，键盘与读屏用户能感知页面变化。 */
+function focusPageHeading(page: PageId): void {
+  // 组件回归在无 DOM 的 VM 中执行同一脚本；没有文档时跳过焦点管理。
+  if (typeof document === 'undefined') return;
+  const heading = document.getElementById(`page-${page}-title`);
+  if (heading !== null) {
+    heading.tabIndex = -1;
+    heading.focus({ preventScroll: true });
+  }
+}
+
+/** 面板动作按成功回执推进；隐藏成功才清面板，打开成功才登记新面板。 */
+async function performPanelAction(target: PanelTarget): Promise<boolean> {
   panelBusy.value = true;
   panelNotice.value = null;
   clearError();
@@ -1933,12 +2086,12 @@ async function performPanelAction(target: PanelTarget): Promise<void> {
         null,
         capturedBuddy.expectedBuddyId,
       );
-      if (disposed || hidden.kind !== 'success' || revoked.value) return;
+      if (disposed || hidden.kind !== 'success' || revoked.value) return false;
       activePanel.value = null;
       discardPanelDrafts();
     }
     if (target === 'close') {
-      return;
+      return true;
     }
     const update = applyResponse(
       await dispatchPrototype(openPanelCommand(target), capturedBuddy),
@@ -1953,9 +2106,12 @@ async function performPanelAction(target: PanelTarget): Promise<void> {
         memoryNotice.value = null;
         memoryError.value = null;
       }
+      return true;
     }
+    return false;
   } catch (error) {
     if (!disposed && !revoked.value) setError(describeThrownFailure('panel', error), null);
+    return false;
   } finally {
     if (!disposed) panelBusy.value = false;
   }
@@ -3272,704 +3428,1044 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="main-view">
-    <header class="app-header">
-      <div class="identity">
-        <span class="emblem" aria-hidden="true">苔</span>
-        <div>
-          <h1>Moe Buddy</h1>
-          <p class="subtitle">陪伴原型 · Windows 优先</p>
+    <!-- 本地装饰 SVG：仅作界面插画与图标，不代表当前素材或任何业务状态。 -->
+    <svg class="svg-defs" aria-hidden="true" focusable="false">
+      <defs>
+        <symbol id="mb-icon-chat" viewBox="0 0 24 24"><path d="M20 11.4a8.4 8.4 0 0 1-8.5 8.2 9 9 0 0 1-3.4-.7L3 20l1.2-4.5A8 8 0 0 1 3 11.4a8.5 8.5 0 0 1 17 0Z"/><path d="M8 10h8m-8 4h5"/></symbol>
+        <symbol id="mb-icon-buddy" viewBox="0 0 24 24"><path d="M5 10 4 3l6 4h4l6-4-1 7a7 7 0 0 1 1 4c0 4-3.6 7-8 7s-8-3-8-7a7 7 0 0 1 1-4Z"/><path d="M8 13h.01M16 13h.01M10 17q2 2 4 0"/></symbol>
+        <symbol id="mb-icon-sparkle" viewBox="0 0 24 24"><path d="m12 3 2.4 6.6L21 12l-6.6 2.4L12 21l-2.4-6.6L3 12l6.6-2.4Z"/></symbol>
+        <symbol id="mb-icon-memory" viewBox="0 0 24 24"><path d="M5 4h6v16H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm6 0h8a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-8m4-12h3m-3 4h3m-3 4h2"/></symbol>
+        <symbol id="mb-icon-sliders" viewBox="0 0 24 24"><path d="M4 7h3m4 0h9M4 17h9m4 0h3"/><circle cx="9" cy="7" r="2"/><circle cx="15" cy="17" r="2"/></symbol>
+        <symbol id="mb-icon-pulse" viewBox="0 0 24 24"><path d="M3 12h4l3-7 4 14 3-7h4"/></symbol>
+        <symbol id="mb-icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+        <symbol id="mb-icon-send" viewBox="0 0 24 24"><path d="m21 3-6 18-4-8-8-4Zm0 0L11 13"/></symbol>
+        <symbol id="mb-icon-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
+        <symbol id="mb-icon-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5m10.4-3A8 8 0 0 0 5 6m-.4 9A8 8 0 0 0 19 18"/></symbol>
+        <symbol id="mb-icon-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 4v3"/></symbol>
+        <symbol id="mb-icon-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10h.01"/></symbol>
+        <symbol id="mb-icon-window" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M3 9h18m-14 5h4"/></symbol>
+        <symbol id="mb-icon-exit" viewBox="0 0 24 24"><path d="M10 4H5v16h5m-1-8h12m-4-4 4 4-4 4"/></symbol>
+        <symbol id="mb-cat" viewBox="0 0 180 180">
+          <path d="M42 124C21 126 14 112 22 101" fill="none" stroke="#879d72" stroke-width="12" stroke-linecap="round"/>
+          <path d="M48 96C37 119 43 146 61 149h58c18-4 24-27 12-53" fill="#e3eaca" stroke="#82976b" stroke-width="2.5"/>
+          <path d="m43 67 1-38c0-4 4-5 7-2l25 22c9-2 20-2 29 0l26-22c3-3 7-2 7 2l-1 38c21 36 1 66-47 66S22 104 43 67Z" fill="#f3f4dc" stroke="#82976b" stroke-width="2.5"/>
+          <path d="m49 38 1 25 16-12m64-13-1 25-16-12" fill="#dbb5a1" opacity=".7"/>
+          <path d="M64 87q7-8 14 0m25 0q7-8 14 0" stroke="#63754f" stroke-width="3" fill="none" stroke-linecap="round"/>
+          <path d="m86 95 5 5 5-5" fill="#9c9570"/><path d="M91 100v4m-9-1q4 6 9 1 5 5 9-1" stroke="#78845d" stroke-width="2" fill="none" stroke-linecap="round"/>
+          <ellipse cx="58" cy="98" rx="9" ry="5" fill="#e9c0a6" opacity=".65"/><ellipse cx="123" cy="98" rx="9" ry="5" fill="#e9c0a6" opacity=".65"/>
+          <path d="M68 139v10m43-10v10" stroke="#82976b" stroke-width="2.5" stroke-linecap="round"/>
+          <path d="m83 54 5 9m11-9-4 9" stroke="#c4cfaa" stroke-width="3" stroke-linecap="round"/>
+        </symbol>
+      </defs>
+    </svg>
+
+    <!-- 常驻外壳：侧栏与页头从挂载起就存在；连接状态只占据工作区，
+         让导航契约与键盘路径在“正在连接”期间同样可预测。 -->
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="主导航">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"><svg class="icon"><use href="#mb-icon-buddy" /></svg></span>
+          <div class="brand-name">
+            <strong>Moe Buddy</strong>
+            <small>ALWAYS AROUND</small>
+          </div>
         </div>
-      </div>
-      <div class="badges">
-        <span class="offline-badge">离线验证</span>
-        <button
-          type="button"
-          data-testid="quit-application"
-          :disabled="snapshot === null || interactionLocked"
-          title="退出主窗、宠物窗和后台；未保存内容会先提示"
-          @click="requestQuit"
-        >退出应用</button>
-      </div>
-    </header>
-
-    <div v-if="connectionState === 'loading'" class="center-state">
-      <p>正在连接桌面宿主…</p>
-      <p class="muted">初始化聊天状态与事件监听。</p>
-    </div>
-
-    <div v-else-if="connectionState === 'failed'" class="center-state">
-      <p class="center-title">无法连接桌面宿主</p>
-      <p class="muted">{{ fatalMessage }}</p>
-      <button type="button" class="primary" @click="initialize">重试连接</button>
-    </div>
-
-    <section v-else class="chat-shell">
-      <div class="chat-meta">
-        <span class="status-pill" :class="statusTone">状态：{{ statusLabel }}</span>
-        <span v-if="revoked" class="revoked-pill">授权已撤回</span>
-        <span v-if="paused !== null" class="pet-pill">
-          {{ paused ? '宠物已暂停' : '宠物播放中' }}
-        </span>
-        <span class="pet-pill">
-          {{ externalTransmissionAllowed ? '已允许外传' : '仅本地 / 未允许外传' }}
-        </span>
-        <span v-if="busy || panelBusy" class="pending-pill">等待桌面宿主确认…</span>
-        <span class="offline-note">请求经桌面宿主受控发出</span>
-      </div>
-
-      <section
-        v-if="!revoked"
-        class="buddy-bar"
-        aria-label="伙伴列表"
-        :title="buddyCatalogAvailable ? `选择修订 ${buddiesRevision}` : undefined"
-      >
-        <div class="buddy-list">
-          <span v-if="!buddyCatalogAvailable" class="session-empty">
-            桌面宿主尚未提供伙伴注册表；创建、切换与改名暂不可用。
-          </span>
-          <template v-else>
-            <span v-if="buddies.length === 0" class="session-empty">宿主尚未签发任何伙伴。</span>
+        <template v-for="group in NAV_GROUPS" :key="group.label">
+          <p class="nav-label">{{ group.label }}</p>
+          <nav class="navigation" aria-label="页面">
             <button
-              v-for="buddy in buddies"
-              :key="buddy.id"
+              v-for="page in group.pages"
+              :key="page"
               type="button"
-              class="buddy-chip"
-              :class="{ active: buddy.id === activeBuddyId }"
-              :disabled="buddyActionBlockReason !== null || buddy.id === activeBuddyId || busy"
-              :title="
-                buddyActionBlockReason ??
-                `实例 ${buddy.id} · 档案 r${buddy.profileRevision} · 人设 r${buddy.personaRevision} · 模型 r${buddy.modelRevision}`
-              "
-              @click="switchToBuddy(buddy.id)"
+              class="nav-item"
+              :data-page="page"
+              :aria-current="activePage === page ? 'page' : undefined"
+              :disabled="pageNavBlockReason(page) !== null"
+              :title="pageNavBlockReason(page) ?? PAGES[page].name"
+              @click="requestPage(page)"
             >
-              <span class="buddy-name">{{ buddyName(buddy) }}</span>
-              <span class="buddy-revisions">{{ buddyRevisionText(buddy) }}</span>
+              <svg class="icon" aria-hidden="true"><use :href="`#mb-icon-${PAGE_ICONS[page]}`" /></svg>
+              <span class="nav-text">{{ PAGES[page].nav }}</span>
+              <span v-if="activePage === page" class="nav-arrow" aria-hidden="true">›</span>
             </button>
-          </template>
-        </div>
-        <div class="buddy-actions">
+          </nav>
+        </template>
+        <div class="sidebar-bottom">
+          <div v-if="!revoked" class="companion-mini">
+            <span class="avatar" aria-hidden="true"><svg><use href="#mb-cat" /></svg></span>
+            <div class="grow">
+              <strong>{{ activeBuddy ? buddyName(activeBuddy) : '未签发伙伴' }}</strong>
+              <small>当前伙伴</small>
+            </div>
+            <span class="dot" aria-hidden="true"></span>
+          </div>
           <button
+            v-if="snapshot !== null && !revoked"
             type="button"
-            :disabled="createBuddyBlockReason !== null || buddyCreateOpen"
-            :title="createBuddyBlockReason ?? undefined"
-            @click="openBuddyCreate"
+            class="sidebar-revoke"
+            data-testid="revoke-authorization"
+            aria-label="撤回授权"
+            title="撤回本次授权；确认后清空当前展示与草稿"
+            :disabled="!canRequestRevoke"
+            @click="requestRevoke"
           >
-            新建伙伴
+            <svg class="icon" aria-hidden="true"><use href="#mb-icon-lock" /></svg>
+            <span>撤回授权</span>
           </button>
-          <button
-            v-if="activeBuddy !== null"
-            type="button"
-            :disabled="buddyActionBlockReason !== null || buddyRenameOpen"
-            :title="buddyActionBlockReason ?? undefined"
-            @click="openBuddyRename"
-          >
-            伙伴改名
-          </button>
-        </div>
-      </section>
-
-      <p v-if="!revoked" class="buddy-identity" role="status">
-        <span>当前伙伴：{{ activeBuddy ? buddyName(activeBuddy) : '未签发' }}</span>
-        <span v-if="activeBuddy !== null" class="muted">{{ activeBuddyRevisions }}</span>
-        <span class="muted">
-          实例身份由受信服务签发；API Key 与发送许可只属于当前伙伴本次进程，不随伙伴复制或恢复。
-        </span>
-      </p>
-
-      <MaterialPanel
-        v-if="!revoked"
-        :context="materialContext"
-        :blocked-reason="materialBlockReason"
-      />
-
-      <section v-if="!revoked && buddyCreateOpen" class="buddy-form" aria-label="新建伙伴">
-        <label>
-          伙伴名称
-          <input
-            v-model="buddyForm.label"
-            type="text"
-            :disabled="!canMutate"
-            :placeholder="`最多 ${BUDDY_LABEL_MAX} 个 Unicode 字符`"
-            @input="buddyError = null"
-          />
-        </label>
-        <label>
-          伙伴人设
-          <textarea
-            v-model="buddyForm.persona"
-            rows="3"
-            :disabled="!canMutate"
-            :placeholder="`最多 ${BUDDY_PERSONA_MAX_CHARS} 个字符；不继承任何旧伙伴的私密经历`"
-            @input="buddyError = null"
-          />
-        </label>
-        <p class="muted">
-          新实例 ID、私有域与归属由受信注册服务裁决；前端不提供 ID、路径、继承来源或权限字段。
-        </p>
-        <div class="panel-actions">
-          <button type="button" :disabled="busy" @click="cancelBuddyCreate">取消</button>
-          <button type="button" class="primary" :disabled="!canMutate" @click="submitBuddyCreate">
-            创建伙伴
-          </button>
-        </div>
-      </section>
-
-      <section v-if="!revoked && buddyRenameOpen && activeBuddy !== null" class="buddy-form" aria-label="伙伴改名">
-        <label>
-          新的伙伴名称
-          <input
-            v-model="buddyRenameLabel"
-            type="text"
-            :disabled="!canMutate"
-            :placeholder="`最多 ${BUDDY_LABEL_MAX} 个 Unicode 字符`"
-            @input="buddyError = null"
-          />
-        </label>
-        <p class="muted">改名只推进伙伴档案版本，不改变实例 ID、人设、模型配置或已有会话归属。</p>
-        <div class="panel-actions">
-          <button type="button" :disabled="busy" @click="cancelBuddyRename">取消</button>
-          <button type="button" class="primary" :disabled="!canMutate" @click="submitBuddyRename">
-            保存名称
-          </button>
-        </div>
-      </section>
-
-      <p v-if="buddyError" class="chat-failure" role="alert">{{ buddyError }}</p>
-      <p v-if="buddyNotice" class="panel-message" role="status">{{ buddyNotice }}</p>
-
-      <section
-        v-if="!revoked"
-        class="session-bar"
-        aria-label="会话列表"
-        :title="sessionDirectoryRevision !== null ? `目录修订 ${sessionDirectoryRevision}` : undefined"
-      >
-        <div class="session-list">
-          <span v-if="!sessionCatalogAvailable" class="session-empty">
-            桌面宿主尚未提供会话目录；新建、切换与归档暂不可用。
-          </span>
-          <template v-else>
-            <span v-if="sessions.length === 0" class="session-empty">宿主尚未签发任何会话。</span>
-            <button
-              v-for="item in sessions"
-              :key="item.id"
-              type="button"
-              class="session-chip"
-              :class="{ active: item.id === activeSessionId, archived: item.archived }"
-              :disabled="switchSessionBlockReason !== null || item.id === activeSessionId || busy"
-              :title="
-                switchSessionBlockReason ??
-                (item.archived ? '已归档：可只读查看，不能发送' : undefined)
-              "
-              @click="switchToSession(item.id)"
-            >
-              <span class="session-name">{{ sessionLabel(item) }}</span>
-              <span v-if="item.archived" class="session-flag">归档</span>
-              <span class="session-status" :class="sessionTone(item)">{{ statusText(item.status) }}</span>
-            </button>
-          </template>
-        </div>
-        <div class="session-actions">
-          <button
-            type="button"
-            :disabled="newSessionBlockReason !== null"
-            :title="newSessionBlockReason ?? undefined"
-            @click="startNewSession"
-          >
-            新建会话
-          </button>
-          <button
-            v-if="activeSession !== null && !activeSession.archived"
-            type="button"
-            :disabled="archiveBlockReason !== null"
-            :title="archiveBlockReason ?? undefined"
-            @click="requestArchiveSession"
-          >
-            归档当前会话
-          </button>
-        </div>
-      </section>
-
-      <p
-        v-if="newSessionBlockReason !== null && sessionCatalogAvailable && commandUnconfirmed"
-        class="chat-warning"
-        role="status"
-      >
-        {{ newSessionBlockReason }}
-      </p>
-      <p v-if="sendIsolationAllowed" class="chat-warning" role="status">
-        当前会话的上一次发送结果未知：可显式新建隔离会话；旧会话保持 Unknown、草稿按会话保留，不会自动重发。
-      </p>
-      <p v-if="activeSessionArchived" class="archived-banner" role="status">
-        当前会话已归档：只能只读查看，不能发送或继续编辑草稿。本阶段不提供解归档、删除会话或自动创建下一会话。
-      </p>
-
-      <div v-if="!revoked" class="panel-nav" role="group" aria-label="管理入口">
-        <button
-          v-for="panel in PANELS"
-          :key="panel"
-          type="button"
-          :class="{ active: activePanel === panel }"
-          :disabled="!panelActionsAllowed || panelBusy"
-          @click="requestPanel(panel)"
-        >
-          {{ panelLabel(panel) }}
-        </button>
-      </div>
-
-      <p v-if="hostNotice" class="recovery-banner" role="status">
-        <strong>宿主提示：</strong>{{ hostNotice }}
-      </p>
-      <p v-if="persistenceNotice" class="chat-warning" role="status">{{ persistenceNotice }}</p>
-
-      <section
-        v-if="activePanel !== null"
-        class="panel-shell"
-        :aria-label="activePanelLabel"
-      >
-        <header class="panel-head">
-          <h2>{{ activePanelLabel }}</h2>
-          <div class="panel-head-meta">
-            <span v-if="panelBusy" class="pending-pill">等待桌面宿主确认…</span>
+          <div class="sidebar-tools">
             <button
               type="button"
-              :disabled="panelBusy || managementExitConfirmation !== null"
-              @click="requestPanel('close')"
+              :disabled="busy || connectionState !== 'ready'"
+              title="隐藏主窗；宿主确认后才改变窗口可见性"
+              @click="hideChat"
             >
-              关闭面板
+              <svg class="icon" aria-hidden="true"><use href="#mb-icon-window" /></svg>
+              <span>隐藏聊天</span>
             </button>
+            <button
+              type="button"
+              data-testid="quit-application"
+              :disabled="snapshot === null || interactionLocked"
+              title="退出主窗、宠物窗和后台；未保存内容会先提示"
+              @click="requestQuit"
+            >
+              <svg class="icon" aria-hidden="true"><use href="#mb-icon-exit" /></svg>
+              <span>退出应用</span>
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div class="breadcrumb">
+            <span class="crumb-root">我的陪伴空间</span>
+            <span class="slash" aria-hidden="true">/</span>
+            <span>{{ PAGES[activePage].name }}</span>
+          </div>
+          <div class="chat-meta">
+            <span v-if="connectionState === 'ready'" class="status-pill" :class="statusTone">状态：{{ statusLabel }}</span>
+            <span v-if="revoked" class="revoked-pill">授权已撤回</span>
+            <span v-if="paused !== null" class="pet-pill">
+              {{ paused ? '宠物已暂停' : '宠物播放中' }}
+            </span>
+            <span class="pet-pill">
+              {{ externalTransmissionAllowed ? '已允许外传' : '仅本地 / 未允许外传' }}
+            </span>
+            <span v-if="busy || panelBusy" class="pending-pill">等待桌面宿主确认…</span>
+            <span class="offline-note">请求经桌面宿主受控发出</span>
           </div>
         </header>
 
-        <p v-if="panelNotice" class="panel-message" role="status">{{ panelNotice }}</p>
+        <div v-if="connectionState === 'loading'" class="center-state">
+          <p>正在连接桌面宿主…</p>
+          <p class="muted">初始化聊天状态与事件监听。</p>
+        </div>
 
-        <div v-if="activePanel === 'presets'" class="panel-body">
-          <div class="panel-status">
-            <span>当前预设：{{ activePreset || '未选择' }}</span>
-            <span>{{ transmissionStatusText(externalTransmissionAllowed) }}</span>
-            <span>{{ credentialStatusText(modelSettings) }}</span>
-            <span v-if="!persistenceEnabled">本地保存不可用</span>
-          </div>
-          <p v-if="modelChangeHint" class="chat-warning">{{ modelChangeHint }}</p>
-          <p v-if="modelApplyNotice" class="panel-message" role="status">{{ modelApplyNotice }}</p>
+        <div v-else-if="connectionState === 'failed'" class="center-state">
+          <p class="center-title">无法连接桌面宿主</p>
+          <p class="muted">{{ fatalMessage }}</p>
+          <button type="button" class="btn primary" @click="initialize">重试连接</button>
+        </div>
 
-          <section class="panel-block">
-            <h3>可用预设</h3>
-            <p v-if="presets.length === 0" class="muted">桌面宿主尚未返回预设。</p>
-            <ul v-else class="preset-list">
-              <li
-                v-for="preset in presets"
-                :key="preset.id"
-                :class="{ selected: preset.id === activePreset }"
-              >
-                <div class="preset-text">
-                  <strong>{{ preset.label || preset.id }}</strong>
-                  <p class="muted">{{ preset.provider }} · {{ preset.model }}</p>
-                  <p class="muted endpoint">{{ preset.endpoint }}</p>
-                </div>
-                <button
-                  type="button"
-                  :disabled="!canMutate || preset.id === activePreset"
-                  @click="selectPreset(preset)"
-                >
-                  {{ preset.id === activePreset ? '当前预设' : '使用此预设' }}
-                </button>
-              </li>
-            </ul>
-          </section>
+        <template v-else>
+        <!-- 以下横幅与确认属于整个应用：任何页面都可见，不会被切页隐藏。 -->
+        <p v-if="hostNotice" class="recovery-banner" role="status">
+          <strong>宿主提示：</strong>{{ hostNotice }}
+        </p>
+        <p v-if="persistenceNotice" class="chat-warning" role="status">{{ persistenceNotice }}</p>
+        <div v-if="lastError" class="error-banner" role="alert">
+          <span>{{ lastError }}</span>
+          <button type="button" class="ghost" @click="clearError">关闭提示</button>
+        </div>
+        <div v-if="commandUnconfirmed" class="error-banner" role="status">
+          <span>桌面宿主未确认最近一次操作的结果，发送、模型配置与记忆编辑已锁定；请重新读取状态后再操作。</span>
+          <button type="button" class="ghost" @click="initialize">重新读取状态</button>
+        </div>
 
-          <form class="panel-form" @submit.prevent="applyModelSettings">
-            <h3>模型配置与发送许可</h3>
-            <label>
-              端点
-              <input
-                v-model="modelForm.endpoint"
-                type="url"
-                placeholder="https://…/v1/chat/completions"
-                :disabled="!canMutate"
-                @input="onModelIdentityInput"
-              />
-            </label>
-            <label>
-              模型
-              <input
-                v-model="modelForm.model"
-                type="text"
-                :disabled="!canMutate"
-                @input="onModelIdentityInput"
-              />
-            </label>
-            <label>
-              人设
-              <textarea
-                v-model="modelForm.persona"
-                rows="3"
-                :disabled="!canMutate"
-                @input="noteModelInteraction"
-              />
-            </label>
-            <label class="checkbox-row">
-              <input
-                v-model="modelForm.allowTransmission"
-                type="checkbox"
-                :disabled="!canMutate"
-                @change="onTransmissionChange"
-              />
-              允许本次请求向端点发送人设、获准私密记忆和当前会话内容
-            </label>
-            <label>
-              API Key
-              <input
-                v-model="modelForm.apiKeyInput"
-                type="password"
-                autocomplete="off"
-                :disabled="!canMutate"
-                @input="noteModelInteraction"
-                :placeholder="
-                  modelSettings?.hasApiKey
-                    ? '已保存本次进程凭据；留空表示保留'
-                    : '未配置；留空表示不使用'
-                "
-              />
-            </label>
-            <label class="checkbox-row">
-              <input
-                v-model="modelForm.clearApiKey"
-                type="checkbox"
-                :disabled="!canMutate || modelForm.apiKeyInput.length > 0"
-                @change="noteModelInteraction"
-              />
-              本次不使用 / 清除 API Key（以空串显式替换）
-            </label>
-            <p class="muted">API Key 只用于本次桌面宿主进程，不写入快照或本地存储；应用成功后密码框会清空。</p>
-            <p class="muted">配置 API Key 不等于允许外传；许可仅覆盖上方列出的内容。</p>
-            <div class="panel-actions">
+        <section
+          class="page page-chat"
+          data-page-view="chat"
+          aria-labelledby="page-chat-title"
+          :hidden="activePage !== 'chat'"
+        >
+          <header class="page-heading chat-heading">
+            <div>
+              <h1 id="page-chat-title">聊聊今天</h1>
+              <p>平凡的小事，也值得被认真听见。</p>
+            </div>
+            <div class="heading-actions">
               <button
                 type="button"
-                :disabled="!canMutate || !modelPanelDirty"
-                @click="resetModelForm"
+                class="btn quiet"
+                :disabled="busy || revoked || closeConfirmation"
+                @click="requestClose"
               >
-                放弃修改
+                关闭聊天
               </button>
-              <button type="submit" class="primary" :disabled="!canMutate">应用配置</button>
+              <button type="button" class="btn quiet" @click="requestPage('buddies')">
+                <svg class="icon" aria-hidden="true"><use href="#mb-icon-buddy" /></svg>
+                <span>{{ activeBuddy ? buddyName(activeBuddy) : '选择伙伴' }}</span>
+                <span class="muted" aria-hidden="true">⌄</span>
+              </button>
             </div>
-          </form>
-        </div>
-
-        <div v-else-if="activePanel === 'memory'" class="panel-body">
-          <div class="memory-toolbar">
-            <label class="grow">
-              检索
-              <input
-                v-model="memoryQuery"
-                type="search"
-                :disabled="!panelActionsAllowed || panelBusy"
-                @input="noteManagementInteraction"
-                @keyup.enter="searchMemories"
-              />
-            </label>
-            <button
-              type="button"
-              :disabled="!panelActionsAllowed || panelBusy"
-              @click="searchMemories"
-            >
-              检索
-            </button>
-            <button
-              type="button"
-              :disabled="!panelActionsAllowed || panelBusy"
-              @click="refreshMemories"
-            >
-              刷新列表
-            </button>
+          </header>
+          <div v-if="revoked" class="page-content">
+            <div class="empty-state revoked-state">
+              <p class="empty-title">授权已撤回</p>
+              <p>聊天记录、草稿、模型配置与记忆列表已从界面清空。</p>
+              <p>此页面不提供重新授权入口。</p>
+            </div>
           </div>
-
-          <div class="remember-form">
-            <label class="grow">
-              新增私密记忆
-              <textarea
-                v-model="rememberDraft"
-                rows="2"
-                :disabled="!panelActionsAllowed || panelBusy || commandUnconfirmed"
-                @input="noteManagementInteraction"
-              />
-            </label>
-            <button
-              type="button"
-              class="primary"
-              :disabled="!canMutate || rememberDraft.trim().length === 0"
-              @click="rememberMemory"
+          <div v-else class="chat-body">
+            <aside
+              class="sessions"
+              aria-label="会话列表"
+              :title="sessionDirectoryRevision !== null ? `目录修订 ${sessionDirectoryRevision}` : undefined"
             >
-              记住
-            </button>
-          </div>
+              <div class="session-top">
+                <strong>我们的对话</strong>
+                <button
+                  type="button"
+                  class="icon-btn"
+                  aria-label="新建会话"
+                  :disabled="newSessionBlockReason !== null"
+                  :title="newSessionBlockReason ?? '新建会话'"
+                  @click="startNewSession"
+                >
+                  <svg class="icon" aria-hidden="true"><use href="#mb-icon-plus" /></svg>
+                </button>
+              </div>
+              <div class="session-scroll">
+                <span v-if="!sessionCatalogAvailable" class="session-empty">
+                  桌面宿主尚未提供会话目录；新建、切换与归档暂不可用。
+                </span>
+                <template v-else>
+                  <span v-if="sessions.length === 0" class="session-empty">宿主尚未签发任何会话。</span>
+                  <button
+                    v-for="item in sessions"
+                    :key="item.id"
+                    type="button"
+                    class="session-chip"
+                    :class="{ active: item.id === activeSessionId, archived: item.archived }"
+                    :disabled="switchSessionBlockReason !== null || item.id === activeSessionId || busy"
+                    :title="
+                      switchSessionBlockReason ??
+                      (item.archived ? '已归档：可只读查看，不能发送' : undefined)
+                    "
+                    @click="switchToSession(item.id)"
+                  >
+                    <svg class="icon" aria-hidden="true"><use href="#mb-icon-chat" /></svg>
+                    <span class="session-text">
+                      <span class="session-name">{{ sessionLabel(item) }}</span>
+                      <span class="session-sub">
+                        <span v-if="item.archived" class="session-flag">归档</span>
+                        <span class="session-status" :class="sessionTone(item)">{{ statusText(item.status) }}</span>
+                      </span>
+                    </span>
+                  </button>
+                </template>
+              </div>
+              <p class="session-bottom">每一段对话各自保存；归档只读，不会删除原文。</p>
+            </aside>
 
-          <p v-if="memoryError" class="chat-failure" role="alert">{{ memoryError }}</p>
-          <p v-if="memoryNotice" class="panel-message" role="status">{{ memoryNotice }}</p>
-
-          <p v-if="memories.length === 0" class="muted">没有匹配的记忆。新增或刷新后再试。</p>
-          <ul v-else class="memory-list">
-            <li v-for="memory in memories" :key="memory.id">
-              <template v-if="memoryEdit && memoryEdit.id === memory.id">
-                <div class="memory-editor">
-                  <p v-if="memoryEditStale" class="chat-warning">
-                    该记忆版本已变化；保存会被拒绝，当前编辑草稿仍保留。
-                  </p>
-                  <label>
-                    编辑记忆
-                    <textarea
-                      v-model="memoryDraft"
-                      rows="3"
-                      :disabled="!canMutate"
-                      @input="noteManagementInteraction"
-                    />
-                  </label>
-                  <div class="panel-actions">
-                    <button type="button" :disabled="panelBusy" @click="cancelMemoryEdit">
-                      取消编辑
-                    </button>
-                    <button type="button" class="primary" :disabled="!canMutate" @click="saveMemory">
-                      保存修改
-                    </button>
+            <div class="conversation">
+              <div class="conversation-head">
+                <div class="row">
+                  <span class="avatar" aria-hidden="true"><svg><use href="#mb-cat" /></svg></span>
+                  <div class="grow">
+                    <strong>{{ activeBuddy ? buddyName(activeBuddy) : '未签发伙伴' }}</strong>
+                    <small>
+                      <span class="dot" aria-hidden="true"></span>
+                      {{ statusLabel }}
+                    </small>
                   </div>
                 </div>
-              </template>
-              <template v-else>
-                <div class="memory-text">
-                  <p>{{ memory.text }}</p>
-                  <span class="muted">版本 {{ memory.revision }}</span>
+                <button
+                  v-if="activeSession !== null && !activeSession.archived"
+                  type="button"
+                  class="btn quiet"
+                  :disabled="archiveBlockReason !== null"
+                  :title="archiveBlockReason ?? undefined"
+                  @click="requestArchiveSession"
+                >
+                  归档会话
+                </button>
+              </div>
+
+              <div ref="messagesEl" class="messages" aria-live="polite">
+                <div v-if="messages.length === 0" class="empty-state">
+                  <p class="empty-title">还没有消息</p>
+                  <p>这里只展示桌面宿主返回的内容，前端不会模拟回复。</p>
+                  <p>Enter 发送，Shift+Enter 换行。</p>
                 </div>
-                <div class="memory-actions">
-                  <button type="button" :disabled="!canMutate" @click="beginEditMemory(memory)">
-                    编辑
-                  </button>
-                  <template v-if="isMemoryDeleteArmed(deleteArm, memory)">
-                    <button type="button" :disabled="panelBusy" @click="cancelDeleteMemory">
-                      取消
+                <article
+                  v-for="(message, index) in messages"
+                  :key="index"
+                  class="message"
+                  :class="messageClass(message.role)"
+                >
+                  <span
+                    v-if="message.role !== 'user'"
+                    class="avatar avatar-sm"
+                    aria-hidden="true"
+                  ><svg><use href="#mb-cat" /></svg></span>
+                  <div class="message-body">
+                    <p class="message-meta">{{ roleLabel(message.role) }}</p>
+                    <div class="bubble"><p class="text">{{ message.text }}</p></div>
+                  </div>
+                </article>
+              </div>
+
+              <p v-if="activeSessionArchived" class="archived-banner" role="status">
+                当前会话已归档：只能只读查看，不能发送或继续编辑草稿。本阶段不提供解归档、删除会话或自动创建下一会话。
+              </p>
+              <p v-if="sendBlockade" class="chat-warning" role="status">{{ sendBlockade }}</p>
+              <p v-if="chatFailure" class="chat-failure" role="alert">{{ chatFailure }}</p>
+              <p v-if="sendIsolationAllowed" class="chat-warning" role="status">
+                当前会话的上一次发送结果未知：可显式新建隔离会话；旧会话保持 Unknown、草稿按会话保留，不会自动重发。
+              </p>
+              <p
+                v-if="newSessionBlockReason !== null && sessionCatalogAvailable && commandUnconfirmed"
+                class="chat-warning"
+                role="status"
+              >
+                {{ newSessionBlockReason }}
+              </p>
+
+              <div class="composer-wrap">
+                <form class="composer" @submit.prevent="send">
+                  <label class="sr-only" for="chat-input">聊天草稿</label>
+                  <textarea
+                    id="chat-input"
+                    ref="inputRef"
+                    v-model="draft"
+                    :disabled="!canCompose"
+                    rows="2"
+                    :placeholder="
+                      revoked
+                        ? '授权已撤回'
+                        : activeSessionArchived
+                          ? '会话已归档，只读查看'
+                          : '想说什么都可以，慢慢来…'
+                    "
+                    @input="onDraftInput"
+                    @keydown="handleKeydown"
+                    @compositionstart="onCompositionStart"
+                    @compositionend="onCompositionEnd"
+                  />
+                  <div class="composer-bottom">
+                    <small>Enter 发送 · Shift+Enter 换行</small>
+                    <button
+                      class="btn primary"
+                      type="submit"
+                      :disabled="!canSend"
+                      :title="sendBlockade ?? undefined"
+                    >
+                      发送
+                      <svg class="icon" aria-hidden="true"><use href="#mb-icon-send" /></svg>
                     </button>
+                  </div>
+                </form>
+                <p class="composer-caption">
+                  {{ externalTransmissionAllowed
+                    ? '已允许向当前端点发送本次会话内容。'
+                    : '仅本地 · 连接模型后，需由你允许发送。' }}
+                  <button type="button" class="inline-link" @click="requestPage('model')">
+                    前往设置
+                  </button>
+                </p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section
+          class="page"
+          data-page-view="buddies"
+          aria-labelledby="page-buddies-title"
+          :hidden="activePage !== 'buddies'"
+        >
+          <header class="page-heading">
+            <div>
+              <h1 id="page-buddies-title">陪伴，各有模样</h1>
+              <p>在这里认识、选择和照顾你的伙伴。</p>
+            </div>
+            <div class="buddy-actions heading-actions">
+              <button
+                type="button"
+                class="btn primary"
+                :disabled="createBuddyBlockReason !== null || buddyCreateOpen"
+                :title="createBuddyBlockReason ?? undefined"
+                @click="openBuddyCreate"
+              >
+                <svg class="icon" aria-hidden="true"><use href="#mb-icon-plus" /></svg>
+                新建伙伴
+              </button>
+              <button
+                v-if="activeBuddy !== null"
+                type="button"
+                class="btn"
+                :disabled="buddyActionBlockReason !== null || buddyRenameOpen"
+                :title="buddyActionBlockReason ?? undefined"
+                @click="openBuddyRename"
+              >
+                伙伴改名
+              </button>
+            </div>
+          </header>
+          <div class="page-content">
+            <span v-if="!buddyCatalogAvailable" class="session-empty">
+              桌面宿主尚未提供伙伴注册表；创建、切换与改名暂不可用。
+            </span>
+            <template v-else>
+              <div class="buddy-hero" aria-hidden="true">
+                <div>
+                  <span class="micro muted">YOUR LITTLE COMPANION</span>
+                  <h2>总有一个小小的身影，<br />愿意听你说完。</h2>
+                  <p>每位伙伴都有自己的性格、对话和记忆。</p>
+                </div>
+                <svg class="hero-cat"><use href="#mb-cat" /></svg>
+              </div>
+              <div class="section-label">我的伙伴 <span>{{ buddies.length }}</span></div>
+              <div v-if="buddies.length === 0" class="empty-state">
+                <p class="empty-title">还没有伙伴</p>
+                <p>桌面宿主尚未签发任何伙伴；用右上角「新建伙伴」开始第一段陪伴。</p>
+              </div>
+              <div class="buddy-grid">
+                <article
+                  v-for="buddy in buddies"
+                  :key="buddy.id"
+                  class="card buddy-card buddy-chip"
+                  :class="{ active: buddy.id === activeBuddyId, selected: buddy.id === activeBuddyId }"
+                >
+                  <div class="row">
+                    <span class="avatar" aria-hidden="true">{{ buddyName(buddy).slice(0, 1) }}</span>
+                    <div class="grow">
+                      <h3 class="buddy-name">{{ buddyName(buddy) }}</h3>
+                      <small class="muted">独立记忆与会话</small>
+                    </div>
+                    <span v-if="buddy.id === activeBuddyId" class="pill">当前伙伴</span>
+                  </div>
+                  <details class="buddy-detail">
+                    <summary>实例详情</summary>
+                    <dl class="buddy-detail-list">
+                      <div class="buddy-detail-line">
+                        <dt>实例 ID</dt>
+                        <dd>{{ buddy.id }}</dd>
+                      </div>
+                      <div class="buddy-detail-line">
+                        <dt>档案 / 人设 / 模型</dt>
+                        <dd class="buddy-revisions">{{ buddyRevisionText(buddy) }}</dd>
+                      </div>
+                    </dl>
+                    <p class="muted buddy-detail-note">
+                      实例身份由受信服务签发，仅供确认当前资料；界面操作不依赖这些编号。
+                    </p>
+                  </details>
+                  <div class="buddy-card-foot">
+                    <div class="row">
+                      <button
+                        type="button"
+                        class="btn"
+                        :disabled="buddyActionBlockReason !== null || buddy.id === activeBuddyId || busy"
+                        :title="buddyActionBlockReason ?? undefined"
+                        @click="switchToBuddy(buddy.id)"
+                      >
+                        {{ buddy.id === activeBuddyId ? '当前伙伴' : '选择伙伴' }}
+                      </button>
+                      <button
+                        v-if="buddy.id === activeBuddyId"
+                        type="button"
+                        class="btn quiet"
+                        @click="requestPage('chat')"
+                      >
+                        去聊天
+                      </button>
+                    </div>
+                  </div>
+                </article>
+              </div>
+              <p class="note buddy-identity" role="status">
+                <svg class="icon" aria-hidden="true"><use href="#mb-icon-lock" /></svg>
+                <span>
+                  当前伙伴：{{ activeBuddy ? buddyName(activeBuddy) : '未签发' }}。
+                  实例身份由受信服务签发；API Key 与发送许可只属于当前伙伴本次进程，不随伙伴复制或恢复。新伙伴从自己的故事开始，不会继承其他伙伴的私密记忆。
+                </span>
+              </p>
+            </template>
+
+            <section v-if="!revoked && buddyCreateOpen" class="buddy-form" aria-label="新建伙伴">
+              <label>
+                伙伴名称
+                <input
+                  v-model="buddyForm.label"
+                  type="text"
+                  :disabled="!canMutate"
+                  :placeholder="`最多 ${BUDDY_LABEL_MAX} 个 Unicode 字符`"
+                  @input="buddyError = null"
+                />
+              </label>
+              <label>
+                伙伴人设
+                <textarea
+                  v-model="buddyForm.persona"
+                  rows="3"
+                  :disabled="!canMutate"
+                  :placeholder="`最多 ${BUDDY_PERSONA_MAX_CHARS} 个字符；不继承任何旧伙伴的私密经历`"
+                  @input="buddyError = null"
+                />
+              </label>
+              <p class="muted">
+                新实例 ID、私有域与归属由受信注册服务裁决；前端不提供 ID、路径、继承来源或权限字段。
+              </p>
+              <div class="panel-actions">
+                <button type="button" class="btn quiet" :disabled="busy" @click="cancelBuddyCreate">取消</button>
+                <button type="button" class="btn primary" :disabled="!canMutate" @click="submitBuddyCreate">
+                  创建伙伴
+                </button>
+              </div>
+            </section>
+
+            <section v-if="!revoked && buddyRenameOpen && activeBuddy !== null" class="buddy-form" aria-label="伙伴改名">
+              <label>
+                新的伙伴名称
+                <input
+                  v-model="buddyRenameLabel"
+                  type="text"
+                  :disabled="!canMutate"
+                  :placeholder="`最多 ${BUDDY_LABEL_MAX} 个 Unicode 字符`"
+                  @input="buddyError = null"
+                />
+              </label>
+              <p class="muted">改名只推进伙伴档案版本，不改变实例 ID、人设、模型配置或已有会话归属。</p>
+              <div class="panel-actions">
+                <button type="button" class="btn quiet" :disabled="busy" @click="cancelBuddyRename">取消</button>
+                <button type="button" class="btn primary" :disabled="!canMutate" @click="submitBuddyRename">
+                  保存名称
+                </button>
+              </div>
+            </section>
+
+            <p v-if="buddyError" class="chat-failure" role="alert">{{ buddyError }}</p>
+            <p v-if="buddyNotice" class="panel-message" role="status">{{ buddyNotice }}</p>
+          </div>
+        </section>
+
+        <section
+          class="page"
+          data-page-view="appearance"
+          aria-labelledby="page-appearance-title"
+          :hidden="activePage !== 'appearance'"
+        >
+          <header class="page-heading">
+            <div>
+              <h1 id="page-appearance-title">换一种可爱</h1>
+              <p>为陪伴添一点新模样，还是熟悉的那个它。</p>
+            </div>
+            <div class="heading-actions">
+              <button type="button" class="btn quiet" @click="showPet">
+                <svg class="icon" aria-hidden="true"><use href="#mb-icon-window" /></svg>
+                显示宠物
+              </button>
+              <button type="button" class="btn quiet" @click="togglePetPause">{{ pauseLabel }}</button>
+            </div>
+          </header>
+          <div class="page-content">
+            <div class="appearance-grid">
+              <div class="pet-preview">
+                <span class="preview-tag">插画 · 非当前素材预览</span>
+                <svg class="pet-drawing" aria-hidden="true"><use href="#mb-cat" /></svg>
+                <div class="pet-shadow" aria-hidden="true"></div>
+                <strong>一点陪伴，一点可爱</strong>
+                <small>实际外观以桌面宠物窗口为准</small>
+              </div>
+              <section class="card appearance-card">
+                <div class="section-title">
+                  <div>
+                    <h2>素材与动作</h2>
+                    <p>从本地素材包，为伙伴换个模样。</p>
+                  </div>
+                  <span class="pill neutral">仅本地</span>
+                </div>
+                <MaterialPanel
+                  v-if="!revoked"
+                  :context="materialContext"
+                  :blocked-reason="materialBlockReason"
+                  :page-hidden="activePage !== 'appearance'"
+                />
+                <p v-else class="muted">授权已撤回，素材面板不可用。</p>
+              </section>
+            </div>
+            <p class="note appearance-note">
+              <svg class="icon" aria-hidden="true"><use href="#mb-icon-info" /></svg>
+              更换外观不会改变伙伴的身份、记忆或人设。素材选择只在本次运行中生效。
+            </p>
+          </div>
+        </section>
+
+        <section
+          class="page"
+          data-page-view="memory"
+          aria-labelledby="page-memory-title"
+          :hidden="activePage !== 'memory'"
+        >
+          <header class="page-heading">
+            <div>
+              <h1 id="page-memory-title">记住那些小事</h1>
+              <p>属于 {{ activeBuddy ? buddyName(activeBuddy) : '当前伙伴' }} 的私密记忆，由你查看与整理。</p>
+            </div>
+            <div class="heading-actions">
+              <button
+                type="button"
+                class="btn quiet"
+                :disabled="panelBusy || managementExitConfirmation !== null"
+                @click="requestPage('chat')"
+              >
+                返回聊天
+              </button>
+              <button
+                type="button"
+                class="btn quiet"
+                :disabled="!panelActionsAllowed || panelBusy"
+                @click="refreshMemories"
+              >
+                <svg class="icon" aria-hidden="true"><use href="#mb-icon-refresh" /></svg>
+                刷新列表
+              </button>
+            </div>
+          </header>
+          <div class="page-content">
+            <section v-if="activePanel === 'memory'" class="panel-shell" aria-label="记忆">
+              <p v-if="panelNotice" class="panel-message" role="status">{{ panelNotice }}</p>
+              <div class="panel-body">
+                <div class="memory-toolbar">
+                  <label class="grow">
+                    检索
+                    <input
+                      v-model="memoryQuery"
+                      type="search"
+                      :disabled="!panelActionsAllowed || panelBusy"
+                      @input="noteManagementInteraction"
+                      @keyup.enter="searchMemories"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    class="btn"
+                    :disabled="!panelActionsAllowed || panelBusy"
+                    @click="searchMemories"
+                  >
+                    检索
+                  </button>
+                </div>
+
+                <div class="memory-layout">
+                  <div class="memory-main">
+                    <p v-if="memoryError" class="chat-failure" role="alert">{{ memoryError }}</p>
+                    <p v-if="memoryNotice" class="panel-message" role="status">{{ memoryNotice }}</p>
+                    <p class="memory-count">共 {{ memories.length }} 条获准展示的记忆</p>
+                    <div v-if="memories.length === 0" class="empty-state">
+                      <p class="empty-title">还没有可展示的记忆</p>
+                      <p>属于当前伙伴的私密记忆会出现在这里。先在右侧记下一件小事，或刷新列表看看。</p>
+                    </div>
+                    <ul v-else class="memory-list">
+                      <li v-for="memory in memories" :key="memory.id">
+                        <template v-if="memoryEdit && memoryEdit.id === memory.id">
+                          <div class="memory-editor">
+                            <p v-if="memoryEditStale" class="chat-warning">
+                              该记忆版本已变化；保存会被拒绝，当前编辑草稿仍保留。
+                            </p>
+                            <label>
+                              编辑记忆
+                              <textarea
+                                v-model="memoryDraft"
+                                rows="3"
+                                :disabled="!canMutate"
+                                @input="noteManagementInteraction"
+                              />
+                            </label>
+                            <div class="panel-actions">
+                              <button type="button" class="btn quiet" :disabled="panelBusy" @click="cancelMemoryEdit">
+                                取消编辑
+                              </button>
+                              <button type="button" class="btn primary" :disabled="!canMutate" @click="saveMemory">
+                                保存修改
+                              </button>
+                            </div>
+                          </div>
+                        </template>
+                        <template v-else>
+                          <div class="memory-text">
+                            <p>{{ memory.text }}</p>
+                            <span class="muted">版本 {{ memory.revision }}</span>
+                          </div>
+                          <div class="memory-actions">
+                            <button type="button" class="btn quiet" :disabled="!canMutate" @click="beginEditMemory(memory)">
+                              编辑
+                            </button>
+                            <template v-if="isMemoryDeleteArmed(deleteArm, memory)">
+                              <button type="button" class="btn quiet" :disabled="panelBusy" @click="cancelDeleteMemory">
+                                取消
+                              </button>
+                              <button
+                                type="button"
+                                class="btn danger"
+                                :disabled="!canMutate"
+                                @click="confirmDeleteMemory(memory)"
+                              >
+                                确认删除
+                              </button>
+                            </template>
+                            <button
+                              v-else
+                              type="button"
+                              class="btn quiet danger-link"
+                              :disabled="!canMutate"
+                              @click="requestDeleteMemory(memory)"
+                            >
+                              删除
+                            </button>
+                          </div>
+                        </template>
+                      </li>
+                    </ul>
+                  </div>
+
+                  <div class="remember-form">
+                    <h3>一件想记住的事</h3>
+                    <label class="grow">
+                      新增私密记忆
+                      <textarea
+                        v-model="rememberDraft"
+                        rows="5"
+                        :disabled="!panelActionsAllowed || panelBusy || commandUnconfirmed"
+                        @input="noteManagementInteraction"
+                      />
+                    </label>
                     <button
                       type="button"
-                      class="danger"
-                      :disabled="!canMutate"
-                      @click="confirmDeleteMemory(memory)"
+                      class="btn primary"
+                      :disabled="!canMutate || rememberDraft.trim().length === 0"
+                      @click="rememberMemory"
                     >
-                      确认删除
+                      <svg class="icon" aria-hidden="true"><use href="#mb-icon-plus" /></svg>
+                      记住
                     </button>
-                  </template>
-                  <button
-                    v-else
-                    type="button"
-                    class="danger-link"
-                    :disabled="!canMutate"
-                    @click="requestDeleteMemory(memory)"
-                  >
-                    删除
-                  </button>
+                    <p class="note">
+                      <svg class="icon" aria-hidden="true"><use href="#mb-icon-lock" /></svg>
+                      仅属于当前伙伴的私密记忆；不会自动共享给其他伙伴或服务。
+                    </p>
+                  </div>
                 </div>
-              </template>
-            </li>
-          </ul>
-        </div>
-
-        <div v-else class="panel-body">
-          <div class="panel-actions">
-            <button
-              type="button"
-              :disabled="!panelActionsAllowed || panelBusy"
-              @click="refreshDiagnostics"
-            >
-              刷新诊断
-            </button>
-            <span class="muted">只展示宿主授权的有界诊断；Gap 由宿主提示显式说明。</span>
+              </div>
+            </section>
+            <p v-else class="muted panel-closed-hint">
+              记忆面板尚未打开；从侧栏重新进入「记忆」即可恢复。
+            </p>
           </div>
-          <p v-if="diagnostics.length === 0" class="muted">暂无诊断事件。</p>
-          <ul v-else class="diagnostic-list">
-            <li v-for="item in diagnostics" :key="item.sequence">
-              <span class="diag-seq">#{{ item.sequence }}</span>
-              <span>{{ item.run }}</span>
-              <span>{{ item.event }}</span>
-              <span class="diag-status">{{ item.status }}</span>
-            </li>
-          </ul>
-        </div>
-      </section>
+        </section>
 
-      <section ref="messagesEl" class="messages" aria-live="polite">
-        <div v-if="revoked" class="empty-state revoked-state">
-          <p class="empty-title">授权已撤回</p>
-          <p>聊天记录、草稿、模型配置与记忆列表已从界面清空。</p>
-          <p>此页面不提供重新授权入口。</p>
-        </div>
-        <div v-else-if="messages.length === 0" class="empty-state">
-          <p class="empty-title">还没有消息</p>
-          <p>这里只展示桌面宿主返回的内容，前端不会模拟回复。</p>
-          <p>Enter 发送，Shift+Enter 换行。</p>
-        </div>
-        <article
-          v-for="(message, index) in messages"
-          :key="index"
-          class="message"
-          :class="messageClass(message.role)"
+        <section
+          class="page"
+          data-page-view="model"
+          aria-labelledby="page-model-title"
+          :hidden="activePage !== 'model'"
         >
-          <div class="bubble">
-            <span class="role">{{ roleLabel(message.role) }}</span>
-            <p class="text">{{ message.text }}</p>
+          <header class="page-heading">
+            <div>
+              <h1 id="page-model-title">让对话开始</h1>
+              <p>为 {{ activeBuddy ? buddyName(activeBuddy) : '当前伙伴' }} 设置模型、人设与发送许可。</p>
+            </div>
+            <div class="heading-actions">
+              <span class="pill neutral">
+                <svg class="icon icon-sm" aria-hidden="true"><use href="#mb-icon-lock" /></svg>
+                {{ externalTransmissionAllowed ? '已允许发送' : '尚未允许发送' }}
+              </span>
+              <button
+                type="button"
+                class="btn quiet"
+                :disabled="panelBusy || managementExitConfirmation !== null"
+                @click="requestPage('chat')"
+              >
+                返回聊天
+              </button>
+            </div>
+          </header>
+          <div class="page-content">
+            <section v-if="activePanel === 'presets'" class="panel-shell" aria-label="模型设置">
+              <p v-if="panelNotice" class="panel-message" role="status">{{ panelNotice }}</p>
+              <div class="panel-body">
+                <div class="panel-status">
+                  <span>当前预设：{{ activePreset || '未选择' }}</span>
+                  <span>{{ transmissionStatusText(externalTransmissionAllowed) }}</span>
+                  <span>{{ credentialStatusText(modelSettings) }}</span>
+                  <span v-if="!persistenceEnabled">本地保存不可用</span>
+                </div>
+                <p v-if="modelChangeHint" class="chat-warning">{{ modelChangeHint }}</p>
+                <p v-if="modelApplyNotice" class="panel-message" role="status">{{ modelApplyNotice }}</p>
+
+                <section class="panel-block">
+                  <h3>可用预设</h3>
+                  <div v-if="presets.length === 0" class="empty-state">
+                    <p class="empty-title">还没有可用预设</p>
+                    <p>桌面宿主尚未返回预设；可以直接在下方填写自定义连接。</p>
+                  </div>
+                  <ul v-else class="preset-list">
+                    <li
+                      v-for="preset in presets"
+                      :key="preset.id"
+                      :class="{ selected: preset.id === activePreset }"
+                    >
+                      <div class="preset-text">
+                        <strong>{{ preset.label || preset.id }}</strong>
+                        <p class="muted">{{ preset.provider }} · {{ preset.model }}</p>
+                        <p class="muted endpoint">{{ preset.endpoint }}</p>
+                      </div>
+                      <button
+                        type="button"
+                        class="btn"
+                        :disabled="!canMutate || preset.id === activePreset"
+                        @click="selectPreset(preset)"
+                      >
+                        {{ preset.id === activePreset ? '当前预设' : '使用此预设' }}
+                      </button>
+                    </li>
+                  </ul>
+                </section>
+
+                <form class="panel-form" @submit.prevent="applyModelSettings">
+                  <h3>模型配置与发送许可</h3>
+                  <label>
+                    端点
+                    <input
+                      v-model="modelForm.endpoint"
+                      type="url"
+                      placeholder="https://…/v1/chat/completions"
+                      :disabled="!canMutate"
+                      @input="onModelIdentityInput"
+                    />
+                  </label>
+                  <label>
+                    模型
+                    <input
+                      v-model="modelForm.model"
+                      type="text"
+                      :disabled="!canMutate"
+                      @input="onModelIdentityInput"
+                    />
+                  </label>
+                  <label>
+                    人设
+                    <textarea
+                      v-model="modelForm.persona"
+                      rows="3"
+                      :disabled="!canMutate"
+                      @input="noteModelInteraction"
+                    />
+                  </label>
+                  <label class="checkbox-row">
+                    <input
+                      v-model="modelForm.allowTransmission"
+                      type="checkbox"
+                      :disabled="!canMutate"
+                      @change="onTransmissionChange"
+                    />
+                    允许本次请求向端点发送人设、获准私密记忆和当前会话内容
+                  </label>
+                  <label>
+                    API Key
+                    <input
+                      v-model="modelForm.apiKeyInput"
+                      type="password"
+                      autocomplete="off"
+                      :disabled="!canMutate"
+                      @input="noteModelInteraction"
+                      :placeholder="
+                        modelSettings?.hasApiKey
+                          ? '已保存本次进程凭据；留空表示保留'
+                          : '未配置；留空表示不使用'
+                      "
+                    />
+                  </label>
+                  <label class="checkbox-row">
+                    <input
+                      v-model="modelForm.clearApiKey"
+                      type="checkbox"
+                      :disabled="!canMutate || modelForm.apiKeyInput.length > 0"
+                      @change="noteModelInteraction"
+                    />
+                    本次不使用 / 清除 API Key（以空串显式替换）
+                  </label>
+                  <p class="muted">API Key 只用于本次桌面宿主进程，不写入快照或本地存储；应用成功后密码框会清空。</p>
+                  <p class="muted">配置 API Key 不等于允许外传；许可仅覆盖上方列出的内容。</p>
+                  <div class="panel-actions">
+                    <button
+                      type="button"
+                      class="btn quiet"
+                      :disabled="!canMutate || !modelPanelDirty"
+                      @click="resetModelForm"
+                    >
+                      放弃修改
+                    </button>
+                    <button type="submit" class="btn primary" :disabled="!canMutate">应用配置</button>
+                  </div>
+                </form>
+              </div>
+            </section>
+            <p v-else class="muted panel-closed-hint">
+              模型设置面板尚未打开；从侧栏重新进入「模型设置」即可恢复。
+            </p>
           </div>
-        </article>
-      </section>
+        </section>
 
-      <p v-if="chatFailure" class="chat-failure" role="alert">{{ chatFailure }}</p>
+        <section
+          class="page"
+          data-page-view="diagnostics"
+          aria-labelledby="page-diagnostics-title"
+          :hidden="activePage !== 'diagnostics'"
+        >
+          <header class="page-heading">
+            <div>
+              <h1 id="page-diagnostics-title">看看运行情况</h1>
+              <p>需要排查问题时，在这里查看获准展示的事件。</p>
+            </div>
+            <div class="heading-actions">
+              <button
+                type="button"
+                class="btn quiet"
+                :disabled="panelBusy || managementExitConfirmation !== null"
+                @click="requestPage('chat')"
+              >
+                返回聊天
+              </button>
+              <button
+                type="button"
+                class="btn quiet"
+                :disabled="!panelActionsAllowed || panelBusy"
+                @click="refreshDiagnostics"
+              >
+                <svg class="icon" aria-hidden="true"><use href="#mb-icon-refresh" /></svg>
+                刷新诊断
+              </button>
+            </div>
+          </header>
+          <div class="page-content">
+            <section v-if="activePanel === 'diagnostics'" class="panel-shell" aria-label="运行诊断">
+              <p v-if="panelNotice" class="panel-message" role="status">{{ panelNotice }}</p>
+              <div class="panel-body">
+                <p class="muted">只展示宿主授权的有界诊断；Gap 由宿主提示显式说明。流程完成与消息实际写入分别呈现。</p>
+                <div v-if="diagnostics.length === 0" class="empty-state">
+                  <p class="empty-title">还没有可展示的诊断事件</p>
+                  <p>本次运行暂无获准展示的事件；聊过几句或点「刷新诊断」后再来看看。</p>
+                </div>
+                <ul v-else class="diagnostic-list">
+                  <li v-for="item in diagnostics" :key="item.sequence">
+                    <span class="diag-seq">#{{ item.sequence }}</span>
+                    <span>{{ item.run }}</span>
+                    <span>{{ item.event }}</span>
+                    <span class="diag-status">{{ item.status }}</span>
+                  </li>
+                </ul>
+                <div class="divider"></div>
+                <div class="diagnostics-foot">
+                  <p class="muted">
+                    可使用侧栏「退出应用」结束本次使用，或「撤回授权」清空当前展示与草稿；撤权后不能在此重新授权。
+                  </p>
+                </div>
+              </div>
+            </section>
+            <p v-else class="muted panel-closed-hint">
+              运行诊断面板尚未打开；从侧栏重新进入「运行诊断」即可恢复。
+            </p>
+          </div>
+        </section>
 
-      <p v-if="sendBlockade" class="chat-warning" role="status">{{ sendBlockade }}</p>
+        <div v-if="revokeArmed" class="inline-confirm" role="alertdialog" aria-label="撤回授权确认">
+          <p>撤回后将清空界面展示的聊天与草稿，并且不能在此重新授权。</p>
+          <div class="inline-confirm-actions">
+            <button type="button" class="btn quiet" :disabled="busy" @click="revokeArmed = false">取消</button>
+            <button type="button" class="btn danger" :disabled="busy" @click="confirmRevoke">
+              确认撤回
+            </button>
+          </div>
+        </div>
 
-      <div v-if="lastError" class="error-banner" role="alert">
-        <span>{{ lastError }}</span>
-        <button type="button" class="ghost" @click="clearError">关闭提示</button>
-      </div>
+        <div v-if="archiveArmed" class="inline-confirm" role="alertdialog" aria-label="归档会话确认">
+          <p>
+            归档后仍可显式选择查看，但不能发送或继续编辑草稿；不会回收原文或删除会话，本阶段不提供解归档。
+          </p>
+          <div class="inline-confirm-actions">
+            <button type="button" class="btn quiet" :disabled="busy" @click="archiveArmed = false">取消</button>
+            <button type="button" class="btn danger" :disabled="busy" @click="confirmArchiveSession">
+              确认归档
+            </button>
+          </div>
+        </div>
 
-      <div v-if="commandUnconfirmed" class="error-banner" role="status">
-        <span>桌面宿主未确认最近一次操作的结果，发送、模型配置与记忆编辑已锁定；请重新读取状态后再操作。</span>
-        <button type="button" class="ghost" @click="initialize">重新读取状态</button>
-      </div>
-
-      <form class="composer" @submit.prevent="send">
-        <label class="sr-only" for="chat-input">聊天草稿</label>
-        <textarea
-          id="chat-input"
-          ref="inputRef"
-          v-model="draft"
-          :disabled="!canCompose"
-          rows="3"
-          :placeholder="
-            revoked
-              ? '授权已撤回'
-              : activeSessionArchived
-                ? '会话已归档，只读查看'
-                : '写点什么…'
-          "
-          @input="onDraftInput"
-          @keydown="handleKeydown"
-          @compositionstart="onCompositionStart"
-          @compositionend="onCompositionEnd"
-        />
-        <div class="composer-actions">
-          <p class="hint">Enter 发送 · Shift+Enter 换行</p>
-          <button
-            class="primary"
-            type="submit"
-            :disabled="!canSend"
-            :title="sendBlockade ?? undefined"
+        <div v-if="closeConfirmation" class="dialog-backdrop">
+          <div
+            class="dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="close-dialog-title"
+            aria-describedby="close-dialog-body"
           >
-            发送
-          </button>
-        </div>
-      </form>
-
-      <footer class="actions">
-        <button
-          type="button"
-          :disabled="busy || revoked || closeConfirmation"
-          @click="requestClose"
-        >
-          关闭聊天
-        </button>
-        <button type="button" @click="hideChat">隐藏聊天</button>
-        <button type="button" @click="showPet">显示宠物</button>
-        <button type="button" @click="togglePetPause">{{ pauseLabel }}</button>
-        <span class="actions-spacer" />
-        <button
-          v-if="!revoked"
-          type="button"
-          class="danger-link"
-          :disabled="busy"
-          @click="revokeArmed = true"
-        >
-          撤回授权
-        </button>
-      </footer>
-
-      <div v-if="revokeArmed" class="inline-confirm" role="alertdialog" aria-label="撤回授权确认">
-        <p>撤回后将清空界面展示的聊天与草稿，并且不能在此重新授权。</p>
-        <div class="inline-confirm-actions">
-          <button type="button" :disabled="busy" @click="revokeArmed = false">取消</button>
-          <button type="button" class="danger" :disabled="busy" @click="confirmRevoke">
-            确认撤回
-          </button>
-        </div>
-      </div>
-
-      <div v-if="archiveArmed" class="inline-confirm" role="alertdialog" aria-label="归档会话确认">
-        <p>
-          归档后仍可显式选择查看，但不能发送或继续编辑草稿；不会回收原文或删除会话，本阶段不提供解归档。
-        </p>
-        <div class="inline-confirm-actions">
-          <button type="button" :disabled="busy" @click="archiveArmed = false">取消</button>
-          <button type="button" class="danger" :disabled="busy" @click="confirmArchiveSession">
-            确认归档
-          </button>
-        </div>
-      </div>
-
-      <div v-if="closeConfirmation" class="dialog-backdrop">
-        <div
-          class="dialog"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="close-dialog-title"
-          aria-describedby="close-dialog-body"
-        >
-          <h2 id="close-dialog-title">{{ closeDialogTitle(closeIntent) }}</h2>
-          <p id="close-dialog-body">{{ closeDialogBody(closeIntent) }}</p>
-          <div class="dialog-actions">
-            <button type="button" :disabled="busy" @click="resolveClose(false)">取消</button>
-            <button type="button" class="danger" :disabled="busy" @click="resolveClose(true)">
-              {{ closeDialogConfirmLabel(closeIntent) }}
-            </button>
+            <h2 id="close-dialog-title">{{ closeDialogTitle(closeIntent) }}</h2>
+            <p id="close-dialog-body">{{ closeDialogBody(closeIntent) }}</p>
+            <div class="dialog-actions">
+              <button type="button" class="btn quiet" :disabled="busy" @click="resolveClose(false)">取消</button>
+              <button type="button" class="btn danger" :disabled="busy" @click="resolveClose(true)">
+                {{ closeDialogConfirmLabel(closeIntent) }}
+              </button>
+            </div>
           </div>
         </div>
-      </div>
 
-      <div v-if="managementExitConfirmation !== null" class="dialog-backdrop">
-        <div
-          class="dialog"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="management-exit-title"
-          aria-describedby="management-exit-body"
-        >
-          <h2 id="management-exit-title">
-            {{ closeDialogTitle(managementExitConfirmation.intent) }}
-          </h2>
-          <p id="management-exit-body">
-            {{ managementExitBody(snapshot?.managementDraft.dirty === true, managementExitConfirmation.intent) }}
-          </p>
-          <div class="dialog-actions">
-            <button type="button" :disabled="busy" @click="resolveManagementExit(false)">取消</button>
-            <button type="button" class="danger" :disabled="busy" @click="resolveManagementExit(true)">
-              {{ managementExitConfirmLabel(snapshot?.managementDraft.dirty === true) }}
-            </button>
+        <div v-if="managementExitConfirmation !== null" class="dialog-backdrop">
+          <div
+            class="dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="management-exit-title"
+            aria-describedby="management-exit-body"
+          >
+            <h2 id="management-exit-title">
+              {{ closeDialogTitle(managementExitConfirmation.intent) }}
+            </h2>
+            <p id="management-exit-body">
+              {{ managementExitBody(snapshot?.managementDraft.dirty === true, managementExitConfirmation.intent) }}
+            </p>
+            <div class="dialog-actions">
+              <button type="button" class="btn quiet" :disabled="busy" @click="resolveManagementExit(false)">取消</button>
+              <button type="button" class="btn danger" :disabled="busy" @click="resolveManagementExit(true)">
+                {{ managementExitConfirmLabel(snapshot?.managementDraft.dirty === true) }}
+              </button>
+            </div>
           </div>
         </div>
-      </div>
 
-      <div v-if="pendingPanelLeave !== null" class="dialog-backdrop">
-        <div
-          class="dialog"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="leave-dialog-title"
-          aria-describedby="leave-dialog-body"
-        >
-          <h2 id="leave-dialog-title">放弃未保存的编辑？</h2>
-          <p id="leave-dialog-body">
-            {{ pendingLeaveDescription }}选择“继续编辑”会保留当前草稿和面板。
-          </p>
-          <div class="dialog-actions">
-            <button type="button" @click="cancelPanelLeave">继续编辑</button>
-            <button type="button" class="danger" @click="confirmPanelLeave">放弃并离开</button>
+        <div v-if="pendingPanelLeave !== null" class="dialog-backdrop">
+          <div
+            class="dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="leave-dialog-title"
+            aria-describedby="leave-dialog-body"
+          >
+            <h2 id="leave-dialog-title">放弃未保存的编辑？</h2>
+            <p id="leave-dialog-body">
+              {{ pendingLeaveDescription }}选择“继续编辑”会保留当前草稿和页面。
+            </p>
+            <div class="dialog-actions">
+              <button type="button" class="btn quiet" @click="cancelPanelLeave">继续编辑</button>
+              <button type="button" class="btn danger" @click="confirmPanelLeave">放弃并离开</button>
+            </div>
           </div>
         </div>
-      </div>
-    </section>
+        </template>
+      </main>
+    </div>
   </div>
 </template>
 
@@ -3980,465 +4476,41 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 100%;
   background: var(--paper);
-}
-
-.app-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 16px 24px 14px;
-  border-bottom: 1px solid var(--line);
-  background: var(--paper);
-}
-
-.identity {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
-}
-
-.emblem {
-  display: grid;
-  place-items: center;
-  width: 40px;
-  height: 40px;
-  flex: 0 0 auto;
-  color: var(--paper);
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: 1px;
-  background: var(--moss);
-  border-radius: 14px;
-}
-
-h1 {
-  margin: 0;
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: 0.3px;
-}
-
-.subtitle {
-  margin: 2px 0 0;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.badges {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 8px;
-}
-
-.offline-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 10px;
-  color: var(--moss);
-  font-size: 12px;
-  background: var(--paper-raised);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-}
-
-.offline-badge::before {
-  width: 6px;
-  height: 6px;
-  content: '';
-  background: var(--moss);
-  border-radius: 50%;
-}
-
-.chat-shell {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  gap: 10px;
-  width: min(100%, 840px);
-  min-height: 0;
-  margin: 0 auto;
-  padding: 14px 24px 18px;
-}
-
-.chat-meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.status-pill,
-.revoked-pill,
-.pet-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 9px;
-  border: 1px solid transparent;
-  border-radius: 999px;
-}
-
-.status-pill::before {
-  width: 6px;
-  height: 6px;
-  content: '';
-  background: currentColor;
-  border-radius: 50%;
-}
-
-.tone-ok {
-  color: var(--moss);
-  background: var(--moss-soft);
-}
-
-.tone-busy {
-  color: var(--warn);
-  background: var(--warn-soft);
-}
-
-.tone-warn {
-  color: var(--warn);
-  background: var(--warn-soft);
-}
-
-.tone-danger {
-  color: var(--danger);
-  background: var(--danger-soft);
-}
-
-.revoked-pill {
-  color: var(--danger);
-  background: var(--danger-soft);
-  border-color: #ebd2c9;
-}
-
-.pet-pill {
-  color: var(--muted);
-  background: var(--paper-raised);
-  border-color: var(--line);
-}
-
-.pending-pill {
-  color: var(--warn);
-  background: var(--warn-soft);
-  border-color: #e3d9bd;
-  border-radius: 999px;
-  padding: 4px 9px;
-}
-
-.offline-note {
-  margin-left: auto;
-}
-
-.messages {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  gap: 12px;
-  min-height: 120px;
-  overflow-y: auto;
-  padding: 8px 4px 12px;
-  scrollbar-color: #cfd8cf transparent;
-  scrollbar-width: thin;
-}
-
-.empty-state {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin: auto;
-  max-width: 380px;
-  color: var(--muted);
-  font-size: 13px;
-  line-height: 1.8;
-  text-align: center;
-}
-
-.empty-state p {
-  margin: 0;
-}
-
-.empty-title {
   color: var(--ink);
-  font-size: 15px;
-  font-weight: 600;
 }
 
-.revoked-state {
-  color: #7d4b41;
+.svg-defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
 }
 
-.message {
-  display: flex;
+.icon {
+  width: 19px;
+  height: 19px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.65;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
 }
 
-.from-user {
-  justify-content: flex-end;
-}
-
-.from-assistant {
-  justify-content: flex-start;
-}
-
-.from-system {
-  justify-content: center;
-}
-
-.bubble {
-  max-width: min(78%, 560px);
-  padding: 10px 14px;
-  background: var(--paper-raised);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  border-bottom-left-radius: 4px;
-  box-shadow: 0 1px 0 rgba(38, 47, 43, 0.03);
-}
-
-.from-user .bubble {
-  color: #f8f7f1;
-  background: var(--moss);
-  border-color: var(--moss);
-  border-bottom-right-radius: 4px;
-  border-bottom-left-radius: 14px;
-}
-
-.from-system .bubble {
-  color: var(--muted);
-  font-size: 12px;
-  background: transparent;
-  border-style: dashed;
-}
-
-.role {
-  display: block;
-  margin-bottom: 3px;
-  color: var(--muted);
-  font-size: 11px;
-  letter-spacing: 0.4px;
-}
-
-.from-user .role {
-  color: rgba(255, 255, 255, 0.68);
-  text-align: right;
-}
-
-.text {
-  margin: 0;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
-  font-size: 14px;
-  line-height: 1.65;
-}
-
-.chat-failure {
-  padding: 8px 12px;
-  margin: 0;
-  color: var(--danger);
-  font-size: 12px;
-  line-height: 1.6;
-  background: var(--danger-soft);
-  border: 1px solid #ebd2c9;
-  border-radius: 10px;
-}
-
-.chat-warning {
-  padding: 8px 12px;
-  margin: 0;
-  color: var(--warn);
-  font-size: 12px;
-  line-height: 1.6;
-  background: var(--warn-soft);
-  border: 1px solid #e3d9bd;
-  border-radius: 10px;
-}
-
-.error-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 12px;
-  color: var(--danger);
-  font-size: 12px;
-  line-height: 1.6;
-  background: var(--danger-soft);
-  border: 1px solid #ebd2c9;
-  border-radius: 10px;
-}
-
-.composer {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 10px 12px;
-  background: var(--paper-raised);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  box-shadow: 0 2px 10px rgba(38, 47, 43, 0.04);
-}
-
-.composer textarea {
-  width: 100%;
-  min-height: 64px;
-  max-height: 140px;
-  padding: 4px 2px;
-  color: var(--ink);
-  font-size: 14px;
-  line-height: 1.65;
-  background: transparent;
-  border: 0;
-  outline: none;
-  resize: none;
-}
-
-.composer textarea::placeholder {
-  color: #9aa49c;
-}
-
-.composer textarea:disabled {
-  color: var(--muted);
-}
-
-.composer-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding-top: 8px;
-  border-top: 1px solid var(--line);
-}
-
-.hint {
-  margin: 0;
-  color: var(--muted);
-  font-size: 11px;
-}
-
-button {
-  padding: 7px 12px;
-  font-size: 12.5px;
-  background: var(--paper-raised);
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  transition:
-    background-color 0.15s,
-    border-color 0.15s,
-    color 0.15s;
-}
-
-button:hover:not(:disabled) {
-  background: var(--moss-soft);
-  border-color: #bcc9bd;
-}
-
-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.45;
-}
-
-button.primary {
-  padding: 8px 18px;
-  color: #fff;
-  background: var(--moss);
-  border-color: var(--moss);
-}
-
-button.primary:hover:not(:disabled) {
-  background: var(--moss-deep);
-  border-color: var(--moss-deep);
-}
-
-button.danger {
-  color: #fff;
-  background: var(--danger);
-  border-color: var(--danger);
-}
-
-button.danger:hover:not(:disabled) {
-  background: #843b2f;
-  border-color: #843b2f;
-}
-
-button.ghost {
-  padding: 3px 8px;
-  color: var(--danger);
-  font-size: 11px;
-  background: transparent;
-  border-color: transparent;
-}
-
-button.ghost:hover:not(:disabled) {
-  background: rgba(155, 74, 60, 0.08);
-  border-color: transparent;
-}
-
-button.danger-link {
-  color: var(--danger);
-  background: transparent;
-  border-color: transparent;
-}
-
-button.danger-link:hover:not(:disabled) {
-  background: var(--danger-soft);
-  border-color: #ebd2c9;
-}
-
-.actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-}
-
-.actions-spacer {
-  flex: 1;
-}
-
-.inline-confirm {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 12px 14px;
-  color: #7a3d32;
-  font-size: 12.5px;
-  line-height: 1.6;
-  background: var(--danger-soft);
-  border: 1px solid #ebd2c9;
-  border-radius: 12px;
-}
-
-.inline-confirm p {
-  margin: 0;
-}
-
-.inline-confirm-actions {
-  display: flex;
-  gap: 8px;
+.icon-sm {
+  width: 13px;
+  height: 13px;
 }
 
 .center-state {
-  display: flex;
   flex: 1;
+  display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  padding: 24px;
-  color: var(--ink);
-  font-size: 14px;
   text-align: center;
-}
-
-.center-state p {
-  margin: 0;
+  padding: 24px;
 }
 
 .center-title {
@@ -4446,375 +4518,1302 @@ button.danger-link:hover:not(:disabled) {
   font-weight: 600;
 }
 
-.muted {
-  color: var(--muted);
-  font-size: 12.5px;
-}
+/* ---------- 应用骨架：侧栏 + 工作区 ---------- */
 
-.dialog-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 20;
+.app-shell {
   display: grid;
-  place-items: center;
-  padding: 24px;
-  background: rgba(38, 47, 43, 0.32);
+  grid-template-columns: 204px minmax(0, 1fr);
+  flex: 1;
+  height: 100%;
+  min-height: 380px;
+  overflow: hidden;
 }
 
-.dialog {
-  width: min(100%, 400px);
-  padding: 22px;
-  background: var(--paper-raised);
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  box-shadow: 0 18px 60px rgba(24, 35, 28, 0.22);
-}
-
-.dialog h2 {
-  margin: 0 0 8px;
-  font-size: 17px;
-  font-weight: 600;
-}
-
-.dialog p {
-  margin: 0;
-  color: var(--muted);
-  font-size: 13px;
-  line-height: 1.75;
-}
-
-.dialog-actions {
+.sidebar {
+  background: var(--sidebar);
+  border-right: 1px solid var(--line);
+  padding: 25px 17px 15px;
   display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 20px;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
 }
 
-@media (max-width: 560px) {
-  .app-header {
-    padding: 14px 16px 12px;
-  }
-
-  .chat-shell {
-    padding: 12px 16px 14px;
-  }
-
-  .offline-note {
-    margin-left: 0;
-  }
-
-  .bubble {
-    max-width: 88%;
-  }
-}
-
-.session-bar {
+.brand {
   display: flex;
-  flex-wrap: wrap;
+  gap: 10px;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 8px 10px;
-  background: var(--paper-raised);
-  border: 1px solid var(--line);
-  border-radius: 12px;
-}
-
-.buddy-bar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 8px 10px;
-  background: var(--paper-raised);
-  border: 1px solid var(--line);
-  border-radius: 12px;
-}
-
-.buddy-list {
-  display: flex;
-  flex: 1 1 320px;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
+  margin: 0 9px 32px;
   min-width: 0;
 }
 
-.buddy-chip {
-  display: inline-flex;
-  flex-direction: column;
-  align-items: flex-start;
-  max-width: 260px;
-  padding: 4px 10px;
-  color: var(--ink);
-  text-align: left;
-  background: var(--paper);
-  border: 1px solid var(--line);
+.brand-mark {
+  width: 36px;
+  height: 36px;
   border-radius: 12px;
+  background: var(--moss);
+  display: grid;
+  place-items: center;
+  color: #fff;
+  flex-shrink: 0;
 }
 
-.buddy-chip.active {
-  color: var(--moss);
-  background: var(--moss-soft);
-  border-color: #bcc9bd;
+.brand-mark .icon {
+  width: 24px;
+  height: 24px;
 }
 
-.buddy-name {
-  max-width: 100%;
+/* flex 子项允许收缩：长副标题在窄侧栏内省略，而不是把侧栏撑出横向滚动。 */
+.brand-name {
+  min-width: 0;
+}
+
+.brand-name strong {
+  display: block;
+  font-size: 18px;
+  letter-spacing: -0.7px;
+  line-height: 1.3;
+}
+
+.brand-name small {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  color: #77836f;
+  white-space: nowrap;
   overflow: hidden;
-  font-size: 12.5px;
   text-overflow: ellipsis;
+}
+
+.nav-label {
+  margin: 0 13px 11px;
+  font-size: 10px;
+  letter-spacing: 0.15em;
+  color: #87917f;
+}
+
+.nav-label + .navigation {
+  margin-bottom: 4px;
+}
+
+.navigation {
+  display: grid;
+  gap: 6px;
+}
+
+.nav-item {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  width: 100%;
+  padding: 12px 13px;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  text-align: left;
+  color: #727f70;
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.16s, color 0.16s, box-shadow 0.16s;
+}
+
+.nav-item:hover {
+  background: #e7ede1;
+  color: var(--moss);
+}
+
+.nav-item[aria-current='page'] {
+  background: var(--moss);
+  color: #fff;
+  box-shadow: 0 3px 8px rgba(50, 91, 60, 0.07);
+}
+
+.nav-arrow {
+  margin-left: auto;
+  font-size: 16px;
+  opacity: 0.7;
+}
+
+.sidebar-bottom {
+  margin-top: auto;
+  padding-top: 28px;
+}
+
+.companion-mini {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 13px 9px;
+  border-top: 1px solid #dfe5d9;
+}
+
+.companion-mini strong {
+  display: block;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.companion-mini small {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.avatar {
+  display: grid;
+  place-items: center;
+  width: 35px;
+  height: 35px;
+  border-radius: 11px;
+  background: #e4eadc;
+  color: var(--moss);
+  flex-shrink: 0;
+  font-size: 14px;
+  font-weight: 600;
+  overflow: hidden;
+}
+
+.avatar svg {
+  width: 27px;
+  height: 27px;
+}
+
+.avatar-sm {
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+}
+
+.avatar-sm svg {
+  width: 23px;
+  height: 23px;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  background: #719365;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.sidebar-tools {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 8px 3px 0;
+}
+
+.sidebar-tools button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: none;
+  font-size: 11px;
+  color: #7c8578;
+  padding: 5px;
+  border-radius: 8px;
   white-space: nowrap;
 }
 
-.buddy-revisions {
+.sidebar-tools button:hover {
+  background: var(--moss-soft);
+  color: var(--moss);
+}
+
+.sidebar-tools .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.sidebar-revoke {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
   color: var(--muted);
   font-size: 11px;
 }
 
-.buddy-actions {
-  display: flex;
-  flex: 0 0 auto;
-  gap: 8px;
+.sidebar-revoke .icon {
+  width: 14px;
+  height: 14px;
 }
 
-.buddy-identity {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin: 0;
-  color: var(--ink);
-  font-size: 12px;
-  line-height: 1.6;
+.sidebar-revoke:not(:disabled):hover {
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 
-.buddy-form {
+.workspace {
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px 12px;
-  background: var(--paper-raised);
-  border: 1px solid var(--line);
-  border-radius: 12px;
+  min-height: 0;
 }
 
-.session-list {
+.topbar {
+  min-height: 51px;
+  flex-shrink: 0;
+  padding: 0 30px;
+  border-bottom: 1px solid var(--line);
   display: flex;
-  flex: 1 1 320px;
-  flex-wrap: wrap;
+  justify-content: space-between;
   align-items: center;
-  gap: 6px;
+  gap: 12px;
+}
+
+.breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.crumb-root,
+.slash {
+  color: #9aa394;
+}
+
+.chat-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  font-size: 11px;
   min-width: 0;
 }
 
-.session-empty {
+.offline-note {
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.6;
 }
 
-.session-chip {
+.status-pill,
+.revoked-pill,
+.pet-pill,
+.pending-pill {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  max-width: 240px;
-  padding: 4px 10px;
-  color: var(--ink);
-  font-size: 12px;
-  background: var(--paper);
-  border: 1px solid var(--line);
+  padding: 3px 9px;
   border-radius: 999px;
+  white-space: nowrap;
+}
+
+.status-pill::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.tone-ok {
+  background: var(--moss-soft);
+  color: var(--moss);
+}
+
+.tone-busy {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.tone-warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.tone-danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.revoked-pill {
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.pet-pill {
+  background: #f0f2ed;
+  color: #69756b;
+}
+
+.pending-pill {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+/* ---------- 跨页横幅 ---------- */
+
+.recovery-banner,
+.chat-warning,
+.chat-failure,
+.error-banner,
+.archived-banner {
+  margin: 0;
+  padding: 10px 30px;
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.recovery-banner {
+  background: var(--moss-soft);
+  color: var(--moss-deep);
+  border-bottom: 1px solid var(--line);
+}
+
+.chat-warning {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.chat-failure {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.archived-banner {
+  background: #f0f2ed;
+  color: #69756b;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-bottom: 1px solid var(--line);
+}
+
+.error-banner span {
+  flex: 1;
+  min-width: 0;
+}
+
+.ghost {
+  border: 1px solid currentColor;
+  background: none;
+  border-radius: 8px;
+  padding: 3px 10px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* ---------- 页面骨架 ---------- */
+
+.page {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.page-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 25px 30px 22px;
+  flex-shrink: 0;
+}
+
+.page-heading h1 {
+  margin: 0;
+  font-size: 24px;
+  letter-spacing: -0.7px;
+  line-height: 1.4;
+  font-weight: 600;
+}
+
+/* 切页后焦点移动到标题供读屏播报；与样稿一致不画可见焦点框。 */
+.page-heading h1:focus,
+.page-heading h1:focus-visible {
+  outline: none;
+}
+
+.page-heading p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.chat-heading {
+  padding-bottom: 20px;
+}
+
+.heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+/* 长伙伴名按钮在窄窗内换行显示，而不是把页头撑出容器。 */
+.heading-actions .btn {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.heading-actions .btn span {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.page-content {
+  overflow: auto;
+  padding: 0 30px 30px;
+  flex: 1;
+  min-height: 0;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink);
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  transition: background 0.16s, color 0.16s, box-shadow 0.16s;
+}
+
+.btn:hover {
+  background: #f0f4ed;
+  border-color: #cdd9c8;
+}
+
+.btn.primary {
+  background: var(--moss);
+  border-color: var(--moss);
+  color: #fff;
+}
+
+.btn.primary:hover {
+  background: var(--moss-deep);
+}
+
+.btn.quiet {
+  background: transparent;
+}
+
+.btn.danger {
+  color: var(--danger);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+/* 管理与表单按钮统一走 .btn；这里只保留图标按钮等少量例外样式。 */
+
+.icon-btn {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--muted);
+}
+
+.icon-btn:hover {
+  background: var(--moss-soft);
+  color: var(--moss);
+}
+
+.inline-link {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--moss);
+  font-size: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border-radius: 6px;
+  background: var(--moss-soft);
+  color: var(--moss);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.pill.neutral {
+  background: #f0f2ed;
+  color: #69756b;
+}
+
+.micro {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.note {
+  color: var(--muted);
+  font-size: 11px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  line-height: 1.8;
+}
+
+.note .icon {
+  width: 15px;
+  height: 15px;
+  margin-top: 3px;
+}
+
+.section-label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--muted);
+  margin: 0 0 13px;
+}
+
+.section-label::after {
+  height: 1px;
+  background: var(--line);
+  content: '';
+  flex: 1;
+}
+
+.card {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  padding: 24px;
+}
+
+.section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 19px;
+}
+
+.section-title h2 {
+  margin: 0;
+  font-size: 17px;
+  letter-spacing: -0.2px;
+}
+
+.section-title p {
+  margin: 5px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.divider {
+  height: 1px;
+  background: var(--line);
+}
+
+/* ---------- 聊天页 ---------- */
+
+.chat-body {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
+  border-top: 1px solid var(--line);
+}
+
+.sessions {
+  padding: 22px 14px 16px 18px;
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.session-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 6px 16px;
+}
+
+.session-top strong {
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 500;
+  letter-spacing: 0.1em;
+}
+
+.session-scroll {
+  overflow: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.session-chip {
+  display: flex;
+  gap: 9px;
+  padding: 13px 11px;
+  border: 0;
+  border-radius: 11px;
+  background: none;
+  width: 100%;
+  text-align: left;
+  margin-bottom: 5px;
+  align-items: flex-start;
+  color: var(--ink);
+}
+
+.session-chip .icon {
+  width: 16px;
+  height: 16px;
+  color: #84927a;
+  margin-top: 3px;
 }
 
 .session-chip.active {
-  color: var(--moss);
-  background: var(--moss-soft);
-  border-color: #bcc9bd;
+  background: #e9eee3;
+}
+
+.session-chip:hover {
+  background: #edf1e8;
+}
+
+.session-text {
+  min-width: 0;
+}
+
+.session-name {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
 }
 
 .session-chip.archived .session-name {
   color: var(--muted);
 }
 
-.session-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.session-sub {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-top: 3px;
 }
 
 .session-flag {
+  font-size: 10px;
+  color: #8a6a33;
+  background: var(--warn-soft);
+  border-radius: 5px;
   padding: 0 5px;
-  color: var(--muted);
-  font-size: 11px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
 }
 
 .session-status {
-  font-size: 11px;
+  font-size: 10px;
+  color: #899282;
 }
 
-.session-status.tone-ok {
-  color: var(--moss);
-  background: transparent;
+.tone-ok.session-status {
+  color: #6f8b62;
 }
 
-.session-status.tone-busy,
-.session-status.tone-warn {
+.tone-busy.session-status,
+.tone-warn.session-status {
   color: var(--warn);
-  background: transparent;
 }
 
-.session-status.tone-danger {
+.tone-danger.session-status {
   color: var(--danger);
-  background: transparent;
 }
 
-.session-status.tone-muted {
+.tone-muted.session-status {
   color: var(--muted);
-  background: transparent;
 }
 
-.session-actions {
+.session-empty {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.7;
+  display: block;
+  padding: 4px 6px;
+}
+
+.session-bottom {
+  padding: 15px 6px 0;
+  font-size: 10px;
+  color: #8d9787;
+  border-top: 1px solid var(--line);
+  margin: 12px 0 0;
+}
+
+.conversation {
   display: flex;
-  flex: 0 0 auto;
-  gap: 8px;
-}
-
-.archived-banner {
-  padding: 8px 12px;
-  margin: 0;
-  color: var(--moss);
-  font-size: 12px;
-  line-height: 1.6;
-  background: var(--moss-soft);
-  border: 1px solid #bcc9bd;
-  border-radius: 10px;
-}
-
-.panel-nav {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.panel-nav button.active {
-  color: var(--moss);
-  background: var(--moss-soft);
-  border-color: #bcc9bd;
-}
-
-.recovery-banner {
-  padding: 8px 12px;
-  margin: 0;
-  color: var(--ink);
-  font-size: 12px;
-  line-height: 1.6;
-  background: var(--paper-raised);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-}
-
-.recovery-banner strong {
-  color: var(--moss);
-}
-
-.panel-shell {
-  display: flex;
-  flex: 0 0 auto;
   flex-direction: column;
-  gap: 10px;
-  max-height: 46vh;
-  overflow-y: auto;
-  padding: 12px 14px;
-  background: var(--paper-raised);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  box-shadow: 0 2px 10px rgba(38, 47, 43, 0.04);
-  scrollbar-color: #cfd8cf transparent;
-  scrollbar-width: thin;
+  min-height: 0;
+  min-width: 0;
+  background: linear-gradient(180deg, #fffefb 0%, #f9faf6 100%);
 }
 
-.panel-head {
+.conversation-head {
+  padding: 15px 26px;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  border-bottom: 1px solid #edf0e7;
   gap: 10px;
+  flex-shrink: 0;
 }
 
-.panel-head h2 {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 600;
+/* 长伙伴名在这里收缩换行，右侧「归档会话」按钮保持可达。 */
+.conversation-head .row {
+  flex: 1;
+  min-width: 0;
 }
 
-.panel-head-meta {
+.conversation-head strong {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.conversation-head small {
+  font-size: 10px;
+  color: #829076;
   display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.messages {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 28px 30px 20px;
+}
+
+.empty-state {
+  display: grid;
+  gap: 6px;
+  align-content: center;
+  justify-items: center;
+  text-align: center;
+  padding: 30px 20px;
+  color: var(--muted);
+  font-size: 12px;
+  min-height: 160px;
+}
+
+.empty-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  margin: 0;
+}
+
+.revoked-state {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+}
+
+.message {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 23px;
+}
+
+.message-body {
+  max-width: min(560px, 85%);
+  min-width: 0;
+}
+
+.message-meta {
+  margin: 0 0 6px 2px;
+  font-size: 10px;
+  color: #919a8a;
+}
+
+.bubble {
+  padding: 14px 17px;
+  border-radius: 3px 15px 15px 15px;
+  background: var(--surface);
+  border: 1px solid #e8ecdf;
+  line-height: 1.9;
+  font-size: 13px;
+  box-shadow: 0 2px 4px rgba(46, 79, 40, 0.06);
+}
+
+.bubble .text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.from-user {
+  justify-content: flex-end;
+}
+
+.from-user .message-meta {
+  text-align: right;
+}
+
+.from-user .bubble {
+  background: #e9efdf;
+  border-color: #e2e9d6;
+  border-radius: 15px 3px 15px 15px;
+}
+
+.from-system .bubble {
+  background: #f4f6ef;
+  border-style: dashed;
+  color: var(--muted);
+}
+
+.composer-wrap {
+  padding: 0 26px 19px;
+  flex-shrink: 0;
+}
+
+.composer {
+  display: block;
+  border: 1px solid #d8e0d0;
+  border-radius: 15px;
+  background: var(--surface);
+  padding: 12px 15px 11px;
+  box-shadow: 0 4px 16px rgba(62, 80, 37, 0.02);
+}
+
+.composer:focus-within {
+  border-color: #8da37e;
+  box-shadow: 0 0 0 3px #edf1e7;
+}
+
+.composer textarea {
+  display: block;
+  width: 100%;
+  resize: none;
+  border: 0;
+  outline: 0 !important;
+  box-shadow: none;
+  min-height: 56px;
+  max-height: 160px;
+  padding: 3px 1px;
+  font-size: 13px;
+  background: none;
+  color: var(--ink);
+}
+
+.composer textarea::placeholder {
+  color: #a0a894;
+}
+
+.composer textarea:disabled {
+  opacity: 0.6;
+}
+
+.composer-bottom {
+  display: flex;
+  justify-content: space-between;
   align-items: center;
   gap: 8px;
 }
 
-.panel-body {
+.composer-bottom small {
+  font-size: 10px;
+  color: #98a18e;
+}
+
+.composer .btn {
+  padding: 7px 13px;
+  min-height: 33px;
+}
+
+.composer .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.composer-caption {
+  font-size: 10px;
+  color: #8d9785;
+  margin: 10px 0 0;
+  text-align: center;
+}
+
+/* ---------- 伙伴页 ---------- */
+
+.buddy-hero {
+  background: #eaf0e1;
+  border: 1px solid #dce6d2;
+  border-radius: 18px;
+  padding: 27px 30px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 25px;
+  overflow: hidden;
+}
+
+.buddy-hero h2 {
+  margin: 9px 0 7px;
+  font-size: 25px;
+  font-weight: 500;
+  letter-spacing: -0.6px;
+  line-height: 1.4;
+}
+
+.buddy-hero p {
+  margin: 0;
+  font-size: 12px;
+  color: #7c886e;
+  max-width: 380px;
+}
+
+.hero-cat {
+  width: 140px;
+  height: 140px;
+  flex-shrink: 0;
+  transform: rotate(-6deg);
+}
+
+.buddy-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.buddy-card {
+  padding: 22px;
+  min-width: 0;
+}
+
+.buddy-card.selected,
+.buddy-card.active {
+  border-color: #9cb48c;
+  box-shadow: inset 0 0 0 1px #bed0af;
+}
+
+.buddy-card h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.buddy-card .row {
+  align-items: flex-start;
+}
+
+.buddy-card .pill {
+  margin-left: auto;
+}
+
+/* 实例 ID 与档案/人设/模型修订收进可展开详情，日常视图不再直出编号。 */
+.buddy-detail {
+  margin-top: 14px;
+  border-top: 1px dashed var(--line);
+  padding-top: 8px;
+  min-width: 0;
+}
+
+.buddy-detail summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--muted);
+  padding: 2px 0;
+  width: fit-content;
+}
+
+.buddy-detail summary:hover {
+  color: var(--moss);
+}
+
+.buddy-detail[open] summary {
+  margin-bottom: 6px;
+}
+
+.buddy-detail-list {
+  margin: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.buddy-detail-line {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  min-width: 0;
+}
+
+.buddy-detail-line dt {
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.buddy-detail-line dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+}
+
+.buddy-revisions {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.buddy-detail-note {
+  margin: 8px 0 0;
+  font-size: 10px;
+  line-height: 1.7;
+}
+
+.buddy-card-foot {
+  border-top: 1px solid var(--line);
+  padding-top: 15px;
+  margin-top: 17px;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.buddy-card-foot .btn {
+  min-height: 31px;
+  padding: 4px 11px;
+}
+
+.buddy-identity {
+  margin: 22px 0 0;
+}
+
+.buddy-form {
+  display: grid;
+  gap: 12px;
+  margin-top: 22px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  padding: 22px;
+}
+
+.buddy-form label {
+  display: grid;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.buddy-form input,
+.buddy-form textarea {
+  font-weight: 400;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 10px 12px;
+  color: var(--ink);
+  min-width: 0;
+}
+
+.buddy-form textarea {
+  resize: vertical;
+}
+
+/* ---------- 外观页 ---------- */
+
+.appearance-grid {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.9fr) minmax(0, 1.1fr);
+  gap: 22px;
+  align-items: start;
+}
+
+.pet-preview {
+  min-height: 320px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(ellipse at 50% 65%, #e5edda 0%, #f2f5eb 52%, #f8faf3 100%);
+  border: 1px solid #e2e9d9;
+  border-radius: 18px;
+  position: relative;
+  overflow: hidden;
+  padding: 24px;
+  text-align: center;
+}
+
+.preview-tag {
+  position: absolute;
+  top: 18px;
+  left: 19px;
+  color: #8a957f;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
+.pet-drawing {
+  width: 190px;
+  height: 190px;
+  filter: drop-shadow(0 14px 12px rgba(109, 130, 83, 0.1));
+}
+
+.pet-shadow {
+  width: 114px;
+  height: 12px;
+  background: #d6dfca;
+  filter: blur(5px);
+  border-radius: 50%;
+  margin-top: -12px;
+}
+
+.pet-preview strong {
+  font-size: 14px;
+  font-weight: 500;
+  margin-top: 23px;
+}
+
+.pet-preview small {
+  font-size: 10px;
+  color: #8c987e;
+  margin-top: 5px;
+}
+
+.appearance-card {
+  min-width: 0;
+}
+
+.appearance-note {
+  padding: 19px 1px;
+  margin: 0;
+}
+
+/* ---------- 面板页（记忆 / 模型 / 诊断） ---------- */
+
+/* 页面级 h1 由 page-heading 承担，面板本身不再重复大标题；
+   返回聊天入口统一放在页头 heading-actions。 */
+.panel-shell {
+  display: grid;
+  gap: 14px;
+}
+
+.panel-message {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.panel-body {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.panel-closed-hint {
+  margin: 0;
 }
 
 .panel-status {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px 14px;
-  color: var(--muted);
+  gap: 8px 18px;
   font-size: 12px;
-}
-
-.panel-block,
-.panel-form {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.panel-form {
-  padding-top: 10px;
-  border-top: 1px solid var(--line);
+  color: var(--muted);
+  background: #f2f4ed;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 15px;
 }
 
 .panel-block h3,
 .panel-form h3 {
-  margin: 0;
-  font-size: 13px;
-  font-weight: 600;
+  margin: 0 0 12px;
+  font-size: 14px;
 }
 
-.preset-list,
-.memory-list,
-.diagnostic-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 0;
-  margin: 0;
+.preset-list {
   list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
 }
 
-.preset-list li,
-.memory-list li {
+.preset-list li {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 8px 10px;
-  background: var(--paper);
+  gap: 12px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 12px;
+  padding: 14px 16px;
+  background: var(--surface);
 }
 
 .preset-list li.selected {
-  background: var(--moss-soft);
-  border-color: #bcc9bd;
+  border-color: #9cb48c;
+  background: #f4f7ef;
+}
+
+.preset-list .btn {
+  flex-shrink: 0;
+  min-height: 34px;
+  padding: 6px 12px;
+  font-size: 11px;
 }
 
 .preset-text {
@@ -4826,167 +5825,678 @@ button.danger-link:hover:not(:disabled) {
 }
 
 .preset-text p {
-  margin: 2px 0 0;
-  overflow-wrap: anywhere;
-}
-
-.endpoint {
+  margin: 3px 0 0;
   font-size: 11px;
 }
 
-.panel-form label,
-.memory-toolbar label,
-.remember-form label,
-.memory-editor label,
-.buddy-form label {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  color: var(--muted);
+.preset-text .endpoint {
+  overflow-wrap: anywhere;
+}
+
+.panel-form {
+  display: grid;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  padding: 20px;
+}
+
+.panel-form label {
+  display: grid;
+  gap: 7px;
   font-size: 12px;
+  font-weight: 600;
 }
 
 .panel-form input,
-.panel-form textarea,
-.memory-toolbar input,
-.remember-form textarea,
-.memory-editor textarea,
-.buddy-form input,
-.buddy-form textarea {
+.panel-form textarea {
+  font-weight: 400;
   width: 100%;
-  padding: 7px 9px;
-  color: var(--ink);
-  font-size: 13px;
-  background: var(--paper);
   border: 1px solid var(--line);
-  border-radius: 9px;
-  outline: none;
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 10px 12px;
+  color: var(--ink);
+  min-width: 0;
 }
 
-.panel-form input:focus,
-.panel-form textarea:focus,
-.memory-toolbar input:focus,
-.remember-form textarea:focus,
-.memory-editor textarea:focus,
-.buddy-form input:focus,
-.buddy-form textarea:focus {
-  border-color: #bcc9bd;
-  box-shadow: 0 0 0 2px rgba(56, 102, 83, 0.12);
+.panel-form textarea {
+  resize: vertical;
 }
 
 .checkbox-row {
-  flex-direction: row !important;
+  display: flex;
   align-items: flex-start;
-  gap: 8px !important;
-  color: var(--ink) !important;
-  font-size: 12.5px !important;
-  line-height: 1.5;
+  gap: 9px;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.8;
 }
 
 .checkbox-row input {
+  accent-color: var(--moss);
+  margin: 5px 0 0;
   width: auto;
-  margin-top: 2px;
 }
 
 .panel-actions {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
-}
-
-.panel-message {
-  padding: 8px 12px;
-  margin: 0;
-  color: var(--moss);
-  font-size: 12px;
-  line-height: 1.6;
-  background: var(--moss-soft);
-  border: 1px solid #cfd8cf;
-  border-radius: 10px;
-}
-
-.memory-toolbar,
-.remember-form {
-  display: flex;
+  gap: 9px;
   flex-wrap: wrap;
-  align-items: flex-end;
-  gap: 8px;
 }
 
-.grow {
-  flex: 1 1 220px;
+.memory-toolbar {
+  display: flex;
+  gap: 9px;
+  align-items: end;
 }
 
-.memory-text {
+.memory-toolbar label {
+  display: grid;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  flex: 1;
   min-width: 0;
+}
+
+.memory-toolbar input {
+  font-weight: 400;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 10px 12px;
+  color: var(--ink);
+  min-width: 0;
+}
+
+.memory-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 265px;
+  gap: 22px;
+  align-items: start;
+}
+
+.memory-main {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.memory-count {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.memory-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.memory-list li {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+  padding: 18px 20px;
 }
 
 .memory-text p {
   margin: 0;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
   font-size: 13px;
-  line-height: 1.6;
+  line-height: 1.9;
+  overflow-wrap: anywhere;
 }
 
 .memory-text .muted {
-  font-size: 11px;
+  font-size: 10px;
 }
 
 .memory-actions {
   display: flex;
-  flex: 0 0 auto;
-  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
+  margin-top: 12px;
+}
+
+.memory-actions .btn {
+  min-height: 30px;
+  padding: 4px 10px;
+  font-size: 11px;
+}
+
+.memory-actions .danger,
+.memory-actions .danger-link {
+  color: var(--danger);
+  border-color: var(--danger-soft);
+  background: var(--surface);
+}
+
+.memory-actions .danger:hover,
+.memory-actions .danger-link:hover {
+  background: var(--danger-soft);
+  border-color: #e3c3b8;
 }
 
 .memory-editor {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  gap: 8px;
+  display: grid;
+  gap: 10px;
+}
+
+.memory-editor label {
+  display: grid;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.memory-editor textarea {
+  font-weight: 400;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 10px 12px;
+  color: var(--ink);
+  resize: vertical;
+  min-width: 0;
+}
+
+.remember-form {
+  border: 1px solid #e4e9d8;
+  border-radius: 16px;
+  background: #f2f4ea;
+  padding: 21px;
+  display: grid;
+  gap: 12px;
+  position: sticky;
+  top: 0;
+}
+
+.remember-form h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.remember-form label {
+  display: grid;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.remember-form textarea {
+  font-weight: 400;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--ink);
+  resize: vertical;
+  min-height: 110px;
+  min-width: 0;
+}
+
+.remember-form .note {
+  margin: 0;
+  font-size: 10px;
+}
+
+.diagnostic-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+  overflow: hidden;
 }
 
 .diagnostic-list li {
   display: grid;
-  grid-template-columns: auto minmax(0, 1.2fr) minmax(0, 1fr) auto;
-  gap: 8px;
+  grid-template-columns: 72px minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 0.8fr);
+  gap: 10px;
   align-items: center;
-  padding: 6px 9px;
+  padding: 14px 17px;
+  border-bottom: 1px solid #edf0e7;
   font-size: 12px;
-  background: var(--paper);
-  border: 1px solid var(--line);
-  border-radius: 9px;
+}
+
+.diagnostic-list li:last-child {
+  border-bottom: 0;
 }
 
 .diag-seq {
-  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  color: #929c89;
+  font-size: 11px;
 }
 
 .diag-status {
-  color: var(--moss);
-  text-align: right;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.diagnostics-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.diagnostics-foot p {
+  margin: 0;
+  font-size: 11px;
+  max-width: 520px;
+}
+
+.diagnostics-foot .btn.danger {
+  border-color: var(--danger-soft);
+  background: var(--danger-soft);
+}
+
+/* ---------- 确认与对话框 ---------- */
+
+.inline-confirm {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(calc(-50% + 102px));
+  z-index: 30;
+  max-width: min(460px, calc(100vw - 36px));
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 10px 34px rgba(43, 62, 43, 0.16);
+  padding: 16px 18px;
+  font-size: 12px;
+}
+
+.inline-confirm p {
+  margin: 0 0 10px;
+  line-height: 1.7;
+}
+
+.inline-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.inline-confirm-actions .btn {
+  min-height: 32px;
+  padding: 5px 12px;
+  font-size: 12px;
+}
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(38, 58, 43, 0.27);
+  backdrop-filter: blur(3px);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.dialog {
+  background: var(--paper);
+  border: 1px solid #fff;
+  border-radius: 20px;
+  padding: 29px;
+  max-width: 440px;
+  width: 100%;
+  box-shadow: 0 20px 70px rgba(28, 56, 34, 0.17);
+}
+
+.dialog h2 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.dialog p {
+  margin: 11px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.8;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  margin-top: 22px;
+}
+
+.dialog-actions .btn {
+  min-height: 36px;
+}
+
+/* ---------- 窄窗 ---------- */
+
+@media (max-width: 1100px) {
+  .app-shell {
+    grid-template-columns: 180px minmax(0, 1fr);
+  }
+
+  .sidebar {
+    padding: 23px 12px 13px;
+  }
+
+  .topbar,
+  .page-heading {
+    padding-left: 24px;
+    padding-right: 24px;
+  }
+
+  .page-content {
+    padding: 0 24px 24px;
+  }
+
+  .recovery-banner,
+  .chat-warning,
+  .chat-failure,
+  .error-banner,
+  .archived-banner {
+    padding-left: 24px;
+    padding-right: 24px;
+  }
+
+  .chat-body {
+    grid-template-columns: 175px minmax(0, 1fr);
+  }
+
+  .sessions {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .conversation-head {
+    padding: 14px 20px;
+  }
+
+  .messages {
+    padding: 22px 21px 12px;
+  }
+
+  .composer-wrap {
+    padding: 0 20px 16px;
+  }
+
+  .memory-layout {
+    grid-template-columns: minmax(0, 1fr) 215px;
+    gap: 16px;
+  }
+
+  .offline-note {
+    display: none;
+  }
+}
+
+@media (max-width: 800px) {
+  .app-shell {
+    grid-template-columns: 72px minmax(0, 1fr);
+  }
+
+  .sidebar {
+    padding: 20px 10px 12px;
+  }
+
+  .brand {
+    justify-content: center;
+    margin: 0 0 28px;
+  }
+
+  .brand-name,
+  .nav-label,
+  .nav-item .nav-text,
+  .nav-arrow,
+  .companion-mini .grow,
+  .companion-mini .dot,
+  .sidebar-revoke span,
+  .sidebar-tools span {
+    display: none;
+  }
+
+  .nav-item {
+    justify-content: center;
+    padding: 13px 0;
+  }
+
+  .nav-item .icon {
+    width: 21px;
+    height: 21px;
+  }
+
+  .companion-mini {
+    justify-content: center;
+    padding: 14px 0;
+  }
+
+  .sidebar-tools {
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .sidebar-revoke {
+    justify-content: center;
+  }
+
+  .topbar,
+  .page-heading {
+    padding-left: 20px;
+    padding-right: 20px;
+  }
+
+  .page-heading h1 {
+    font-size: 21px;
+  }
+
+  .page-content {
+    padding: 0 20px 20px;
+  }
+
+  .recovery-banner,
+  .chat-warning,
+  .chat-failure,
+  .error-banner,
+  .archived-banner {
+    padding-left: 20px;
+    padding-right: 20px;
+  }
+
+  .chat-body {
+    grid-template-columns: 155px minmax(0, 1fr);
+  }
+
+  .session-chip .icon {
+    display: none;
+  }
+
+  .messages {
+    padding: 20px 16px 12px;
+  }
+
+  .composer-wrap {
+    padding: 0 16px 14px;
+  }
+
+  .appearance-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .pet-preview {
+    min-height: 240px;
+  }
+
+  .pet-drawing {
+    width: 135px;
+    height: 135px;
+  }
+
+  .memory-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .remember-form {
+    position: static;
+    order: -1;
+  }
+
+  .buddy-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .buddy-hero {
+    padding: 22px;
+  }
+
+  .buddy-hero h2 {
+    font-size: 21px;
+  }
+
+  .hero-cat {
+    width: 105px;
+    height: 105px;
+  }
+
+  .inline-confirm {
+    transform: translateX(-50%);
+  }
 }
 
 @media (max-width: 560px) {
-  .panel-shell {
-    max-height: 52vh;
+  .app-shell {
+    grid-template-columns: 56px minmax(0, 1fr);
   }
 
-  .preset-list li,
-  .memory-list li {
-    flex-direction: column;
-    align-items: stretch;
+  .sidebar {
+    padding-left: 7px;
+    padding-right: 7px;
   }
 
-  .memory-actions {
-    justify-content: flex-end;
+  .topbar {
+    padding: 0 14px;
+    gap: 5px;
+  }
+
+  .crumb-root,
+  .slash {
+    display: none;
+  }
+
+  .page-heading {
+    padding: 18px 16px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .page-heading h1 {
+    font-size: 19px;
+  }
+
+  .page-content {
+    padding: 0 16px 18px;
+  }
+
+  .recovery-banner,
+  .chat-warning,
+  .chat-failure,
+  .error-banner,
+  .archived-banner {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .chat-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .sessions {
+    flex-direction: row;
+    gap: 6px;
+    overflow: auto;
+    max-height: 64px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    padding: 8px 12px;
+    align-items: center;
+  }
+
+  .session-top {
+    padding: 0;
+  }
+
+  .session-top strong,
+  .session-bottom {
+    display: none;
+  }
+
+  .session-scroll {
+    display: flex;
+    gap: 4px;
+    overflow: visible;
+    flex: initial;
+  }
+
+  .session-chip {
+    white-space: nowrap;
+    width: auto;
+    margin: 0;
+    padding: 8px 12px;
+  }
+
+  .session-sub {
+    display: none;
+  }
+
+  .messages {
+    padding: 18px 14px 10px;
+  }
+
+  .message-body {
+    max-width: 88%;
+  }
+
+  .bubble {
+    padding: 11px 13px;
+    font-size: 12px;
+  }
+
+  .buddy-hero {
+    padding: 19px;
+  }
+
+  .hero-cat {
+    width: 78px;
+    height: 78px;
   }
 
   .diagnostic-list li {
-    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-columns: 56px minmax(0, 1fr);
+  }
+
+  .diag-status {
+    grid-column: 2;
+  }
+
+  .inline-confirm {
+    transform: translateX(-50%);
+    left: 50%;
   }
 }
 </style>
